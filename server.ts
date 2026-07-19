@@ -2235,23 +2235,34 @@ app.post("/api/verify", async (req, res) => {
   }
 });
 
-// Vite server / Static files configuration
+// Vite server / Static files configuration.
+//
+// IMPORTANT (deploy-safety): decide the mode by OPTING IN to dev, not by opting
+// out of prod. On hosts like Render/Cloud Run, `vite` is a devDependency that is
+// pruned from the production install — so if we ever tried to `import("vite")`
+// there, the import would throw, startServer() would reject, and the process
+// would exit WITHOUT binding a port (Render then shows `x-render-routing:
+// no-server`). Defaulting to static-serving unless NODE_ENV is explicitly
+// "development" makes production the safe fallback even if NODE_ENV is unset.
+const IS_DEV = process.env.NODE_ENV === "development";
+
 async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
-    // Vite is a DEV-only dependency. Import it lazily so the production bundle
-    // never loads it (and does not need it installed at all).
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
+  if (IS_DEV) {
+    try {
+      // Vite is a DEV-only dependency. Import it lazily so the production bundle
+      // never loads it (and does not need it installed at all).
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } catch (err) {
+      console.error("Vite dev middleware failed to load; falling back to static:", err);
+      serveStatic();
+    }
   } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    serveStatic();
   }
 
   // Ensure the deed template library exists (seeds placeholder .docx files on first run).
@@ -2262,8 +2273,37 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT} (mode: ${IS_DEV ? "development" : "production"})`);
   });
 }
 
-startServer();
+// Serve the built SPA (dist/) as static files with an index.html fallback for
+// client-side routes. Kept as its own fn so both prod and the dev-failure path
+// can use it.
+function serveStatic() {
+  const distPath = path.join(process.cwd(), "dist");
+  app.use(express.static(distPath));
+  app.get("*", (req, res) => {
+    res.sendFile(path.join(distPath, "index.html"));
+  });
+}
+
+// Never let an unexpected async rejection take the process down silently — log it
+// and keep serving. (A crashed process is what produces Render's `no-server`.)
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection (kept alive):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception (kept alive):", err);
+});
+
+startServer().catch((err) => {
+  // Last-ditch: even if startup wiring failed, bind the port so the platform
+  // sees a live server (health check still responds) instead of a dead instance.
+  console.error("startServer() failed; binding port anyway so health check responds:", err);
+  try {
+    app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT} (recovery mode)`));
+  } catch (e) {
+    console.error("Failed to bind port in recovery mode:", e);
+  }
+});
