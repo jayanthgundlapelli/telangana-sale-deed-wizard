@@ -1,0 +1,31 @@
+# Files NOT uploaded to Cloud Build. Keeps the build context small & secret-free.
+# (Cloud Build still needs source to build the image, so this mirrors .dockerignore.)
+.git
+.gitignore
+node_modules
+dist
+*.log
+
+# Secrets — never upload
+.env
+.env.local
+.env.*.local
+
+# Docs / notes / scratch
+*.md
+START_HERE.txt
+Samples/
+.agents/
+.playwright-mcp/
+test-*.ts
+test-*.mjs
+*-check.png
+step*.png
+bun.lock
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+
+# NOTE: templates/*.docx MUST be uploaded (shipped in the image) — do not ignore.

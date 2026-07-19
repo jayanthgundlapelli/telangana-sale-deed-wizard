@@ -1,0 +1,23 @@
+# Render.com Blueprint — one-click deploy for the Telangana Sale Deed Wizard.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# The free plan sleeps after 15 min of inactivity (~1 min cold start) and gives
+# 750 instance-hours/month per workspace. Fine for development/demo. For always-on
+# production, change `plan: free` to `plan: starter` (see DEPLOYMENT.md).
+services:
+  - type: web
+    name: telangana-sale-deed-wizard
+    runtime: node
+    region: singapore # closest Render region to India; also: oregon, frankfurt
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false # set manually in the Render dashboard — never commit secrets
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash # override to gemini-2.5-flash / -flash-lite to cut cost

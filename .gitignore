@@ -1,0 +1,45 @@
+# === Secrets — NEVER commit these ===
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# === Dependencies ===
+node_modules/
+
+# === Build output ===
+dist/
+server.js
+*.tsbuildinfo
+
+# === Logs ===
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# === OS / editor cruft ===
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# === Test / scratch artifacts ===
+.playwright-mcp/
+*-check.png
+step*.png
+.agents/
+
+# === PRIVATE: real Aadhaar cards & personal documents used for local testing ===
+# NEVER commit — these contain real PII. Keep them local only.
+Samples/
+*.jpeg
+*.jpg
+*.pdf
+
+# === Runtime-generated PDF temp dirs (also written to os.tmpdir) ===
+deed-pdf-*/
+
+# NOTE: templates/*.docx ARE committed on purpose — they are the deed
+# templates baked into the production image. Do not ignore them.

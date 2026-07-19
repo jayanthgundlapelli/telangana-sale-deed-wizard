@@ -1,0 +1,8 @@
+{
+  "name": "Remix: Remix: Telangana Registration Document Verifier",
+  "description": "Verify names, ages, survey numbers, and property details across Aadhaar cards, link documents, and draft registration papers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

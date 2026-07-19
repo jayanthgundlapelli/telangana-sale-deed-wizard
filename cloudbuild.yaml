@@ -1,0 +1,51 @@
+# Google Cloud Build → Cloud Run pipeline for the Telangana Sale Deed Wizard.
+# Trigger from the repo root with:
+#   gcloud builds submit --config cloudbuild.yaml \
+#       --substitutions=_REGION=asia-south1,_SERVICE=telangana-sale-deed-wizard
+#
+# The GEMINI_API_KEY is read from Secret Manager at deploy time (see DEPLOYMENT.md),
+# so it is never baked into the image or committed to the repo.
+substitutions:
+  _REGION: asia-south1 # Mumbai — lowest latency for India
+  _SERVICE: telangana-sale-deed-wizard
+  _MODEL: gemini-3.5-flash
+
+steps:
+  # 1. Build the container image.
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/apps/$_SERVICE:$SHORT_SHA
+      - .
+
+  # 2. Push it to Artifact Registry.
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/apps/$_SERVICE:$SHORT_SHA
+
+  # 3. Deploy to Cloud Run (scales to zero; GEMINI_API_KEY pulled from Secret Manager).
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - $_SERVICE
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/apps/$_SERVICE:$SHORT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=3000
+      - --memory=512Mi
+      - --cpu=1
+      - --min-instances=0
+      - --max-instances=3
+      - --set-env-vars=NODE_ENV=production,GEMINI_MODEL=$_MODEL
+      - --set-secrets=GEMINI_API_KEY=gemini-api-key:latest
+
+images:
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/apps/$_SERVICE:$SHORT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
