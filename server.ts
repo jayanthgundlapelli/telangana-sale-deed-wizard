@@ -2283,7 +2283,13 @@ async function startServer() {
 function serveStatic() {
   const distPath = path.join(process.cwd(), "dist");
   app.use(express.static(distPath));
-  app.get("*", (req, res) => {
+  // SPA fallback: serve index.html for any non-API GET that didn't match a static
+  // file, so client-side deep links / refreshes work. Using a plain fallback
+  // middleware (not app.get("*")) makes this robust across Express /
+  // path-to-regexp versions, where the "*" pattern can fail to match.
+  app.use((req, res, next) => {
+    if (req.method !== "GET") return next();
+    if (req.path.startsWith("/api/")) return next();
     res.sendFile(path.join(distPath, "index.html"));
   });
 }
