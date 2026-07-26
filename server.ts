@@ -1346,6 +1346,12 @@ app.post("/api/export-document", async (req, res) => {
       finalText,
       templateId,
       details,
+      // The ALREADY-FILLED .docx produced by /api/generate-document (in-place fill of
+      // the uploaded template). This is the authoritative artifact the user reviewed
+      // in the Stamp Preview — shipping these exact bytes guarantees the download is
+      // byte-identical to the preview (tables, centered/bold titles, fonts, page
+      // breaks all preserved) and removes any dependency on re-filling at export.
+      filledDocxBase64,
       // The uploaded template's ORIGINAL .docx bytes. When present we preserve the
       // template's exact formatting by filling it in place rather than rebuilding
       // the deed from text — this is what makes the download open in Word cleanly
@@ -1368,6 +1374,32 @@ app.post("/api/export-document", async (req, res) => {
 
     let docxBuffer: Buffer;
 
+    // Helper: splice the plan image in as the LAST page of an already-built docx.
+    const withPlanPage = async (buf: Buffer): Promise<Buffer> => {
+      if (!planImg) return buf;
+      try {
+        return await appendPlanPageToDocx(buf, {
+          imageBase64: planImg,
+          imageWidthPx: planW,
+          imageHeightPx: planH,
+        });
+      } catch (e: any) {
+        console.warn("Failed to append plan page to docx:", e?.message || e);
+        return buf;
+      }
+    };
+
+    // ── TOP PRIORITY: ship the ALREADY-FILLED docx the user reviewed ───────────
+    // /api/generate-document already produced the in-place filled .docx (tables,
+    // centered/bold titles, fonts, page breaks intact) and the Stamp Preview
+    // rendered THOSE bytes. Re-using them here makes the download byte-identical to
+    // what was previewed — the single source of truth — and sidesteps any chance of
+    // a text-rebuild fallback losing the tables/formatting at export time.
+    const preFilled =
+      typeof filledDocxBase64 === "string" && filledDocxBase64.trim().length > 0
+        ? filledDocxBase64
+        : "";
+
     // ── PREFERRED PATH: preserve the uploaded template's format ────────────────
     // Re-fill the ORIGINAL .docx in place (only <w:t> text changes → fonts,
     // margins, tables, page setup are byte-preserved), then splice the plan page
@@ -1376,21 +1408,13 @@ app.post("/api/export-document", async (req, res) => {
       (typeof templateDocxBase64 === "string" && templateDocxBase64.trim().length > 0 && templateDocxBase64) ||
       (typeof customTemplateDocxBase64 === "string" && customTemplateDocxBase64.trim().length > 0 && customTemplateDocxBase64) ||
       "";
-    if (tmplDocx) {
+    if (preFilled) {
+      const raw = preFilled.replace(/^data:[^,]+,/, "");
+      docxBuffer = await withPlanPage(Buffer.from(raw, "base64"));
+    } else if (tmplDocx) {
       const { resolve } = buildAngleFieldResolver(details);
       const filled = await fillDocxTemplate(tmplDocx, resolve, { open: "<", close: ">" });
-      docxBuffer = filled.buffer;
-      if (planImg) {
-        try {
-          docxBuffer = await appendPlanPageToDocx(docxBuffer, {
-            imageBase64: planImg,
-            imageWidthPx: planW,
-            imageHeightPx: planH,
-          });
-        } catch (e: any) {
-          console.warn("Failed to append plan page to in-place docx:", e?.message || e);
-        }
-      }
+      docxBuffer = await withPlanPage(filled.buffer);
     } else {
       // ── FALLBACK PATH: rebuild from text (library templates / no upload) ──────
       let mergedText: string = typeof finalText === "string" ? finalText : "";

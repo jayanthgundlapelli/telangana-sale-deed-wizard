@@ -1,1 +1,20 @@
 @import "tailwindcss";
+
+/* docx-preview (Auto-Fill Draft + Stamp Preview): render the real filled .docx
+   with page shadows and spacing between sheets so it reads like a stack of A4
+   pages, matching the download. docx-preview 0.4.0 with {className:"docxpv"}
+   emits `.docxpv-wrapper > section.docxpv` (NOT `.docx-wrapper`/`section.docx`);
+   these selectors must match those exact classes or the styling silently no-ops. */
+.docxpv-host .docxpv-wrapper {
+  background: transparent;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+.docxpv-host .docxpv-wrapper > section.docxpv {
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.25), 0 8px 10px -6px rgba(0, 0, 0, 0.15);
+  margin: 0;
+  background: #fff;
+}

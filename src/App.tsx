@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import * as mammoth from "mammoth";
+import DocxLivePreview from "./DocxLivePreview";
 import {
   CheckCircle2,
   XCircle,
@@ -658,6 +659,11 @@ export default function App() {
   const [previewScale, setPreviewScale] = useState(1);
   const deedMeasureRef = useRef<HTMLDivElement | null>(null);
   const previewWrapRef = useRef<HTMLDivElement | null>(null);
+  // Set true when docx-preview cannot render the filled .docx bytes; both the
+  // Auto-Fill Draft (Step 4) and Stamp Preview (Step 6) then fall back to their
+  // text views. Reset to false whenever new bytes are generated. The actual
+  // rendering/measuring/scaling lives in the shared <DocxLivePreview> component.
+  const [docxPreviewError, setDocxPreviewError] = useState(false);
   // Generated document artifacts (from server /api/generate-document)
   const [generatedDocxBase64, setGeneratedDocxBase64] = useState<string>("");
   const [unresolvedPlaceholders, setUnresolvedPlaceholders] = useState<string[]>([]);
@@ -1824,59 +1830,40 @@ export default function App() {
   // We extract the raw WORDING here; the extracted registration details get merged
   // into it server-side in Step 4. Selecting it sets selectedTemplateId to the sentinel.
   const handleCustomTemplateUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
     if (!file) return;
+    const lower = file.name.toLowerCase();
+    // Templates MUST be .docx. Only the original .docx bytes let us fill in place
+    // while preserving the template's tables, centered/bold headings, fonts, page
+    // size and margins (the whole point of the uploaded-template flow). .doc/.txt/
+    // .pdf/images would flatten all of that, so we reject them up front with a
+    // clear warning and ask the user to pick a .docx — rather than silently
+    // degrading the output. Reset the input so re-picking the SAME file re-fires.
+    if (!lower.endsWith(".docx")) {
+      input.value = "";
+      const msg =
+        "Only Microsoft Word .docx templates are supported. " +
+        `“${file.name}” is not a .docx file. Please save your template as .docx ` +
+        "(in Word: File → Save As → Word Document *.docx) and upload it again — this " +
+        "preserves your tables, headings, fonts and page layout exactly.";
+      setError(msg);
+      alert(msg);
+      return;
+    }
     setCustomTemplateLoading(true);
     setError(null);
     try {
-      const lower = file.name.toLowerCase();
-      let text = "";
-      // Reset any previously captured original .docx bytes.
-      setCustomTemplateDocxBase64("");
-      if (lower.endsWith(".docx")) {
-        const arrayBuffer = await file.arrayBuffer();
-        const result = await mammoth.extractRawText({ arrayBuffer });
-        text = (result?.value || "").trim();
-        // Keep the ORIGINAL .docx bytes for true in-place, formatting-preserving fill.
-        setCustomTemplateDocxBase64(await convertFileToBase64(file));
-      } else if (lower.endsWith(".doc")) {
-        // Legacy Word 97-2003 — parse server-side via word-extractor.
-        const base64 = await convertFileToBase64(file);
-        const res = await fetch("/api/parse-doc", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ base64 }),
-        });
-        if (!res.ok) throw new Error(`parse-doc responded ${res.status}`);
-        const data = await res.json();
-        text = (data.text || "").trim();
-      } else if (lower.endsWith(".txt")) {
-        text = (await file.text()).trim();
-      } else if (
-        lower.endsWith(".pdf") ||
-        lower.endsWith(".png") ||
-        lower.endsWith(".jpg") ||
-        lower.endsWith(".jpeg")
-      ) {
-        // PDFs / scanned images have no reliable pure-JS text layer in
-        // production, so transcribe them verbatim with Gemini server-side.
-        const base64 = await convertFileToBase64(file);
-        const mimeType = file.type || (lower.endsWith(".pdf") ? "application/pdf" : "image/jpeg");
-        const res = await fetch("/api/extract-template-text", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ base64, mimeType }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data?.error || `extract-template-text responded ${res.status}`);
-        text = (data.text || "").trim();
-      } else {
-        setError("Unsupported template format. Please upload a .docx, .doc, .txt, .pdf, or image file.");
-        return;
-      }
+      // Guaranteed .docx here (guarded above). Extract the raw wording for the
+      // merge, and keep the ORIGINAL .docx bytes for true in-place,
+      // formatting-preserving fill (tables, headings, fonts, page layout).
+      const arrayBuffer = await file.arrayBuffer();
+      const result = await mammoth.extractRawText({ arrayBuffer });
+      const text = (result?.value || "").trim();
+      setCustomTemplateDocxBase64(await convertFileToBase64(file));
 
       if (!text) {
-        setError("Could not read any text from that template. Please try a different file.");
+        setError("Could not read any text from that .docx template. Please try a different .docx file.");
         return;
       }
       setCustomTemplateText(text);
@@ -1893,9 +1880,7 @@ export default function App() {
       console.error("Custom template upload failed:", err);
       const msg = err instanceof Error && err.message ? err.message : "";
       setError(
-        msg && !msg.startsWith("extract-template-text responded")
-          ? msg
-          : "Failed to read the uploaded template. Please ensure it is a valid Word, text, PDF, or image file."
+        msg || "Failed to read the uploaded template. Please ensure it is a valid Word .docx file."
       );
     } finally {
       setCustomTemplateLoading(false);
@@ -1985,6 +1970,12 @@ export default function App() {
     return () => window.removeEventListener("resize", fit);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentStep, deedPages.length]);
+
+  // Whenever a fresh filled .docx arrives from the server, clear any prior
+  // render error so the live preview is attempted again (both Step 4 and Step 6).
+  useEffect(() => {
+    if (generatedDocxBase64) setDocxPreviewError(false);
+  }, [generatedDocxBase64]);
 
   // Step 4: generate the merged, formatted Word document server-side.
   // Uses the selected .docx template + consolidated details.
@@ -2111,6 +2102,15 @@ export default function App() {
   };
 
   // Step 7: export the final deed as .docx (mandatory) or .pdf (best-effort).
+  // Manual text edits diverge from the server-filled .docx, so we drop those bytes:
+  // the preview then re-renders from the edited text and the download rebuilds from
+  // it too — keeping preview === download and honoring every edit. (When the user
+  // never edits, the pristine filled .docx with tables/formatting is used as-is.)
+  const handleDeedTextEdit = (value: string) => {
+    setFilledDeedText(value);
+    if (generatedDocxBase64) setGeneratedDocxBase64("");
+  };
+
   const exportDocument = async (format: "docx" | "pdf") => {
     setExporting(format);
     setError(null);
@@ -2133,17 +2133,21 @@ export default function App() {
         }
       }
 
-      // Preserve the uploaded template's EXACT formatting: send its original .docx
-      // bytes + the consolidated details so the server fills it IN PLACE (only the
-      // <Angle Bracket> text changes) and appends the plan into that same docx —
-      // instead of rebuilding the deed from text. Falls back to finalText when no
-      // .docx template was uploaded (library templates).
+      // Download EXACTLY what the Stamp Preview showed. /api/generate-document
+      // already produced the in-place filled .docx (tables, centered/bold titles,
+      // fonts, page breaks intact) and the preview rendered THOSE bytes — so we ship
+      // them back as `filledDocxBase64` and the server merely appends the plan page.
+      // This makes download === preview and can never silently lose the tables.
+      //   • templateDocxBase64 → server can re-fill in place if the pre-filled bytes
+      //     are somehow absent (e.g. the user hand-edited the text).
+      //   • finalText → last-resort text rebuild for library templates.
       const details = buildConsolidatedDetails();
       const res = await fetch("/api/export-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           format,
+          filledDocxBase64: (!previewEditing && generatedDocxBase64) || undefined,
           finalText: filledDeedText,
           templateDocxBase64: customTemplateDocxBase64 || undefined,
           details,
@@ -4821,9 +4825,9 @@ const getTeluguRecommendation = (rec: string) => {
                             <div>
                               <h4 className="font-extrabold text-[13px] text-slate-900 leading-tight">Upload Your Own Template</h4>
                               <p className="text-[11px] text-slate-500 mt-1 leading-relaxed max-w-md">
-                                Bring your own pre-templated deed — <span className="font-semibold">Word (.docx/.doc), text (.txt), PDF, or a scanned image</span>.
-                                We merge the details extracted in Step 1 into your document’s wording, then apply the official Telangana stamp-paper formatting.
-                                <span className="text-slate-400"> PDFs and images are transcribed automatically.</span>
+                                Bring your own pre-templated deed — <span className="font-semibold">Microsoft Word .docx only</span>.
+                                We merge the details extracted in Step 1 directly into your document, preserving its exact tables, headings, fonts and page layout.
+                                <span className="text-slate-400"> Save older .doc files as .docx in Word before uploading.</span>
                               </p>
                             </div>
                           </div>
@@ -4834,7 +4838,7 @@ const getTeluguRecommendation = (rec: string) => {
                               {customTemplateLoading ? "Reading…" : customTemplateName ? "Replace File" : "Browse…"}
                               <input
                                 type="file"
-                                accept=".docx,.doc,.txt,.pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"
+                                accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                                 className="hidden"
                                 onChange={handleCustomTemplateUpload}
                               />
@@ -4913,13 +4917,29 @@ const getTeluguRecommendation = (rec: string) => {
                               )}
                               <span className="text-[10px] text-slate-400">{filledDeedText.length.toLocaleString()} chars</span>
                             </div>
-                            <button
-                              onClick={() => generateDocument(false)}
-                              disabled={!selectedTemplateId}
-                              className="bg-white border border-slate-300 hover:bg-slate-100 disabled:opacity-50 text-slate-700 text-xs font-bold py-2 px-4 rounded-lg flex items-center gap-1.5"
-                            >
-                              <RefreshCw className="w-3.5 h-3.5" /> Regenerate
-                            </button>
+                            <div className="flex items-center gap-2">
+                              {generatedDocxBase64 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setPreviewEditing((v) => !v)}
+                                  title={previewEditing ? "Finish editing and return to the live document preview" : "Edit the full document text"}
+                                  className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold border transition-colors ${
+                                    previewEditing
+                                      ? "bg-orange-100 text-orange-700 border-orange-300 hover:bg-orange-200"
+                                      : "bg-white text-slate-700 border-slate-300 hover:bg-slate-100"
+                                  }`}
+                                >
+                                  {previewEditing ? (<><Unlock className="w-3.5 h-3.5" /> Editing — click to preview</>) : (<><Edit2 className="w-3.5 h-3.5" /> Edit text</>)}
+                                </button>
+                              )}
+                              <button
+                                onClick={() => generateDocument(false)}
+                                disabled={!selectedTemplateId}
+                                className="bg-white border border-slate-300 hover:bg-slate-100 disabled:opacity-50 text-slate-700 text-xs font-bold py-2 px-4 rounded-lg flex items-center gap-1.5"
+                              >
+                                <RefreshCw className="w-3.5 h-3.5" /> Regenerate
+                              </button>
+                            </div>
                           </div>
 
                           {unresolvedPlaceholders.length > 0 && (
@@ -4930,20 +4950,33 @@ const getTeluguRecommendation = (rec: string) => {
                             </div>
                           )}
 
-                          {/* Full document content, A4-styled, editable — matches the final layout */}
-                          <div className="flex justify-center bg-slate-100 rounded-xl p-6 overflow-y-auto max-h-[560px]">
-                            <div
-                              className="bg-white shadow-lg relative"
-                              style={{ width: "210mm", minHeight: "220mm", padding: "1in 0.75in", boxSizing: "border-box" }}
-                            >
-                              <textarea
-                                value={filledDeedText}
-                                onChange={(e) => setFilledDeedText(e.target.value)}
-                                className="w-full bg-transparent border-none p-0 outline-none focus:ring-0 resize-none"
-                                style={{ fontFamily: "'Times New Roman', Times, serif", fontSize: "14pt", lineHeight: 1.5, color: "#000", minHeight: "200mm", whiteSpace: "pre-wrap" }}
-                              />
+                          {/* Full document content. When a filled .docx is available (and not
+                              editing), show the REAL Word document via the SAME shared preview
+                              component used by Step 6 (Stamp Preview) — real tables, centered/bold
+                              headings, correct fonts and true page breaks, i.e. exactly what
+                              downloads. Editing (or a render failure) falls back to the A4-styled
+                              editable text. */}
+                          {(!previewEditing && !!generatedDocxBase64 && !docxPreviewError) ? (
+                            <DocxLivePreview
+                              docxBase64={generatedDocxBase64}
+                              maxHeightClass="max-h-[560px]"
+                              onError={() => setDocxPreviewError(true)}
+                            />
+                          ) : (
+                            <div className="flex justify-center bg-slate-100 rounded-xl p-6 overflow-y-auto max-h-[560px]">
+                              <div
+                                className="bg-white shadow-lg relative"
+                                style={{ width: "210mm", minHeight: "220mm", padding: "1in 0.75in", boxSizing: "border-box" }}
+                              >
+                                <textarea
+                                  value={filledDeedText}
+                                  onChange={(e) => handleDeedTextEdit(e.target.value)}
+                                  className="w-full bg-transparent border-none p-0 outline-none focus:ring-0 resize-none"
+                                  style={{ fontFamily: "'Times New Roman', Times, serif", fontSize: "14pt", lineHeight: 1.5, color: "#000", minHeight: "200mm", whiteSpace: "pre-wrap" }}
+                                />
+                              </div>
                             </div>
-                          </div>
+                          )}
 
                           <div className="flex justify-center">
                             <button onClick={() => setCurrentStep(5)} className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-xs font-bold py-2.5 px-6 rounded-lg flex items-center gap-1.5">
@@ -5086,45 +5119,65 @@ const getTeluguRecommendation = (rec: string) => {
                     const goNext = () => setCurrentPageIdx((i) => Math.min(pageCount - 1, i + 1));
                     const scaledW = A4_WIDTH_PX * previewScale;
                     const scaledH = A4_HEIGHT_PX * previewScale;
+                    // When a filled .docx is available (and rendered OK), show the REAL
+                    // document — all pages, real tables/formatting — instead of the
+                    // text-paginated approximation. Editing always uses the text editor.
+                    const showRealDocx = !previewEditing && !!generatedDocxBase64 && !docxPreviewError;
                     return (
                     <div className="space-y-4">
                       <div className="p-3.5 bg-[#eef6f5] border border-[#c3dedb] rounded-lg text-[11px] text-[#0a4d4a] flex items-start gap-2.5">
                         <Info className="w-4 h-4 shrink-0 mt-0.5" />
-                        <p>
-                          Exact A4 preview of the Word document — Times New Roman 14pt, 0.75&quot; side and 1&quot; bottom margins. Only
-                          <b> page 1</b> reserves 5.8&quot; at the top for the pre-printed stamp logo &amp; header; every other page uses the
-                          normal 1&quot; top margin (no blank space). Flip pages with the arrows. Turn on <b>Edit</b> to change the text —
-                          your edits carry into the download.
-                        </p>
+                        {showRealDocx ? (
+                          <p>
+                            This is the <b>actual Word document</b> that will download — real tables, centered/bold headings, fonts and
+                            page breaks preserved from your template, with your Step-1 details filled in. Scroll to see every page. Turn on
+                            <b> Edit</b> to change any wording — your edits carry into the download.
+                          </p>
+                        ) : (
+                          <p>
+                            Exact A4 preview of the Word document — Times New Roman 14pt, 0.75&quot; side and 1&quot; bottom margins. Only
+                            <b> page 1</b> reserves 5.8&quot; at the top for the pre-printed stamp logo &amp; header; every other page uses the
+                            normal 1&quot; top margin (no blank space). Flip pages with the arrows. Turn on <b>Edit</b> to change the text —
+                            your edits carry into the download.
+                          </p>
+                        )}
                       </div>
 
                       {/* Toolbar: page nav + edit toggle */}
                       <div className="flex items-center justify-between gap-3 flex-wrap">
                         <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={goPrev}
-                            disabled={isFirst}
-                            title="Previous page"
-                            className="w-9 h-9 flex items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
-                          >
-                            <ChevronLeft className="w-5 h-5" />
-                          </button>
-                          <div className="text-xs font-bold text-slate-700 tabular-nums select-none min-w-[92px] text-center">
-                            Page {safeIdx + 1} <span className="text-slate-400 font-medium">of {pageCount}</span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={goNext}
-                            disabled={safeIdx >= pageCount - 1}
-                            title="Next page"
-                            className="w-9 h-9 flex items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
-                          >
-                            <ChevronRight className="w-5 h-5" />
-                          </button>
+                          {showRealDocx ? (
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-[#0a4d4a] bg-[#0a4d4a]/10 border border-[#0a4d4a]/25 px-2.5 py-1.5 rounded flex items-center gap-1.5">
+                              <FileCheck2 className="w-3.5 h-3.5" /> Actual Word document — scroll to view all pages
+                            </span>
+                          ) : (
+                            <>
+                              <button
+                                type="button"
+                                onClick={goPrev}
+                                disabled={isFirst}
+                                title="Previous page"
+                                className="w-9 h-9 flex items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                              >
+                                <ChevronLeft className="w-5 h-5" />
+                              </button>
+                              <div className="text-xs font-bold text-slate-700 tabular-nums select-none min-w-[92px] text-center">
+                                Page {safeIdx + 1} <span className="text-slate-400 font-medium">of {pageCount}</span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={goNext}
+                                disabled={safeIdx >= pageCount - 1}
+                                title="Next page"
+                                className="w-9 h-9 flex items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                              >
+                                <ChevronRight className="w-5 h-5" />
+                              </button>
+                            </>
+                          )}
                         </div>
                         <div className="flex items-center gap-2">
-                          {isFirst && (
+                          {!showRealDocx && isFirst && (
                             <span className="text-[10px] font-bold uppercase tracking-wider text-[#b58c4c] bg-[#b58c4c]/10 border border-[#b58c4c]/30 px-2 py-1 rounded flex items-center gap-1">
                               <BookOpen className="w-3.5 h-3.5" /> Stamp reserve on this page
                             </span>
@@ -5156,12 +5209,26 @@ const getTeluguRecommendation = (rec: string) => {
                           fit the panel — nothing double-scales and preview == print. EDIT MODE is
                           a comfortable full-width editor (not scaled, so the text stays readable);
                           pages re-flow when you leave edit mode. */}
-                      <div ref={previewWrapRef} className="bg-slate-200/70 rounded-xl p-5 flex justify-center overflow-hidden">
+                      {showRealDocx ? (
+                        // REAL DOCUMENT VIEW: render the actual filled .docx — tables,
+                        // centered/bold titles, correct fonts and true page breaks — i.e.
+                        // exactly what downloads. Shared with the Auto-Fill Draft (Step 4)
+                        // so both previews are identical. Falls back to the text view on
+                        // any render error.
+                        <DocxLivePreview
+                          docxBase64={generatedDocxBase64}
+                          onError={() => setDocxPreviewError(true)}
+                        />
+                      ) : (
+                      <div
+                        ref={previewWrapRef}
+                        className="bg-slate-200/70 rounded-xl p-5 flex justify-center overflow-hidden"
+                      >
                         {previewEditing ? (
                           <div className="w-full bg-white shadow-xl rounded-sm p-6">
                             <textarea
                               value={filledDeedText}
-                              onChange={(e) => setFilledDeedText(e.target.value)}
+                              onChange={(e) => handleDeedTextEdit(e.target.value)}
                               autoFocus
                               spellCheck={false}
                               className="w-full bg-transparent border border-dashed border-slate-300 rounded p-3 outline-none focus:ring-1 focus:ring-[#0a4d4a] resize-y"
@@ -5172,8 +5239,10 @@ const getTeluguRecommendation = (rec: string) => {
                             </p>
                           </div>
                         ) : (
-                          // Scaled-to-fit placeholder reserves the exact on-screen space; the
-                          // single transform inside does all the scaling.
+                          // TEXT FALLBACK: A4-styled plain-text page (used for library
+                          // templates or if the .docx failed to render). Scaled-to-fit
+                          // placeholder reserves the exact on-screen space; the single
+                          // transform inside does all the scaling.
                           <div style={{ width: `${scaledW}px`, height: `${scaledH}px` }}>
                             <div style={{ transform: `scale(${previewScale})`, transformOrigin: "top left" }}>
                               {/* A single A4 sheet showing ONLY the current page, at native size. */}
@@ -5218,9 +5287,10 @@ const getTeluguRecommendation = (rec: string) => {
                           </div>
                         )}
                       </div>
+                      )}
 
                       {/* Page dots for quick jumping when there are a handful of pages */}
-                      {!previewEditing && pageCount > 1 && pageCount <= 20 && (
+                      {!showRealDocx && !previewEditing && pageCount > 1 && pageCount <= 20 && (
                         <div className="flex items-center justify-center gap-1.5 flex-wrap">
                           {deedPages.map((_, i) => (
                             <button

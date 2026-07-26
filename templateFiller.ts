@@ -126,6 +126,71 @@ export interface FillResult {
   text: string;
 }
 
+// Does this <w:p>…</w:p> block carry any VISIBLE content (text or an embedded
+// image/object)? Whitespace-only text counts as empty.
+function paragraphHasContent(p: string): boolean {
+  let t = "";
+  const re = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(p))) t += m[1];
+  if (t.replace(/\s+/g, "").length > 0) return true;
+  return /<w:(drawing|pict|object)\b/.test(p);
+}
+
+// Remove body paragraphs that our marker-removal EMPTIED, so the deed shows no
+// blank line where a value was missing. Paragraphs map 1:1 between the original
+// and filled XML (filling only edits <w:t> text and drops <w:br/>; it never adds
+// or removes <w:p>), so a paragraph that HAD content in the original but is empty
+// now was emptied by us. We deliberately DO NOT touch:
+//   • paragraphs already empty in the template  -> preserves intentional spacing;
+//   • a paragraph carrying <w:sectPr>            -> preserves page size/margins;
+//   • ANY paragraph inside a table (<w:tbl>)     -> preserves table cell structure
+//                                                   (a cell must keep ≥1 paragraph).
+function collapseEmptiedParagraphs(originalXml: string, filledXml: string): string {
+  const paraRe = /<w:p\b[^>]*>[\s\S]*?<\/w:p>|<w:p\b[^>]*\/>/g;
+
+  // Emptiness of each ORIGINAL paragraph, in document order.
+  const origHadContent: boolean[] = [];
+  let om: RegExpExecArray | null;
+  while ((om = paraRe.exec(originalXml))) origHadContent.push(paragraphHasContent(om[0]));
+
+  // Walk the filled XML, interleaving table boundaries so we can tell when a
+  // paragraph is inside a table (and must be left alone).
+  const tokenRe = /<w:tbl\b[^>]*>|<\/w:tbl>|<w:p\b[^>]*>[\s\S]*?<\/w:p>|<w:p\b[^>]*\/>/g;
+  let out = "";
+  let last = 0;
+  let idx = 0;
+  let tblDepth = 0;
+  let removed = 0;
+  let tm: RegExpExecArray | null;
+  while ((tm = tokenRe.exec(filledXml))) {
+    const tok = tm[0];
+    if (/^<w:tbl\b/.test(tok)) {
+      tblDepth++;
+      continue;
+    }
+    if (tok === "</w:tbl>") {
+      tblDepth = Math.max(0, tblDepth - 1);
+      continue;
+    }
+    // A paragraph token.
+    const hadContent = origHadContent[idx] ?? true;
+    idx++;
+    if (
+      tblDepth === 0 &&
+      hadContent &&
+      !paragraphHasContent(tok) &&
+      !/<w:sectPr\b/.test(tok)
+    ) {
+      out += filledXml.slice(last, tm.index); // keep everything before this para
+      last = tm.index + tok.length; // skip the emptied paragraph
+      removed++;
+    }
+  }
+  out += filledXml.slice(last);
+  return removed > 0 ? out : filledXml;
+}
+
 /**
  * Fill placeholders inside a raw document.xml string.
  *
@@ -184,7 +249,27 @@ export function fillDocumentXml(
     let value = resolve(innerSpace);
     if (value == null && innerJoin !== innerSpace) value = resolve(innerJoin);
     if (value == null) {
+      // No value for this marker. Per requirement, the finished deed must NOT
+      // show any raw <bracket> placeholder — so we splice it OUT (empty value)
+      // rather than leaving it visible — but we STILL report the label in
+      // `unresolved` so the Verify step surfaces it as a discrepancy (and the
+      // caller can flag the important ones).
       unresolved.add(open + innerSpace.replace(/\s+/g, " ").trim() + close);
+      // Also swallow the whitespace/line-break the removed marker leaves behind,
+      // so the deed has no blank line or double space where a value was missing
+      // (the "unnecessary gaps" the user flagged). In priority order:
+      //   • a trailing <w:br/>  (the marker's own line)  -> drop that blank line
+      //   • else a leading <w:br/>                        -> drop that blank line
+      //   • else "A <m> B" (space on both sides)          -> collapse to "A B"
+      //   • else a line-leading marker's trailing space   -> drop the space
+      // (A whole paragraph left empty is removed later by collapseEmptiedParagraphs.)
+      let ps = match.index;
+      let pe = match.index + rawTok.length;
+      if (V[pe] === BREAK_SENTINEL) pe += 1;
+      else if (ps > 0 && V[ps - 1] === BREAK_SENTINEL) ps -= 1;
+      else if (V[pe] === " " && ps > 0 && V[ps - 1] === " ") pe += 1;
+      else if (V[pe] === " " && (ps === 0 || V[ps - 1] === "\n")) pe += 1;
+      plans.push({ start: ps, end: pe, value: "" });
     } else {
       plans.push({ start: match.index, end: match.index + rawTok.length, value });
     }
@@ -239,8 +324,12 @@ export function fillDocumentXml(
     }
   }
 
+  // Remove any body paragraph our marker-removal left completely empty (a blank
+  // line where a value was missing) — but never touch table cells, section
+  // properties, or paragraphs that were already blank in the template.
+  const filledXml = collapseEmptiedParagraphs(xml, parts.join(""));
+
   // Plain-text preview: join t-node text; <w:br/> => newline; paragraph => blank line.
-  const filledXml = parts.join("");
   const text = xmlToPlainText(filledXml);
 
   return {
