@@ -72,6 +72,29 @@ interface AadhaarRowData {
   district: string; state: string; pincode: string;
 }
 
+// Clean address to ensure no S/O, W/O, D/O, C/O prefix or relation name is included in residential address
+const cleanAddressWithoutRelation = (address: string, relation?: string): string => {
+  if (!address) return "";
+  let cleaned = address.trim();
+
+  // 1. Remove prefixes like "S/O: John Doe,", "W/O Jane Doe,", "D/O: ...", "C/O: ..."
+  cleaned = cleaned.replace(/^(?:S\/[Oo]|W\/[Oo]|D\/[Oo]|C\/[Oo]|Care\s+of|Son\s+of|Wife\s+of|Daughter\s+of)\s*:?\s*[^,.\n\d]+[,.\n]?\s*/i, "");
+
+  // 2. If a specific relation name is given, strip that relation name if present
+  if (relation && relation.trim()) {
+    const rel = relation.trim();
+    const nameOnly = rel.replace(/^(?:S\/[Oo]|W\/[Oo]|D\/[Oo]|C\/[Oo]|Care\s+of|Son\s+of|Wife\s+of|Daughter\s+of)\s*:?\s*/i, "").trim();
+    if (nameOnly.length > 2) {
+      const esc = nameOnly.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      cleaned = cleaned.replace(new RegExp(`(?:S\\/[Oo]|W\\/[Oo]|D\\/[Oo]|C\\/[Oo])?\\s*:?\\s*${esc}[,\\.\\s]*`, "gi"), "");
+    }
+  }
+
+  // 3. Clean leading or trailing punctuation or symbols
+  cleaned = cleaned.replace(/^[\s,.:\-]+|[\s,.:\-]+$/g, "").trim();
+  return cleaned;
+};
+
 // Turn a raw /api/extract-aadhaar payload into a normalized row: DOB coerced to the
 // ISO value the date input needs, and age computed from DOB when the card omits it.
 const normalizeAadhaarPayload = (data: any): AadhaarRowData => {
@@ -80,15 +103,18 @@ const normalizeAadhaarPayload = (data: any): AadhaarRowData => {
   // which is year-subtraction only and overshoots by 1 before the birthday. Only
   // fall back to the model's age when the card has no readable DOB.
   const age = dob ? calculateAgeFromDOB(dob) : (data?.age ? String(data.age) : "");
+  const relation = data?.relation || "";
+  const rawAddr = data?.address || "";
+  const address = cleanAddressWithoutRelation(rawAddr, relation);
   return {
     name: data?.name || "",
-    relation: data?.relation || "",
+    relation,
     occupation: data?.occupation || "",
     cellNo: data?.mobile || "",
     aadhaarNo: data?.aadhaarNo || "",
     age: age || "",
     dob,
-    address: data?.address || "",
+    address,
     district: data?.district || "",
     state: data?.state || "",
     pincode: data?.pincode || "",
@@ -126,16 +152,18 @@ function mergeAadhaar<T extends AadhaarRowData & { id: string }>(
 
   if (idx >= 0) {
     const cur = prev[idx];
+    const rel = cur.relation || incoming.relation;
+    const addr = cleanAddressWithoutRelation(cur.address || incoming.address, rel);
     const filled: T = {
       ...cur,
       name: cur.name || incoming.name,
-      relation: cur.relation || incoming.relation,
+      relation: rel,
       occupation: cur.occupation || incoming.occupation,
       cellNo: cur.cellNo || incoming.cellNo,
       aadhaarNo: cur.aadhaarNo || incoming.aadhaarNo,
       age: cur.age || incoming.age,
       dob: cur.dob || incoming.dob,
-      address: cur.address || incoming.address,
+      address: addr,
       district: cur.district || incoming.district,
       state: cur.state || incoming.state,
       pincode: cur.pincode || incoming.pincode,
@@ -266,9 +294,6 @@ export default function App() {
   // NEW: Property Type selector
   const [propertyType, setPropertyType] = useState<"" | "Open plot" | "House" | "Demolished House" | "Part of open place" | "Flat">("");
 
-  // NEW: Link Document Type selector
-  const [linkDocumentType, setLinkDocumentType] = useState<"Sale Deed" | "Release Deed" | "Gift Deed">("Sale Deed");
-
   // NEW: Loading states for uploads
   const [uploadingAadhaarExecutant, setUploadingAadhaarExecutant] = useState(false);
   const [uploadingAadhaarClaimant, setUploadingAadhaarClaimant] = useState(false);
@@ -318,11 +343,12 @@ export default function App() {
   interface LinkDocumentRow {
     id: string;
     layoutFileNo: string;
-    linkDocType: string;
     linkDocNo: string;
+    linkDocDate: string;
     subRegistrar: string;
     subRegistrarCode: string;
     pattadarPassbookNo: string;
+    passbookKhataNo: string;
     nalaOrderNo: string;
     houseTaxReceipt: string;
   }
@@ -337,11 +363,15 @@ export default function App() {
     nearHNo: string;
     adjacentHNo: string;
     locality: string;
+    pincode: string;
+    vltPtiNo: string;
     marketValuePerSqYard: string;
     marketValueTotal: string;
     // House specific
+    houseBearingHNo: string;
     houseNature: string;
     houseFloors: string;
+    housePlinthArea: string;
     houseAge: string;
     houseTapConnection: string;
     houseMetersNo: string;
@@ -413,11 +443,12 @@ export default function App() {
   const [jurVillage, setJurVillage] = useState("");
   const [jurPincode, setJurPincode] = useState("");
 
-  const [linkDocType, setLinkDocType] = useState("");
   const [linkDocNo, setLinkDocNo] = useState("");
+  const [linkDocDate, setLinkDocDate] = useState("");
   const [linkSubRegistrar, setLinkSubRegistrar] = useState("");
   const [linkSubRegistrarCode, setLinkSubRegistrarCode] = useState("");
   const [linkPattadarPassbook, setLinkPattadarPassbook] = useState("");
+  const [linkPassbookKhataNo, setLinkPassbookKhataNo] = useState("");
   const [linkNalaOrderNo, setLinkNalaOrderNo] = useState("");
   const [linkLayoutFileNo, setLinkLayoutFileNo] = useState("");
 
@@ -429,8 +460,11 @@ export default function App() {
   const [propNearHNo, setPropNearHNo] = useState("");
   const [propAdjacentHNo, setPropAdjacentHNo] = useState("");
   const [propLocality, setPropLocality] = useState("");
+  const [propPincode, setPropPincode] = useState("");
+  const [propVltPtiNo, setPropVltPtiNo] = useState("");
   const [propMarketValuePerSqYard, setPropMarketValuePerSqYard] = useState("");
   const [propMarketValueTotal, setPropMarketValueTotal] = useState("");
+  const [autoAdjustBlanks, setAutoAdjustBlanks] = useState(true);
 
   // Additional Property fields for House, Demolished House, Part of Open Place, Flat from the PDF
   const [propHouseNature, setPropHouseNature] = useState("");
@@ -607,6 +641,10 @@ export default function App() {
   const [customTemplateText, setCustomTemplateText] = useState<string>("");
   const [customTemplateName, setCustomTemplateName] = useState<string>("");
   const [customTemplateLoading, setCustomTemplateLoading] = useState(false);
+  // When the uploaded template is a .docx, keep its ORIGINAL bytes (base64) so the
+  // server can fill the <markers> in place and preserve the template's exact
+  // formatting (fonts, bold, sizes, margins, alignment) instead of rebuilding it.
+  const [customTemplateDocxBase64, setCustomTemplateDocxBase64] = useState<string>("");
 
   // Step 6: Auto-Filled Deed draft text
   const [filledDeedText, setFilledDeedText] = useState("");
@@ -629,6 +667,16 @@ export default function App() {
   const [auditing, setAuditing] = useState(false);
   const [auditStepIndex, setAuditStepIndex] = useState(0);
 
+  // Generate Plan Feature State
+  const [sketchImage, setSketchImage] = useState<string | null>(null);
+  const [sketchFileName, setSketchFileName] = useState<string>("");
+  const [planCustomPrompt, setPlanCustomPrompt] = useState<string>("");
+  const [generatedPlanImage, setGeneratedPlanImage] = useState<string | null>(null);
+  const [planGenerating, setPlanGenerating] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [planMasterPrompt, setPlanMasterPrompt] = useState<string>("");
+  const [planVerificationReport, setPlanVerificationReport] = useState<any | null>(null);
+
   // General App states
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -644,7 +692,8 @@ export default function App() {
     { number: 4, title: "Auto-Fill Draft", telugu: "డీడ్ తయారీ", desc: "Merge details into template" },
     { number: 5, title: "Re-Verify Deed", telugu: "సరిపోలిక తనిఖీ", desc: "Deep audit for errors" },
     { number: 6, title: "Stamp Preview", telugu: "రిజిస్ట్రేషన్ ప్రివ్యూ", desc: "A4 stamp-paper preview" },
-    { number: 7, title: "Download & Print", telugu: "డౌన్‌లోడ్ & ప్రింట్", desc: "Export Word/PDF & print" }
+    { number: 7, title: "Generate Plan", telugu: "ప్లాన్ జనరేషన్", desc: "Convert hand sketch to CAD AI image" },
+    { number: 8, title: "Download & Print", telugu: "డౌన్‌లోడ్ & ప్రింట్", desc: "Export Word/PDF & print" }
   ];
 
   const auditingStepsLogs = [
@@ -1094,84 +1143,219 @@ export default function App() {
 
       const data = await response.json();
 
-      // Update Jurisdiction fields - ADD TO ARRAY
+      // Update Jurisdiction fields - Fill existing row or create new
       if (data.jurisdiction) {
-        const newJurisdiction: JurisdictionRow = {
-          id: `jurisdiction-${Date.now()}`,
-          districtRegistrar: data.jurisdiction.districtRegistrar || "",
-          subRegistrar: data.jurisdiction.subRegistrar || "",
-          district: data.jurisdiction.district || "",
-          mandal: data.jurisdiction.mandal || "",
-          village: data.jurisdiction.village || "",
-          pincode: data.jurisdiction.pincode || ""
-        };
-        setJurisdictionsList(prev => [...prev, newJurisdiction]);
+        setJurisdictionsList(prev => {
+          if (prev.length === 0) {
+            return [{
+              id: `jurisdiction-${Date.now()}`,
+              districtRegistrar: data.jurisdiction.districtRegistrar || "",
+              subRegistrar: data.jurisdiction.subRegistrar || "",
+              district: data.jurisdiction.district || "",
+              mandal: data.jurisdiction.mandal || "",
+              village: data.jurisdiction.village || "",
+              pincode: data.jurisdiction.pincode || ""
+            }];
+          } else {
+            const updated = [...prev];
+            updated[0] = {
+              ...updated[0],
+              districtRegistrar: data.jurisdiction.districtRegistrar || updated[0].districtRegistrar,
+              subRegistrar: data.jurisdiction.subRegistrar || updated[0].subRegistrar,
+              district: data.jurisdiction.district || updated[0].district,
+              mandal: data.jurisdiction.mandal || updated[0].mandal,
+              village: data.jurisdiction.village || updated[0].village,
+              pincode: data.jurisdiction.pincode || updated[0].pincode
+            };
+            return updated;
+          }
+        });
       }
 
-      // Update Link Document Details - ADD TO ARRAY
+      // Update Link Document Details - Fill existing row or append
       if (data.linkDocument) {
-        const newLinkDoc: LinkDocumentRow = {
-          id: `linkdoc-${Date.now()}`,
-          layoutFileNo: data.linkDocument.layoutFileNo || "",
-          linkDocType: data.linkDocument.docType || "",
-          linkDocNo: data.linkDocument.docNo || "",
-          subRegistrar: data.linkDocument.subRegistrar || "",
-          subRegistrarCode: data.linkDocument.subRegistrarCode || "",
-          pattadarPassbookNo: data.linkDocument.pattadarPassbook || "",
-          nalaOrderNo: data.linkDocument.nalaOrderNo || "",
-          houseTaxReceipt: data.linkDocument.houseTaxReceipt || ""
-        };
-        setLinkDocumentsList(prev => [...prev, newLinkDoc]);
+        setLinkDocumentsList(prev => {
+          if (prev.length === 0) {
+            return [{
+              id: `linkdoc-${Date.now()}`,
+              layoutFileNo: data.linkDocument.layoutFileNo || "",
+              linkDocNo: data.linkDocument.docNo || "",
+              linkDocDate: data.linkDocument.docDate || data.linkDocument.linkDocDate || "",
+              subRegistrar: data.linkDocument.subRegistrar || "",
+              subRegistrarCode: data.linkDocument.subRegistrarCode || "",
+              pattadarPassbookNo: data.linkDocument.pattadarPassbook || "",
+              passbookKhataNo: data.linkDocument.passbookKhataNo || data.linkDocument.khataNo || "",
+              nalaOrderNo: data.linkDocument.nalaOrderNo || "",
+              houseTaxReceipt: data.linkDocument.houseTaxReceipt || ""
+            }];
+          } else {
+            const first = prev[0];
+            if (!first.linkDocNo && !first.linkDocDate && !first.layoutFileNo) {
+              const updated = [...prev];
+              updated[0] = {
+                ...first,
+                layoutFileNo: data.linkDocument.layoutFileNo || first.layoutFileNo,
+                linkDocNo: data.linkDocument.docNo || first.linkDocNo,
+                linkDocDate: data.linkDocument.docDate || data.linkDocument.linkDocDate || first.linkDocDate,
+                subRegistrar: data.linkDocument.subRegistrar || first.subRegistrar,
+                subRegistrarCode: data.linkDocument.subRegistrarCode || first.subRegistrarCode,
+                pattadarPassbookNo: data.linkDocument.pattadarPassbook || first.pattadarPassbookNo,
+                passbookKhataNo: data.linkDocument.passbookKhataNo || data.linkDocument.khataNo || first.passbookKhataNo,
+                nalaOrderNo: data.linkDocument.nalaOrderNo || first.nalaOrderNo,
+                houseTaxReceipt: data.linkDocument.houseTaxReceipt || first.houseTaxReceipt
+              };
+              return updated;
+            } else {
+              return [...prev, {
+                id: `linkdoc-${Date.now()}`,
+                layoutFileNo: data.linkDocument.layoutFileNo || "",
+                linkDocNo: data.linkDocument.docNo || "",
+                linkDocDate: data.linkDocument.docDate || data.linkDocument.linkDocDate || "",
+                subRegistrar: data.linkDocument.subRegistrar || "",
+                subRegistrarCode: data.linkDocument.subRegistrarCode || "",
+                pattadarPassbookNo: data.linkDocument.pattadarPassbook || "",
+                passbookKhataNo: data.linkDocument.passbookKhataNo || data.linkDocument.khataNo || "",
+                nalaOrderNo: data.linkDocument.nalaOrderNo || "",
+                houseTaxReceipt: data.linkDocument.houseTaxReceipt || ""
+              }];
+            }
+          }
+        });
       }
 
-      // Update Property Details - ADD TO ARRAY
+      // Update Property Details - Fill existing property row or create new
       if (data.property) {
-        const newProperty: PropertyRow = {
-          id: `property-${Date.now()}`,
-          propertyType: propertyType || "",
-          plotNo: data.property.plotNo || "",
-          surveyNo: data.property.surveyNo || "",
-          extentSqYards: data.property.extentSqYards || "",
-          extentSqMeters: data.property.extentSqMeters || "",
-          nearHNo: data.property.nearHNo || "",
-          locality: data.property.locality || "",
-          marketValueTotal: data.property.marketValueTotal || "",
-          marketValuePerSqYard: data.property.marketValuePerSqYard || "",
-          // House fields
-          houseNature: data.property.house?.nature || "",
-          houseFloors: data.property.house?.floors || "",
-          houseAge: data.property.house?.age || "",
-          houseTapConnection: data.property.house?.tapConnection || "",
-          houseMetersNo: data.property.house?.metersNo || "",
-          houseTaxes: data.property.house?.taxes || "",
-          houseRentalValue: data.property.house?.rentalValue || "",
-          // Flat fields
-          flatNo: data.property.flat?.flatNo || "",
-          flatUndividedSqYards: data.property.flat?.undividedSqYards || "",
-          flatBearingHNo: data.property.flat?.bearingHNo || "",
-          flatBuildingName: data.property.flat?.buildingName || "",
-          flatFloorS: data.property.flat?.floorS || "",
-          // Initialize all other PropertyRow fields as empty
-          adjacentHNo: "",
-          demoBearingHNo: "", demoLocality: "", demoTapConnection: "", demoMetersNo: "",
-          partBearingHNo: "", partLocality: "",
-          flatUndividedSqMeters: "", flatNature: "", flatLocality: "", flatValuePerSqFeet: "",
-          flatMarketValueTotal: "", flatAge: "", flatTapConnection: "", flatMetersNo: "",
-          flatTaxes: "", flatRentalValue: "", flatNearHNo: "", flatPlinthArea: "", flatTotalLand: ""
-        };
-        setPropertiesList(prev => [...prev, newProperty]);
+        const extractedType = (data.property.propertyType as any) || propertyType || "";
+        setPropertiesList(prev => {
+          if (prev.length === 0) {
+            return [{
+              id: `property-${Date.now()}`,
+              propertyType: extractedType || "Open plot",
+              plotNo: data.property.plotNo || "",
+              surveyNo: data.property.surveyNo || "",
+              extentSqYards: data.property.extentSqYards || "",
+              extentSqMeters: data.property.extentSqMeters || (data.property.extentSqYards ? (Number(data.property.extentSqYards) * 0.836127).toFixed(2) : ""),
+              nearHNo: data.property.nearHNo || "",
+              locality: data.property.locality || "",
+              pincode: data.property.pincode || data.jurisdiction?.pincode || "",
+              vltPtiNo: data.property.vltPtiNo || data.property.ptiNo || "",
+              marketValueTotal: data.property.marketValueTotal || "",
+              marketValuePerSqYard: data.property.marketValuePerSqYard || "",
+              houseBearingHNo: data.property.nearHNo || data.property.house?.bearingHNo || "",
+              houseNature: data.property.house?.nature || "",
+              houseFloors: data.property.house?.floors || "",
+              housePlinthArea: data.property.house?.plinthArea || "",
+              houseAge: data.property.house?.age || "",
+              houseTapConnection: data.property.house?.tapConnection || "",
+              houseMetersNo: data.property.house?.metersNo || "",
+              houseTaxes: data.property.house?.taxes || "",
+              houseRentalValue: data.property.house?.rentalValue || "",
+              flatNo: data.property.flat?.flatNo || "",
+              flatUndividedSqYards: data.property.flat?.undividedSqYards || "",
+              flatBearingHNo: data.property.flat?.bearingHNo || "",
+              flatBuildingName: data.property.flat?.buildingName || "",
+              flatFloorS: data.property.flat?.floorS || "",
+              adjacentHNo: "",
+              demoBearingHNo: data.property.nearHNo || "", demoLocality: data.property.locality || "",
+              demoTapConnection: data.property.house?.tapConnection || "", demoMetersNo: data.property.house?.metersNo || "",
+              partBearingHNo: data.property.nearHNo || "", partLocality: data.property.locality || "",
+              flatUndividedSqMeters: "", flatNature: "", flatLocality: data.property.locality || "", flatValuePerSqFeet: "",
+              flatMarketValueTotal: data.property.marketValueTotal || "", flatAge: data.property.house?.age || "",
+              flatTapConnection: data.property.house?.tapConnection || "", flatMetersNo: data.property.house?.metersNo || "",
+              flatTaxes: "", flatRentalValue: "", flatNearHNo: data.property.nearHNo || "", flatPlinthArea: data.property.house?.plinthArea || "", flatTotalLand: ""
+            }];
+          } else {
+            const updated = [...prev];
+            const target = { ...updated[0] };
+            if (!target.propertyType && extractedType) {
+              target.propertyType = extractedType;
+            }
+            if (data.property.plotNo) target.plotNo = data.property.plotNo;
+            if (data.property.surveyNo) target.surveyNo = data.property.surveyNo;
+            if (data.property.extentSqYards) {
+              target.extentSqYards = data.property.extentSqYards;
+              if (!target.extentSqMeters) {
+                target.extentSqMeters = (Number(data.property.extentSqYards) * 0.836127).toFixed(2);
+              }
+            }
+            if (data.property.extentSqMeters) target.extentSqMeters = data.property.extentSqMeters;
+            if (data.property.nearHNo) {
+              target.nearHNo = data.property.nearHNo;
+              target.houseBearingHNo = target.houseBearingHNo || data.property.nearHNo;
+              target.demoBearingHNo = target.demoBearingHNo || data.property.nearHNo;
+              target.partBearingHNo = target.partBearingHNo || data.property.nearHNo;
+              target.flatBearingHNo = target.flatBearingHNo || data.property.nearHNo;
+            }
+            if (data.property.locality) {
+              target.locality = data.property.locality;
+              target.demoLocality = target.demoLocality || data.property.locality;
+              target.partLocality = target.partLocality || data.property.locality;
+              target.flatLocality = target.flatLocality || data.property.locality;
+            }
+            if (data.property.pincode || data.jurisdiction?.pincode) {
+              target.pincode = data.property.pincode || data.jurisdiction?.pincode;
+            }
+            if (data.property.vltPtiNo || data.property.ptiNo) {
+              target.vltPtiNo = data.property.vltPtiNo || data.property.ptiNo;
+            }
+            if (data.property.marketValueTotal) {
+              target.marketValueTotal = data.property.marketValueTotal;
+              target.flatMarketValueTotal = target.flatMarketValueTotal || data.property.marketValueTotal;
+            }
+            if (data.property.marketValuePerSqYard) target.marketValuePerSqYard = data.property.marketValuePerSqYard;
+
+            if (data.property.house) {
+              if (data.property.house.nature) target.houseNature = data.property.house.nature;
+              if (data.property.house.floors) target.houseFloors = data.property.house.floors;
+              if (data.property.house.age) target.houseAge = data.property.house.age;
+              if (data.property.house.tapConnection) target.houseTapConnection = data.property.house.tapConnection;
+              if (data.property.house.metersNo) target.houseMetersNo = data.property.house.metersNo;
+              if (data.property.house.taxes) target.houseTaxes = data.property.house.taxes;
+              if (data.property.house.rentalValue) target.houseRentalValue = data.property.house.rentalValue;
+              if (data.property.house.plinthArea) target.housePlinthArea = data.property.house.plinthArea;
+            }
+
+            if (data.property.flat) {
+              if (data.property.flat.flatNo) target.flatNo = data.property.flat.flatNo;
+              if (data.property.flat.undividedSqYards) target.flatUndividedSqYards = data.property.flat.undividedSqYards;
+              if (data.property.flat.bearingHNo) target.flatBearingHNo = data.property.flat.bearingHNo;
+              if (data.property.flat.buildingName) target.flatBuildingName = data.property.flat.buildingName;
+              if (data.property.flat.floorS) target.flatFloorS = data.property.flat.floorS;
+            }
+
+            updated[0] = target;
+            return updated;
+          }
+        });
+
+        if (!propertyType && extractedType) {
+          setPropertyType(extractedType);
+        }
       }
 
-      // Update Boundaries - ADD TO ARRAY
+      // Update Boundaries - Fill existing row or create new
       if (data.boundaries) {
-        const newBoundary: BoundaryRow = {
-          id: `boundary-${Date.now()}`,
-          east: data.boundaries.east || "",
-          west: data.boundaries.west || "",
-          north: data.boundaries.north || "",
-          south: data.boundaries.south || ""
-        };
-        setBoundariesList(prev => [...prev, newBoundary]);
+        setBoundariesList(prev => {
+          if (prev.length === 0) {
+            return [{
+              id: `boundary-${Date.now()}`,
+              east: data.boundaries.east || "",
+              west: data.boundaries.west || "",
+              north: data.boundaries.north || "",
+              south: data.boundaries.south || ""
+            }];
+          } else {
+            const updated = [...prev];
+            updated[0] = {
+              ...updated[0],
+              east: data.boundaries.east || updated[0].east,
+              west: data.boundaries.west || updated[0].west,
+              north: data.boundaries.north || updated[0].north,
+              south: data.boundaries.south || updated[0].south
+            };
+            return updated;
+          }
+        });
       }
 
       // Retain the raw file so the Step-5 verification can cross-check the draft against the source.
@@ -1270,11 +1454,12 @@ export default function App() {
     const newLinkDoc: LinkDocumentRow = {
       id: `linkdoc-${Date.now()}`,
       layoutFileNo: "",
-      linkDocType: "",
       linkDocNo: "",
+      linkDocDate: "",
       subRegistrar: "",
       subRegistrarCode: "",
       pattadarPassbookNo: "",
+      passbookKhataNo: "",
       nalaOrderNo: "",
       houseTaxReceipt: ""
     };
@@ -1305,10 +1490,14 @@ export default function App() {
       nearHNo: "",
       adjacentHNo: "",
       locality: "",
+      pincode: "",
+      vltPtiNo: "",
       marketValuePerSqYard: "",
       marketValueTotal: "",
+      houseBearingHNo: "",
       houseNature: "",
       houseFloors: "",
+      housePlinthArea: "",
       houseAge: "",
       houseTapConnection: "",
       houseMetersNo: "",
@@ -1555,7 +1744,7 @@ export default function App() {
       dob: e.dob,
       occupation: e.occupation || "",
       cellNo: e.cellNo || "",
-      address: [e.address, e.district, e.state, e.pincode].filter(Boolean).join(", "),
+      address: [cleanAddressWithoutRelation(e.address, e.relation), e.district, e.state, e.pincode].filter(Boolean).join(", "),
     }));
 
     const buyers = (claimantsList.length
@@ -1572,7 +1761,7 @@ export default function App() {
       dob: c.dob,
       occupation: c.occupation || "",
       cellNo: c.cellNo || "",
-      address: [c.address, c.district, c.state, c.pincode].filter(Boolean).join(", "),
+      address: [cleanAddressWithoutRelation(c.address, c.relation), c.district, c.state, c.pincode].filter(Boolean).join(", "),
     }));
 
     const firstProp = propertiesList[0] || ({} as any);
@@ -1593,10 +1782,12 @@ export default function App() {
         village: firstJur.village || jurVillage || propertyVillage || "",
         mandal: firstJur.mandal || jurMandal || propertyMandal || "",
         district: firstJur.district || jurDistrict || propertyDistrict || "",
+        pincode: firstProp.pincode || firstJur.pincode || jurPincode || propPincode || "",
         state: "Telangana",
         hNo: firstProp.nearHNo || propNearHNo || propertyHNo || "",
         plotNo: firstProp.plotNo || propPlotNo || propertyPlotNo || "",
-        ptiNo: firstLink.pattadarPassbookNo || linkPattadarPassbook || propertyPTINo || "",
+        ptiNo: firstProp.vltPtiNo || propVltPtiNo || firstLink.pattadarPassbookNo || linkPattadarPassbook || propertyPTINo || "",
+        vltPtiNo: firstProp.vltPtiNo || propVltPtiNo || propertyPTINo || "",
         extentSqYards: firstProp.extentSqYards || propExtentSqYards || propertyExtent || "",
         plinthArea: firstProp.flatPlinthArea || propertyPlinth || "",
         boundaries: {
@@ -1608,8 +1799,10 @@ export default function App() {
       },
       linkDeed: {
         deedNumber: firstLink.linkDocNo || linkDocNo || "",
-        executionDate: "",
+        executionDate: firstLink.linkDocDate || linkDocDate || "",
         village: firstLink.subRegistrar || linkSubRegistrar || "",
+        pattadarPassbookNo: firstLink.pattadarPassbookNo || linkPattadarPassbook || "",
+        passbookKhataNo: firstLink.passbookKhataNo || linkPassbookKhataNo || "",
       },
     };
   };
@@ -1634,10 +1827,14 @@ export default function App() {
     try {
       const lower = file.name.toLowerCase();
       let text = "";
+      // Reset any previously captured original .docx bytes.
+      setCustomTemplateDocxBase64("");
       if (lower.endsWith(".docx")) {
         const arrayBuffer = await file.arrayBuffer();
         const result = await mammoth.extractRawText({ arrayBuffer });
         text = (result?.value || "").trim();
+        // Keep the ORIGINAL .docx bytes for true in-place, formatting-preserving fill.
+        setCustomTemplateDocxBase64(await convertFileToBase64(file));
       } else if (lower.endsWith(".doc")) {
         // Legacy Word 97-2003 — parse server-side via word-extractor.
         const base64 = await convertFileToBase64(file);
@@ -1806,7 +2003,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(
           isCustom
-            ? { customTemplateText, customTemplateName, details }
+            ? { customTemplateText, customTemplateName, customTemplateDocxBase64, details }
             : { templateId: selectedTemplateId, details }
         ),
       });
@@ -1844,16 +2041,74 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  // Rasterise the registration-plan SVG (a data:image/svg+xml URL) into a PNG in the
+  // browser so the server can embed it in the Word/PDF. Word/LibreOffice cannot embed
+  // a raw SVG reliably, and there is no server-side rasteriser, so we render it here
+  // (the browser already draws this exact SVG) on a canvas at `scale`x for print
+  // crispness. Returns the raw base64 (no data-URL prefix) plus pixel dimensions.
+  const rasterizePlanToPng = (
+    svgDataUrl: string,
+    scale = 2
+  ): Promise<{ pngBase64: string; width: number; height: number }> =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const w = img.naturalWidth || 800;
+        const h = img.naturalHeight || 1131;
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(w * scale);
+        canvas.height = Math.round(h * scale);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          reject(new Error("Canvas 2D context unavailable"));
+          return;
+        }
+        // Flatten onto white — the SVG's own background is white, but be explicit so
+        // transparency never bleeds through in the .docx.
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        try {
+          const dataUrl = canvas.toDataURL("image/png");
+          resolve({
+            pngBase64: dataUrl.replace(/^data:image\/png;base64,/, ""),
+            width: canvas.width,
+            height: canvas.height,
+          });
+        } catch (e) {
+          reject(e);
+        }
+      };
+      img.onerror = () => reject(new Error("Failed to load plan SVG for rasterisation"));
+      img.src = svgDataUrl;
+    });
+
   // Step 7: export the final deed as .docx (mandatory) or .pdf (best-effort).
   const exportDocument = async (format: "docx" | "pdf") => {
     setExporting(format);
     setError(null);
     try {
       const nameForFile = (executantsList[0]?.name || executantName || "Deed").replace(/\s+/g, "_");
+      // If a registration plan was generated, rasterise it so the server appends it
+      // as the LAST page of the exported document. Best-effort: on any failure we
+      // still export the deed itself.
+      let planFields: Record<string, unknown> = {};
+      if (generatedPlanImage) {
+        try {
+          const png = await rasterizePlanToPng(generatedPlanImage, 2);
+          planFields = {
+            planImagePngBase64: png.pngBase64,
+            planImageWidthPx: png.width,
+            planImageHeightPx: png.height,
+          };
+        } catch (e) {
+          console.warn("Could not rasterise plan for document append; exporting without it:", e);
+        }
+      }
       const res = await fetch("/api/export-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ format, finalText: filledDeedText }),
+        body: JSON.stringify({ format, finalText: filledDeedText, ...planFields }),
       });
       if (!res.ok) throw new Error(`Server responded ${res.status}`);
       const data = await res.json();
@@ -1906,50 +2161,7 @@ export default function App() {
       const templateText = template ? template.templateText : customModelText;
       
       // Build high-fidelity facts list consolidated from the user's Step 3 Registration Form state
-      const details = {
-        executants: executantsList.map(e => ({
-          name: e.name,
-          relation: "S/o (implied)",
-          age: parseInt(e.age) || 51,
-          aadhaar: e.aadhaarNo,
-          pan: e.pan || "N/A",
-          dob: e.dob,
-          address: `${e.address}, ${e.district}, ${e.state} - ${e.pincode}`
-        })),
-        claimants: claimantsList.map(c => ({
-          name: c.name,
-          relation: "S/o (implied)",
-          age: parseInt(c.age) || 45,
-          aadhaar: c.aadhaarNo,
-          pan: c.pan || "N/A",
-          dob: c.dob,
-          address: `${c.address}, ${c.district}, ${c.state} - ${c.pincode}`
-        })),
-        property: {
-          surveyNo: propSurveyNo,
-          village: jurVillage,
-          mandal: jurMandal,
-          district: jurDistrict,
-          state: "Telangana",
-          hNo: propNearHNo,
-          plotNo: propPlotNo,
-          ptiNo: linkPattadarPassbook,
-          extentSqYards: propExtentSqYards,
-          plinthArea: "N/A",
-          boundaries: {
-            east: boundaryEast,
-            west: boundaryWest,
-            north: boundaryNorth,
-            south: boundarySouth
-          }
-        },
-        linkDeed: {
-          deedNumber: linkDocNo,
-          executionDate: "14th August 1998",
-          village: linkSubRegistrar
-        },
-        registrationDate
-      };
+      const details = buildConsolidatedDetails();
 
       const response = await fetch("/api/fill-template", {
         method: "POST",
@@ -2037,6 +2249,88 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
     return text;
   };
 
+  // Function to call /api/generate-plan with the sketch base64 image and property details
+  const handleGeneratePlan = async (overridePrompt?: string, overrideImage?: string) => {
+    const base64ToUse = overrideImage || sketchImage;
+    if (!base64ToUse) {
+      setError("Please upload a hand-drawn sketch image first.");
+      return;
+    }
+
+    setPlanGenerating(true);
+    setPlanError(null);
+
+    const consolidated = buildConsolidatedDetails();
+    const currentProp: any = consolidated.property || {};
+
+    try {
+      const response = await fetch("/api/generate-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sketchBase64: base64ToUse,
+          customPrompt: overridePrompt !== undefined ? overridePrompt : planCustomPrompt,
+          // Full consolidated details drive the deterministic one-pager renderer
+          // (party paragraphs by transaction type, property description, area table).
+          details: consolidated,
+          // Flat shape retained for the boundary-verification cross-check + fallback.
+          propertyDetails: {
+            boundaries: currentProp.boundaries || {
+              east: boundaryEast,
+              west: boundaryWest,
+              north: boundaryNorth,
+              south: boundarySouth,
+            },
+            surveyNo: currentProp.surveyNo || propSurveyNo,
+            plotNo: currentProp.plotNo || propPlotNo,
+            extentSqYards: currentProp.extentSqYards || propExtentSqYards,
+          }
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Plan generation failed (${response.status})`);
+      }
+
+      const data = await response.json();
+      if (data.generatedImageBase64) {
+        setGeneratedPlanImage(data.generatedImageBase64);
+      }
+      if (data.masterPromptUsed) {
+        setPlanMasterPrompt(data.masterPromptUsed);
+      }
+      if (data.verificationReport) {
+        setPlanVerificationReport(data.verificationReport);
+      }
+      if (data.imageError) {
+        console.warn("Plan generation notice:", data.imageError);
+      }
+    } catch (err: any) {
+      console.error("Error generating plan:", err);
+      setPlanError(err.message || "Failed to generate computerized plot image.");
+    } finally {
+      setPlanGenerating(false);
+    }
+  };
+
+  // Helper to handle hand-drawn sketch file upload
+  const handleSketchUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setSketchFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const result = event.target?.result as string;
+      setSketchImage(result);
+      setGeneratedPlanImage(null);
+      setPlanVerificationReport(null);
+      // Auto-trigger plan generation upon upload
+      handleGeneratePlan(planCustomPrompt, result);
+    };
+    reader.readAsDataURL(file);
+  };
+
   // Trigger Step 7: Deep Verification Audit
   const triggerDeedVerificationAudit = async () => {
     setAuditing(true);
@@ -2076,6 +2370,73 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
     }
   };
 
+const getTeluguCategory = (category: string) => {
+  if (!category) return "";
+  const catLower = category.toLowerCase();
+  if (catLower.includes("name")) return "పేర్ల వ్యత్యాసం";
+  if (catLower.includes("property")) return "ఆస్తి వివరాల వ్యత్యాసం";
+  if (catLower.includes("link")) return "లింక్ దస్తావేజు వ్యత్యాసం";
+  if (catLower.includes("boundary") || catLower.includes("boundaries")) return "సరిహద్దుల వ్యత్యాసం";
+  if (catLower.includes("identity") || catLower.includes("aadhaar")) return "గుర్తింపు వ్యత్యాసం";
+  if (catLower.includes("residual")) return "ఇతర ఆస్తి వివరాల లోపం";
+  if (catLower.includes("complete")) return "అసంపూర్తి వివరాలు";
+  return "వ్యత్యాసం";
+};
+
+const getTeluguDescription = (desc: string) => {
+  if (!desc) return "";
+  const lower = desc.toLowerCase();
+  if (lower.includes("spelling variation") || (lower.includes("spelling") && lower.includes("ankem"))) {
+    return "పేరు అక్షరక్రమం తేడా: డ్రాఫ్ట్‌లో 'అంకెo శ్రీనివాసరావు' అని ఉంది, కానీ ఆధార్‌లో 'అంకెo శ్రీనివాస్' అని ఉంది.";
+  }
+  if (lower.includes("plot number mismatch") || lower.includes("plot no 15")) {
+    return "ప్లాట్ నంబర్ తేడా: డ్రాఫ్ట్‌లో ప్లాట్ నంబర్ 15 అని ఉంది, కానీ ఒరిజినల్ లింక్ దస్తావేజులో ప్లాట్ నంబర్ 12 ఉంది.";
+  }
+  if (lower.includes("deed reference typo") || lower.includes("2340/1998")) {
+    return "లింక్ దస్తావేజు నంబర్ పొరపాటు: డ్రాఫ్ట్‌లో 2340/1998 అని ప్రస్తావించారు, కానీ ఒరిజినల్ దస్తావేజు నంబర్ 2304/1998.";
+  }
+  if (lower.includes("age written") || lower.includes("age mismatch")) {
+    return "వయస్సు వ్యత్యాసం: ఆధార్ పుట్టిన తేదీ ఆధారంగా రాసిన వయస్సు డ్రాఫ్ట్ పత్రంతో సరిపోలలేదు.";
+  }
+  if (lower.includes("house number") || lower.includes("h.no")) {
+    return "ఇంటి నంబర్ (H.No) వ్యత్యాసం: డ్రాఫ్ట్‌లో నమోదు చేసిన ఇంటి నంబర్ లింక్ పత్రంతో సరిపోలడం లేదు.";
+  }
+  if (lower.includes("pti") || lower.includes("property tax")) {
+    return "ఆస్తి పన్ను గుర్తింపు నంబర్ (PTI No) వ్యత్యాసం.";
+  }
+  if (lower.includes("boundaries") || lower.includes("boundary")) {
+    return "ఆస్తి సరిహద్దుల వ్యత్యాసం: డ్రాఫ్ట్ తూర్పు, పడమర, ఉత్తర, దక్షిణ సరిహద్దులు లింక్ పత్రంతో సరిపోలడం లేదు.";
+  }
+  if (lower.includes("spelling of the seller's name")) {
+    return "డ్రాఫ్ట్ రిజిస్ట్రేషన్ పత్రంలో విక్రేత పేరు అక్షరక్రమం అధికారిక ఆధార్ కార్డుతో సరిపోలలేదు.";
+  }
+  return "";
+};
+
+const getTeluguRecommendation = (rec: string) => {
+  if (!rec) return "";
+  const lower = rec.toLowerCase();
+  if (lower.includes("update name") || lower.includes("ankem srinivas")) {
+    return "ఆధార్ కార్డు ప్రకారం డ్రాఫ్ట్‌లోని పేరును 'అంకెo శ్రీనివాస్' గా సవరించండి.";
+  }
+  if (lower.includes("correct plot no") || lower.includes("plot no")) {
+    return "డ్రాఫ్ట్‌లో ప్లాట్ నంబర్‌ను అసలు లింక్ దస్తావేజు ప్రకారం '12' గా సవరించండి.";
+  }
+  if (lower.includes("correct deed citation") || lower.includes("2304/1998")) {
+    return "డ్రాఫ్ట్‌లో ప్రస్తావించిన లింక్ దస్తావేజు నంబర్‌ను '2304/1998' గా సరిచేయండి.";
+  }
+  if (lower.includes("update the seller's age") || lower.includes("age")) {
+    return "విక్రేత వయస్సును ఆధార్ జన్మతేదీ ప్రకారం సరిచేయండి.";
+  }
+  if (lower.includes("house number") || lower.includes("h.no")) {
+    return "ఇంటి నంబర్‌ను లింక్ దస్తావేజు ప్రకారం సవరించండి.";
+  }
+  if (lower.includes("boundaries") || lower.includes("boundary")) {
+    return "సరిహద్దుల వివరాలను లింక్ దస్తావేజులోని వివరాల ప్రకారం సరిగ్గా నమోదు చేయండి.";
+  }
+  return "";
+};
+
   const getHeuristicReportFallback = (): any => {
     const hasSrinivasaRao = filledDeedText.toLowerCase().includes("srinivasa rao");
     const hasPlot15 = filledDeedText.toLowerCase().includes("plot no 15");
@@ -2093,25 +2454,31 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
             category: "Names mismatch",
             severity: "CRITICAL",
             description: "Spelling variation: Draft has 'Ankem Srinivasa Rao' but Aadhaar has 'Ankem Srinivas'.",
+            descriptionTe: "పేరు అక్షరక్రమం తేడా: డ్రాఫ్ట్‌లో 'అంకెo శ్రీనివాసరావు' అని ఉంది, కానీ ఆధార్‌లో 'అంకెo శ్రీనివాస్' అని ఉంది.",
             expected: "Ankem Srinivas",
             found: "Ankem Srinivasa Rao",
-            recommendation: "Update name in draft to 'Ankem Srinivas' to match Aadhaar."
+            recommendation: "Update name in draft to 'Ankem Srinivas' to match Aadhaar.",
+            recommendationTe: "ఆధార్ కార్డు ప్రకారం డ్రాఫ్ట్‌లోని పేరును 'అంకెo శ్రీనివాస్' గా సవరించండి."
           },
           {
             category: "Property details mismatch",
             severity: "CRITICAL",
             description: "Plot Number Mismatch: Draft mentions Plot No 15 but original Link Deed mentions Plot No 12.",
+            descriptionTe: "ప్లాట్ నంబర్ తేడా: డ్రాఫ్ట్‌లో ప్లాట్ నంబర్ 15 అని ఉంది, కానీ ఒరిజినల్ లింక్ దస్తావేజులో ప్లాట్ నంబర్ 12 ఉంది.",
             expected: "Plot No 12",
             found: "Plot No 15",
-            recommendation: "Correct Plot No to '12'."
+            recommendation: "Correct Plot No to '12'.",
+            recommendationTe: "డ్రాఫ్ట్‌లో ప్లాట్ నంబర్‌ను అసలు లింక్ దస్తావేజు ప్రకారం '12' గా సవరించండి."
           },
           {
             category: "Link document numbers mismatch",
             severity: "CRITICAL",
             description: "Deed reference typo: Draft cites 2340/1998 but original deed is 2304/1998.",
+            descriptionTe: "లింక్ దస్తావేజు నంబర్ పొరపాటు: డ్రాఫ్ట్‌లో 2340/1998 అని ప్రస్తావించారు, కానీ ఒరిజినల్ దస్తావేజు నంబర్ 2304/1998.",
             expected: "2304/1998",
             found: "2340/1998",
-            recommendation: "Correct deed citation in the preamble to '2304/1998'."
+            recommendation: "Correct deed citation in the preamble to '2304/1998'.",
+            recommendationTe: "డ్రాఫ్ట్‌లో ప్రస్తావించిన లింక్ దస్తావేజు నంబర్‌ను '2304/1998' గా సరిచేయండి."
           }
         ],
         sellers: [{
@@ -2404,28 +2771,1334 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                           </div>
                         </div>
 
-                        {/* Top Financials Section: Property Type, Market Value, Stamps, Nature of Transaction */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6 bg-slate-50 p-4 border border-slate-300 rounded-lg">
-                          <div className="flex flex-col gap-1">
-                            <span className="text-[10px] font-black text-slate-700 uppercase">
-                              Type of Property <span className="text-red-600">*</span>
-                            </span>
-                            <select
-                              value={propertyType}
-                              onChange={(e) => setPropertyType(e.target.value as any)}
-                              className={`w-full px-2.5 py-1.5 border border-slate-300 rounded-md text-xs font-bold bg-white focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] ${
-                                propertyType === "" ? "text-slate-400" : "text-slate-800"
-                              }`}
-                            >
-                              <option value="" disabled>Select Property Type</option>
-                              <option value="Open plot">Open plot</option>
-                              <option value="House">House</option>
-                              <option value="Demolished House">Demolished House</option>
-                              <option value="Part of open place">Part of open place</option>
-                              <option value="Flat">Flat</option>
-                            </select>
+                        {/* JURISDICTION OF THE PROPERTY SECTION */}
+                        <div className="mb-6">
+                          <div className="bg-slate-700 text-white px-3 py-1 text-[11px] font-black uppercase tracking-wider rounded-t-lg border border-slate-700 flex items-center justify-between gap-1.5">
+                            <div className="flex items-center gap-3">
+                              <h3 className="text-xs font-black text-white uppercase tracking-wider flex items-center gap-1.5">
+                                <MapPin className="w-3.5 h-3.5 text-slate-300" /> JURISDICTION OF THE PROPERTY (ఆస్తి ప్రాంతీయ కార్యాలయాలు)
+                              </h3>
+                              {jurisdictionsList.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingJurisdiction(!editingJurisdiction)}
+                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
+                                    editingJurisdiction
+                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
+                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
+                                  }`}
+                                  title={editingJurisdiction ? "Click to lock editing" : "Click to edit fields"}
+                                >
+                                  {editingJurisdiction ? (
+                                    <>
+                                      <Unlock className="w-3 h-3" /> Editing
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Lock className="w-3 h-3" /> Edit
+                                    </>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                            <div className="flex gap-2">
+                              <label className="relative cursor-pointer">
+                                <input
+                                  type="file"
+                                  accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
+                                  onChange={handleLinkDocumentUpload}
+                                  className="hidden"
+                                  disabled={uploadingLinkDocument}
+                                />
+                                <span className="bg-blue-600 hover:bg-blue-700 text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1">
+                                  {uploadingLinkDocument ? (
+                                    <>
+                                      <RefreshCw className="w-3 h-3 animate-spin" /> Processing...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <UploadCloud className="w-3 h-3" /> Upload Link Document
+                                    </>
+                                  )}
+                                </span>
+                              </label>
+                              <button
+                                type="button"
+                                onClick={addEmptyJurisdiction}
+                                disabled={jurisdictionsList.some(j =>
+                                  j.district === "" && j.mandal === "" && j.village === ""
+                                )}
+                                className="bg-[#0a4d4a] hover:bg-[#073937] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1 transition-colors"
+                                title={jurisdictionsList.some(j => j.district === "" && j.mandal === "" && j.village === "")
+                                  ? "Fill the current row before adding a new one"
+                                  : "Add new jurisdiction"}
+                              >
+                                <Plus className="w-3 h-3" /> Add
+                              </button>
+                            </div>
                           </div>
 
+                          <table className="w-full border-collapse border border-slate-300 text-xs">
+                            <thead>
+                              <tr className="bg-slate-50">
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left w-16">Jur.No.</th>
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">District Registrar</th>
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Sub-Registrar</th>
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">District</th>
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Mandal</th>
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Village</th>
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Pin Code</th>
+                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-center w-20">Actions</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {jurisdictionsList.length === 0 ? (
+                                <tr>
+                                  <td colSpan={8} className="p-4 text-center text-slate-500 border border-slate-300">
+                                    No jurisdiction details added yet. Click "+ Add" or "Upload Link Document" to add jurisdiction details.
+                                  </td>
+                                </tr>
+                              ) : (
+                                jurisdictionsList.map((jur, idx) => (
+                                  <tr key={jur.id} className="hover:bg-slate-50">
+                                    <td className="border border-slate-300 p-1 bg-slate-50 text-center font-mono text-slate-600">
+                                      {idx + 1}
+                                    </td>
+                                    <td className="border border-slate-300 p-1">
+                                      <input
+                                        type="text"
+                                        value={jur.districtRegistrar}
+                                        onChange={(e) => updateJurisdiction(jur.id, "districtRegistrar", e.target.value)}
+                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
+                                        placeholder="District Registrar"
+                                      />
+                                    </td>
+                                    <td className="border border-slate-300 p-1">
+                                      <input
+                                        type="text"
+                                        value={jur.subRegistrar}
+                                        onChange={(e) => updateJurisdiction(jur.id, "subRegistrar", e.target.value)}
+                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
+                                        placeholder="Sub-Registrar"
+                                      />
+                                    </td>
+                                    <td className="border border-slate-300 p-1">
+                                      <input
+                                        type="text"
+                                        value={jur.district}
+                                        onChange={(e) => updateJurisdiction(jur.id, "district", e.target.value)}
+                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
+                                        placeholder="District"
+                                      />
+                                    </td>
+                                    <td className="border border-slate-300 p-1">
+                                      <input
+                                        type="text"
+                                        value={jur.mandal}
+                                        onChange={(e) => updateJurisdiction(jur.id, "mandal", e.target.value)}
+                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
+                                        placeholder="Mandal"
+                                      />
+                                    </td>
+                                    <td className="border border-slate-300 p-1">
+                                      <input
+                                        type="text"
+                                        value={jur.village}
+                                        onChange={(e) => updateJurisdiction(jur.id, "village", e.target.value)}
+                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
+                                        placeholder="Village"
+                                      />
+                                    </td>
+                                    <td className="border border-slate-300 p-1">
+                                      <input
+                                        type="text"
+                                        value={jur.pincode}
+                                        onChange={(e) => updateJurisdiction(jur.id, "pincode", e.target.value)}
+                                        className="w-full border-0 focus:outline-none text-xs font-mono font-bold p-1 bg-transparent"
+                                        placeholder="Pin Code"
+                                      />
+                                    </td>
+                                    <td className="border border-slate-300 p-1 text-center">
+                                      <button
+                                        type="button"
+                                        onClick={() => deleteJurisdiction(jur.id)}
+                                        className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors"
+                                        title="Delete jurisdiction"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        {/* LINK DOCUMENT DETAILS OF THE PROPERTY */}
+                        <div className="mb-6">
+                          <div className="flex justify-between items-center bg-slate-700 text-white px-3 py-1.5 border border-slate-700 rounded-t-lg">
+                            <div className="flex items-center gap-3">
+                              <h3 className="text-[11px] font-black uppercase tracking-wider flex items-center gap-1.5">
+                                <FileText className="w-3.5 h-3.5 text-slate-300" /> LINK DOCUMENT DETAILS OF THE PROPERTY (లింక్ పత్రాల క్రమ వివరాలు)
+                              </h3>
+                              {linkDocumentsList.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingLinkDocuments(!editingLinkDocuments)}
+                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
+                                    editingLinkDocuments
+                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
+                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
+                                  }`}
+                                  title={editingLinkDocuments ? "Click to lock editing" : "Click to edit fields"}
+                                >
+                                  {editingLinkDocuments ? (
+                                    <>
+                                      <Unlock className="w-3 h-3" /> Editing
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Lock className="w-3 h-3" /> Edit
+                                    </>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                            <div className="flex gap-2">
+                              <label className="relative cursor-pointer">
+                                <input
+                                  type="file"
+                                  accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
+                                  onChange={handleLinkDocumentUpload}
+                                  className="hidden"
+                                  disabled={uploadingLinkDocument}
+                                />
+                                <span className="bg-blue-600 hover:bg-blue-700 text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1">
+                                  {uploadingLinkDocument ? (
+                                    <>
+                                      <RefreshCw className="w-3 h-3 animate-spin" /> Processing...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <UploadCloud className="w-3 h-3" /> Add by Upload
+                                    </>
+                                  )}
+                                </span>
+                              </label>
+                              <button
+                                type="button"
+                                onClick={addEmptyLinkDocument}
+                                disabled={linkDocumentsList.some(doc =>
+                                  doc.layoutFileNo === "" && doc.linkDocNo === "" && doc.linkDocDate === "" &&
+                                  doc.subRegistrar === "" && doc.subRegistrarCode === "" && doc.pattadarPassbookNo === "" &&
+                                  doc.passbookKhataNo === "" && doc.nalaOrderNo === "" && doc.houseTaxReceipt === ""
+                                )}
+                                className="bg-[#0a4d4a] hover:bg-[#073937] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1"
+                                title={linkDocumentsList.some(doc =>
+                                  doc.layoutFileNo === "" && doc.linkDocNo === "" && doc.linkDocDate === "" &&
+                                  doc.subRegistrar === "" && doc.subRegistrarCode === "" && doc.pattadarPassbookNo === "" &&
+                                  doc.passbookKhataNo === "" && doc.nalaOrderNo === "" && doc.houseTaxReceipt === ""
+                                ) ? "Fill the current row before adding a new one" : "Add new link document"}
+                              >
+                                <Plus className="w-3 h-3" /> Add
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="overflow-x-auto">
+                            <table className="w-full border-collapse border border-slate-300 text-left">
+                              <thead>
+                                <tr className="bg-slate-100 border-b border-slate-300 text-[10px] text-slate-700 font-bold">
+                                  <th className="p-2 border border-slate-300 w-12 text-center">Doc.No.</th>
+                                  <th className="p-2 border border-slate-300 min-w-[120px]">Layout File No.</th>
+                                  <th className="p-2 border border-slate-300 min-w-[130px]">Link Doct.No/s</th>
+                                  <th className="p-2 border border-slate-300 min-w-[120px]">Link Doct. Date</th>
+                                  <th className="p-2 border border-slate-300 min-w-[120px]">Sub-Registrar</th>
+                                  <th className="p-2 border border-slate-300 w-32">Sub Registrar Code</th>
+                                  <th className="p-2 border border-slate-300 min-w-[140px]">Pattadar Pass Book No.</th>
+                                  <th className="p-2 border border-slate-300 min-w-[130px]">Pass Book Khata No.</th>
+                                  <th className="p-2 border border-slate-300 w-32">Nala Order No</th>
+                                  <th className="p-2 border border-slate-300 min-w-[120px]">House Tax Receipt</th>
+                                  <th className="p-2 border border-slate-300 w-16 text-center">Actions</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {linkDocumentsList.length === 0 ? (
+                                  <tr>
+                                    <td colSpan={11} className="p-4 text-center text-slate-500 text-sm">
+                                      No link documents added yet. Click "+ Add" or "Add by Upload" to add link documents.
+                                    </td>
+                                  </tr>
+                                ) : (
+                                  linkDocumentsList.map((doc, idx) => (
+                                    <tr key={doc.id} className="border-b border-slate-300 hover:bg-slate-50">
+                                      <td className="p-2 border border-slate-300 text-xs font-bold text-slate-500 text-center">
+                                        {idx + 1}
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.layoutFileNo}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'layoutFileNo', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
+                                          placeholder="Layout File No"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.linkDocNo}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'linkDocNo', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono font-bold text-slate-800 p-1"
+                                          placeholder="Doc Number"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.linkDocDate}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'linkDocDate', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono text-slate-800 p-1"
+                                          placeholder="Doc Date"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.subRegistrar}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'subRegistrar', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
+                                          placeholder="Sub-Registrar"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.subRegistrarCode}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'subRegistrarCode', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono text-slate-800 p-1"
+                                          placeholder="Code"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.pattadarPassbookNo}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'pattadarPassbookNo', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono font-bold text-slate-800 p-1"
+                                          placeholder="Passbook No"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.passbookKhataNo}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'passbookKhataNo', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono font-bold text-slate-800 p-1"
+                                          placeholder="Khata No"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.nalaOrderNo}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'nalaOrderNo', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono text-slate-800 p-1"
+                                          placeholder="Nala No"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={doc.houseTaxReceipt}
+                                          onChange={(e) => updateLinkDocument(doc.id, 'houseTaxReceipt', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
+                                          placeholder="Tax Receipt"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300 text-center">
+                                        <button
+                                          type="button"
+                                          onClick={() => deleteLinkDocument(doc.id)}
+                                          className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors cursor-pointer"
+                                          title="Delete link document"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5 mx-auto" />
+                                        </button>
+                                      </td>
+                                    </tr>
+                                  ))
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        {/* DYNAMIC PROPERTY SPECIFICATION SECTION - Tailored per Property Type */}
+                        <div className="mb-6">
+                          <div className="flex justify-between items-center bg-slate-100 px-3 py-1.5 border border-slate-300 rounded-t-lg flex-wrap gap-2">
+                            <div className="flex items-center gap-3">
+                              <h3 className="text-[10px] font-black text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
+                                <Building2 className="w-4 h-4" /> PROPERTY DETAILS (ఆస్తి వివరాలు)
+                              </h3>
+                              {propertiesList.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingProperties(!editingProperties)}
+                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
+                                    editingProperties
+                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
+                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
+                                  }`}
+                                  title={editingProperties ? "Click to lock editing" : "Click to edit fields"}
+                                >
+                                  {editingProperties ? (
+                                    <>
+                                      <Unlock className="w-3 h-3" /> Editing
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Lock className="w-3 h-3" /> Edit
+                                    </>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <label className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-[9px] font-black uppercase px-2.5 py-1 rounded flex items-center gap-1 cursor-pointer transition-colors shadow-sm">
+                                <UploadCloud className="w-3 h-3" />
+                                {uploadingLinkDocument ? "Extracting Details..." : "Upload Link Document"}
+                                <input
+                                  type="file"
+                                  accept=".pdf,.png,.jpg,.jpeg"
+                                  className="hidden"
+                                  disabled={uploadingLinkDocument}
+                                  onChange={handleLinkDocumentUpload}
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                onClick={addEmptyProperty}
+                                className="bg-slate-700 hover:bg-slate-800 text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1 cursor-pointer"
+                                title="Add new property"
+                              >
+                                <Plus className="w-3 h-3" /> Add Property
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="space-y-4 p-3 border border-t-0 border-slate-300 bg-slate-50/50 rounded-b-lg">
+                            {propertiesList.length === 0 ? (
+                              <div className="p-6 text-center text-slate-600 text-xs bg-white border border-dashed border-slate-300 rounded-lg flex flex-col items-center gap-2">
+                                <p>No properties added yet. Click <span className="font-bold text-[#0a4d4a]">+ Add Property</span> to enter property details manually, or upload a link document to auto-extract details.</p>
+                                <label className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-xs font-bold px-3 py-1.5 rounded flex items-center gap-1.5 cursor-pointer shadow-sm transition-all mt-1">
+                                  <UploadCloud className="w-4 h-4" />
+                                  {uploadingLinkDocument ? "Extracting details..." : "Upload Link Document to Auto-Extract"}
+                                  <input
+                                    type="file"
+                                    accept=".pdf,.png,.jpg,.jpeg"
+                                    className="hidden"
+                                    disabled={uploadingLinkDocument}
+                                    onChange={handleLinkDocumentUpload}
+                                  />
+                                </label>
+                              </div>
+                            ) : (
+                              propertiesList.map((prop, idx) => (
+                                <div key={prop.id} className="bg-white border border-slate-300 rounded-lg shadow-sm overflow-hidden">
+                                  {/* Property Card Header */}
+                                  <div className="bg-slate-100 px-3 py-2 border-b border-slate-300 flex items-center justify-between flex-wrap gap-2">
+                                    <div className="flex items-center gap-2">
+                                      <span className="bg-[#0a4d4a] text-white text-[10px] font-black uppercase px-2 py-0.5 rounded">
+                                        Property #{idx + 1}
+                                      </span>
+                                      <select
+                                        value={prop.propertyType}
+                                        onChange={(e) => {
+                                          const val = e.target.value as any;
+                                          updateProperty(prop.id, 'propertyType', val);
+                                          if (idx === 0) setPropertyType(val);
+                                        }}
+                                        className="bg-white border border-slate-300 text-xs font-bold text-slate-800 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a]"
+                                      >
+                                        <option value="">-- Select Property Type --</option>
+                                        <option value="Open plot">Open plot</option>
+                                        <option value="House">House</option>
+                                        <option value="Demolished House">Demolished House</option>
+                                        <option value="Part of open place">Part of open place</option>
+                                        <option value="Flat">Flat</option>
+                                      </select>
+                                    </div>
+
+                                    <div className="flex items-center gap-2">
+                                      <label className="bg-teal-700 hover:bg-teal-800 text-white text-[10px] font-bold px-2 py-1 rounded flex items-center gap-1 cursor-pointer transition-colors">
+                                        <UploadCloud className="w-3.5 h-3.5" />
+                                        {uploadingLinkDocument ? "Extracting..." : "Auto-fill from Link Doc"}
+                                        <input
+                                          type="file"
+                                          accept=".pdf,.png,.jpg,.jpeg"
+                                          className="hidden"
+                                          disabled={uploadingLinkDocument}
+                                          onChange={handleLinkDocumentUpload}
+                                        />
+                                      </label>
+                                      <button
+                                        type="button"
+                                        onClick={() => deleteProperty(prop.id)}
+                                        className="bg-red-500 hover:bg-red-600 text-white px-2 py-1 rounded text-xs font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                                        title="Delete Property"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" /> Remove
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Property Card Body */}
+                                  <div className="p-4">
+                                    {!prop.propertyType ? (
+                                      <div className="p-4 text-center text-slate-600 text-xs bg-slate-50 border border-dashed border-slate-200 rounded flex flex-col items-center gap-2">
+                                        <p className="italic">Select a property type above (Open plot, House, Demolished House, Part of open place, or Flat) to fill details manually, OR upload your link document to automatically extract and populate all property details.</p>
+                                        <label className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-xs font-bold px-3 py-1.5 rounded flex items-center gap-1.5 cursor-pointer shadow-sm transition-all mt-1">
+                                          <UploadCloud className="w-4 h-4" />
+                                          {uploadingLinkDocument ? "Extracting details..." : "Upload Link Document to Auto-Fill"}
+                                          <input
+                                            type="file"
+                                            accept=".pdf,.png,.jpg,.jpeg"
+                                            className="hidden"
+                                            disabled={uploadingLinkDocument}
+                                            onChange={handleLinkDocumentUpload}
+                                          />
+                                        </label>
+                                      </div>
+                                    ) : prop.propertyType === "Open plot" ? (
+                                      <div>
+                                        <h4 className="text-xs font-black text-[#0a4d4a] uppercase tracking-wider mb-3 pb-1 border-b border-slate-200">
+                                          PROPERTY DETAILS IF OPEN PLOT
+                                        </h4>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Plot No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.plotNo}
+                                              onChange={(e) => updateProperty(prop.id, 'plotNo', e.target.value)}
+                                              placeholder="Plot No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.yards</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqYards}
+                                              onChange={(e) => {
+                                                const val = e.target.value;
+                                                updateProperty(prop.id, 'extentSqYards', val);
+                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
+                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
+                                                }
+                                              }}
+                                              placeholder="Extent in Sq.yards"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.meters</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqMeters}
+                                              onChange={(e) => updateProperty(prop.id, 'extentSqMeters', e.target.value)}
+                                              placeholder="Extent in Sq.meters"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Survey No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.surveyNo}
+                                              onChange={(e) => updateProperty(prop.id, 'surveyNo', e.target.value)}
+                                              placeholder="Survey No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Near H.No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.nearHNo}
+                                              onChange={(e) => updateProperty(prop.id, 'nearHNo', e.target.value)}
+                                              placeholder="Near H.No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Adjacent H.No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.adjacentHNo}
+                                              onChange={(e) => updateProperty(prop.id, 'adjacentHNo', e.target.value)}
+                                              placeholder="Adjacent H.No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Locality</label>
+                                            <input
+                                              type="text"
+                                              value={prop.locality}
+                                              onChange={(e) => updateProperty(prop.id, 'locality', e.target.value)}
+                                              placeholder="Locality"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Pincode (పిన్ కోడ్)</label>
+                                            <input
+                                              type="text"
+                                              value={prop.pincode}
+                                              onChange={(e) => updateProperty(prop.id, 'pincode', e.target.value)}
+                                              placeholder="Pincode (e.g. 508211)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
+                                            <input
+                                              type="text"
+                                              value={prop.marketValuePerSqYard}
+                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                              placeholder="Market Value per sq.yard"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ) : prop.propertyType === "House" ? (
+                                      <div>
+                                        <h4 className="text-xs font-black text-[#0a4d4a] uppercase tracking-wider mb-3 pb-1 border-b border-slate-200">
+                                          PROPERTY DETAILS IF HOUSE
+                                        </h4>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Plot No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.plotNo}
+                                              onChange={(e) => updateProperty(prop.id, 'plotNo', e.target.value)}
+                                              placeholder="Plot No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.yards</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqYards}
+                                              onChange={(e) => {
+                                                const val = e.target.value;
+                                                updateProperty(prop.id, 'extentSqYards', val);
+                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
+                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
+                                                }
+                                              }}
+                                              placeholder="Extent in Sq.yards"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.meters</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqMeters}
+                                              onChange={(e) => updateProperty(prop.id, 'extentSqMeters', e.target.value)}
+                                              placeholder="Extent in Sq.meters"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Survey No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.surveyNo}
+                                              onChange={(e) => updateProperty(prop.id, 'surveyNo', e.target.value)}
+                                              placeholder="Survey No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Bearing H.No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseBearingHNo || prop.nearHNo}
+                                              onChange={(e) => {
+                                                updateProperty(prop.id, 'houseBearingHNo', e.target.value);
+                                                updateProperty(prop.id, 'nearHNo', e.target.value);
+                                              }}
+                                              placeholder="Bearing H.No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Nature of House</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseNature}
+                                              onChange={(e) => updateProperty(prop.id, 'houseNature', e.target.value)}
+                                              placeholder="Nature of House (e.g. RCC / Tiled)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Floors</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseFloors}
+                                              onChange={(e) => updateProperty(prop.id, 'houseFloors', e.target.value)}
+                                              placeholder="Floors (e.g. G+1)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Plinth Area</label>
+                                            <input
+                                              type="text"
+                                              value={prop.housePlinthArea}
+                                              onChange={(e) => updateProperty(prop.id, 'housePlinthArea', e.target.value)}
+                                              placeholder="Plinth Area (e.g. 1500 Sq.Ft)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Locality</label>
+                                            <input
+                                              type="text"
+                                              value={prop.locality}
+                                              onChange={(e) => updateProperty(prop.id, 'locality', e.target.value)}
+                                              placeholder="Locality"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Pincode (పిన్ కోడ్)</label>
+                                            <input
+                                              type="text"
+                                              value={prop.pincode}
+                                              onChange={(e) => updateProperty(prop.id, 'pincode', e.target.value)}
+                                              placeholder="Pincode (e.g. 508211)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
+                                            <input
+                                              type="text"
+                                              value={prop.marketValuePerSqYard}
+                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                              placeholder="Market Value per sq.yard"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Age of House</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseAge}
+                                              onChange={(e) => updateProperty(prop.id, 'houseAge', e.target.value)}
+                                              placeholder="Age of House (years)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Tap Connection No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseTapConnection}
+                                              onChange={(e) => updateProperty(prop.id, 'houseTapConnection', e.target.value)}
+                                              placeholder="Tap Connection No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Meters No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseMetersNo}
+                                              onChange={(e) => updateProperty(prop.id, 'houseMetersNo', e.target.value)}
+                                              placeholder="Meters No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Taxes Per Annum</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseTaxes}
+                                              onChange={(e) => updateProperty(prop.id, 'houseTaxes', e.target.value)}
+                                              placeholder="Taxes Per Annum"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Annual Rental Value</label>
+                                            <input
+                                              type="text"
+                                              value={prop.houseRentalValue}
+                                              onChange={(e) => updateProperty(prop.id, 'houseRentalValue', e.target.value)}
+                                              placeholder="Annual Rental Value"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ) : prop.propertyType === "Demolished House" ? (
+                                      <div>
+                                        <h4 className="text-xs font-black text-[#0a4d4a] uppercase tracking-wider mb-3 pb-1 border-b border-slate-200">
+                                          PROPERTY DETAILS IF DEMOLISHED HOUSE
+                                        </h4>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Plot No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.plotNo}
+                                              onChange={(e) => updateProperty(prop.id, 'plotNo', e.target.value)}
+                                              placeholder="Plot No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.yards</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqYards}
+                                              onChange={(e) => {
+                                                const val = e.target.value;
+                                                updateProperty(prop.id, 'extentSqYards', val);
+                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
+                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
+                                                }
+                                              }}
+                                              placeholder="Extent in Sq.yards"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.meters</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqMeters}
+                                              onChange={(e) => updateProperty(prop.id, 'extentSqMeters', e.target.value)}
+                                              placeholder="Extent in Sq.meters"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Survey No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.surveyNo}
+                                              onChange={(e) => updateProperty(prop.id, 'surveyNo', e.target.value)}
+                                              placeholder="Survey No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Demolished bearing H.No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.demoBearingHNo}
+                                              onChange={(e) => updateProperty(prop.id, 'demoBearingHNo', e.target.value)}
+                                              placeholder="Demolished bearing H.No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Locality</label>
+                                            <input
+                                              type="text"
+                                              value={prop.demoLocality || prop.locality}
+                                              onChange={(e) => {
+                                                updateProperty(prop.id, 'demoLocality', e.target.value);
+                                                updateProperty(prop.id, 'locality', e.target.value);
+                                              }}
+                                              placeholder="Locality"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Pincode (పిన్ కోడ్)</label>
+                                            <input
+                                              type="text"
+                                              value={prop.pincode}
+                                              onChange={(e) => updateProperty(prop.id, 'pincode', e.target.value)}
+                                              placeholder="Pincode (e.g. 508211)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
+                                            <input
+                                              type="text"
+                                              value={prop.marketValuePerSqYard}
+                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                              placeholder="Market Value per sq.yard"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Tap Connection No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.demoTapConnection}
+                                              onChange={(e) => updateProperty(prop.id, 'demoTapConnection', e.target.value)}
+                                              placeholder="Tap Connection No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Meters No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.demoMetersNo}
+                                              onChange={(e) => updateProperty(prop.id, 'demoMetersNo', e.target.value)}
+                                              placeholder="Meters No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ) : prop.propertyType === "Part of open place" ? (
+                                      <div>
+                                        <h4 className="text-xs font-black text-[#0a4d4a] uppercase tracking-wider mb-3 pb-1 border-b border-slate-200">
+                                          PROPERTY DETAILS IF PART OF OPEN PLACE
+                                        </h4>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Plot No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.plotNo}
+                                              onChange={(e) => updateProperty(prop.id, 'plotNo', e.target.value)}
+                                              placeholder="Plot No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.yards</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqYards}
+                                              onChange={(e) => {
+                                                const val = e.target.value;
+                                                updateProperty(prop.id, 'extentSqYards', val);
+                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
+                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
+                                                }
+                                              }}
+                                              placeholder="Extent in Sq.yards"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Extent in Sq.meters</label>
+                                            <input
+                                              type="text"
+                                              value={prop.extentSqMeters}
+                                              onChange={(e) => updateProperty(prop.id, 'extentSqMeters', e.target.value)}
+                                              placeholder="Extent in Sq.meters"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Survey No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.surveyNo}
+                                              onChange={(e) => updateProperty(prop.id, 'surveyNo', e.target.value)}
+                                              placeholder="Survey No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Part open place of bearing H.No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.partBearingHNo}
+                                              onChange={(e) => updateProperty(prop.id, 'partBearingHNo', e.target.value)}
+                                              placeholder="Part open place of bearing H.No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Locality</label>
+                                            <input
+                                              type="text"
+                                              value={prop.partLocality || prop.locality}
+                                              onChange={(e) => {
+                                                updateProperty(prop.id, 'partLocality', e.target.value);
+                                                updateProperty(prop.id, 'locality', e.target.value);
+                                              }}
+                                              placeholder="Locality"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Pincode (పిన్ కోడ్)</label>
+                                            <input
+                                              type="text"
+                                              value={prop.pincode}
+                                              onChange={(e) => updateProperty(prop.id, 'pincode', e.target.value)}
+                                              placeholder="Pincode (e.g. 508211)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
+                                            <input
+                                              type="text"
+                                              value={prop.marketValuePerSqYard}
+                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                              placeholder="Market Value per sq.yard"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ) : prop.propertyType === "Flat" ? (
+                                      <div>
+                                        <h4 className="text-xs font-black text-[#0a4d4a] uppercase tracking-wider mb-3 pb-1 border-b border-slate-200">
+                                          PROPERTY DETAILS IF FLAT
+                                        </h4>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Flat No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatNo}
+                                              onChange={(e) => updateProperty(prop.id, 'flatNo', e.target.value)}
+                                              placeholder="Flat No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Undivided share land in Sq.yards</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatUndividedSqYards}
+                                              onChange={(e) => {
+                                                const val = e.target.value;
+                                                updateProperty(prop.id, 'flatUndividedSqYards', val);
+                                                if (!prop.flatUndividedSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
+                                                  updateProperty(prop.id, 'flatUndividedSqMeters', (Number(val) * 0.836127).toFixed(2));
+                                                }
+                                              }}
+                                              placeholder="UDS in Sq.yards"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Undivided share land in Sq.meters</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatUndividedSqMeters}
+                                              onChange={(e) => updateProperty(prop.id, 'flatUndividedSqMeters', e.target.value)}
+                                              placeholder="UDS in Sq.meters"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Survey No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.surveyNo}
+                                              onChange={(e) => updateProperty(prop.id, 'surveyNo', e.target.value)}
+                                              placeholder="Survey No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-semibold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Bearing H.No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatBearingHNo}
+                                              onChange={(e) => updateProperty(prop.id, 'flatBearingHNo', e.target.value)}
+                                              placeholder="Bearing H.No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Nature of House</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatNature}
+                                              onChange={(e) => updateProperty(prop.id, 'flatNature', e.target.value)}
+                                              placeholder="Nature of House (e.g. Residential Apartment)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Locality</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatLocality}
+                                              onChange={(e) => updateProperty(prop.id, 'flatLocality', e.target.value)}
+                                              placeholder="Locality"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Pincode (పిన్ కోడ్)</label>
+                                            <input
+                                              type="text"
+                                              value={prop.pincode}
+                                              onChange={(e) => updateProperty(prop.id, 'pincode', e.target.value)}
+                                              placeholder="Pincode (e.g. 508211)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.feet</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatValuePerSqFeet}
+                                              onChange={(e) => updateProperty(prop.id, 'flatValuePerSqFeet', e.target.value)}
+                                              placeholder="Market Value per sq.feet"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Age of Flat</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatAge}
+                                              onChange={(e) => updateProperty(prop.id, 'flatAge', e.target.value)}
+                                              placeholder="Age of Flat (years)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Tap Connection No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatTapConnection}
+                                              onChange={(e) => updateProperty(prop.id, 'flatTapConnection', e.target.value)}
+                                              placeholder="Tap Connection No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Meters No/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatMetersNo}
+                                              onChange={(e) => updateProperty(prop.id, 'flatMetersNo', e.target.value)}
+                                              placeholder="Meters No/s"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Taxes Per Annum</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatTaxes}
+                                              onChange={(e) => updateProperty(prop.id, 'flatTaxes', e.target.value)}
+                                              placeholder="Taxes Per Annum"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Annual Rental Value</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatRentalValue}
+                                              onChange={(e) => updateProperty(prop.id, 'flatRentalValue', e.target.value)}
+                                              placeholder="Annual Rental Value"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Building Name</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatBuildingName}
+                                              onChange={(e) => updateProperty(prop.id, 'flatBuildingName', e.target.value)}
+                                              placeholder="Building Name"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Near H.No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatNearHNo}
+                                              onChange={(e) => updateProperty(prop.id, 'flatNearHNo', e.target.value)}
+                                              placeholder="Near H.No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Floor/s</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatFloorS}
+                                              onChange={(e) => updateProperty(prop.id, 'flatFloorS', e.target.value)}
+                                              placeholder="Floor (e.g. 2nd Floor)"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Plinth Area</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatPlinthArea}
+                                              onChange={(e) => updateProperty(prop.id, 'flatPlinthArea', e.target.value)}
+                                              placeholder="Plinth Area in Sq.Ft"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Total land</label>
+                                            <input
+                                              type="text"
+                                              value={prop.flatTotalLand}
+                                              onChange={(e) => updateProperty(prop.id, 'flatTotalLand', e.target.value)}
+                                              placeholder="Total land"
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                        {/* BOUNDARIES SECTION */}
+                        <div>
+                          <div className="flex justify-between items-center bg-[#1e40af] text-white px-3 py-1.5 border border-[#1e40af] rounded-t-lg">
+                            <div className="flex items-center gap-3">
+                              <h3 className="text-[11px] font-black uppercase tracking-wider flex items-center gap-1.5">
+                                <BookOpen className="w-3.5 h-3.5 text-blue-200" /> BOUNDARIES (సరిహద్దుల వివరాలు)
+                              </h3>
+                              {boundariesList.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingBoundaries(!editingBoundaries)}
+                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
+                                    editingBoundaries
+                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
+                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
+                                  }`}
+                                  title={editingBoundaries ? "Click to lock editing" : "Click to edit fields"}
+                                >
+                                  {editingBoundaries ? (
+                                    <>
+                                      <Unlock className="w-3 h-3" /> Editing
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Lock className="w-3 h-3" /> Edit
+                                    </>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={addEmptyBoundary}
+                              disabled={boundariesList.some(b => b.east === "" && b.west === "" && b.north === "" && b.south === "")}
+                              className="bg-[#1e40af] hover:bg-[#1e3a8a] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1"
+                              title={boundariesList.some(b => b.east === "" && b.west === "" && b.north === "" && b.south === "") ? "Fill the current row before adding a new one" : "Add new boundary set"}
+                            >
+                              <Plus className="w-3 h-3" /> Add
+                            </button>
+                          </div>
+
+                          <div className="overflow-x-auto">
+                            <table className="w-full border-collapse border border-slate-300 text-left">
+                              <thead>
+                                <tr className="bg-slate-100 border-b border-slate-300 text-[10px] text-slate-700 font-bold">
+                                  <th className="p-2 border border-slate-300 w-12 text-center">Set No.</th>
+                                  <th className="p-2 border border-slate-300 min-w-[200px]">East (తూర్పు)</th>
+                                  <th className="p-2 border border-slate-300 min-w-[200px]">West (పడమర)</th>
+                                  <th className="p-2 border border-slate-300 min-w-[200px]">North (ఉత్తరం)</th>
+                                  <th className="p-2 border border-slate-300 min-w-[200px]">South (దక్షిణం)</th>
+                                  <th className="p-2 border border-slate-300 w-16 text-center">Actions</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {boundariesList.length === 0 ? (
+                                  <tr>
+                                    <td colSpan={6} className="p-4 text-center text-slate-500 text-sm">
+                                      No boundaries added yet. Click "+ Add" to add boundary details.
+                                    </td>
+                                  </tr>
+                                ) : (
+                                  boundariesList.map((boundary, idx) => (
+                                    <tr key={boundary.id} className="border-b border-slate-300 hover:bg-slate-50">
+                                      <td className="p-2 border border-slate-300 text-xs font-bold text-slate-500 text-center">
+                                        {idx + 1}
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={boundary.east}
+                                          onChange={(e) => updateBoundary(boundary.id, 'east', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
+                                          placeholder="East boundary"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={boundary.west}
+                                          onChange={(e) => updateBoundary(boundary.id, 'west', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
+                                          placeholder="West boundary"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={boundary.north}
+                                          onChange={(e) => updateBoundary(boundary.id, 'north', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
+                                          placeholder="North boundary"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300">
+                                        <input
+                                          type="text"
+                                          value={boundary.south}
+                                          onChange={(e) => updateBoundary(boundary.id, 'south', e.target.value)}
+                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
+                                          placeholder="South boundary"
+                                        />
+                                      </td>
+                                      <td className="p-1 border border-slate-300 text-center">
+                                        <button
+                                          type="button"
+                                          onClick={() => deleteBoundary(boundary.id)}
+                                          className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors cursor-pointer"
+                                          title="Delete boundary set"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5 mx-auto" />
+                                        </button>
+                                      </td>
+                                    </tr>
+                                  ))
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        {/* Top Financials Section: Market Value, Stamps, Nature of Transaction */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 bg-slate-50 p-4 border border-slate-300 rounded-lg mt-6">
                           <div className="flex flex-col gap-1">
                             <span className="text-[10px] font-black text-slate-700 uppercase">
                               Market Value of Rs. <span className="text-red-600">*</span>
@@ -2473,19 +4146,13 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                             <span className="text-[10px] font-black text-slate-700 uppercase">
                               Nature of Transaction <span className="text-red-600">*</span>
                             </span>
-                            <select
+                            <input
+                              type="text"
                               value={natureOfTransaction}
                               onChange={(e) => setNatureOfTransaction(e.target.value)}
-                              className={`w-full px-2.5 py-1.5 border border-slate-300 rounded-md text-xs font-bold bg-white focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] ${
-                                natureOfTransaction === "" ? "text-slate-400" : "text-slate-800"
-                              }`}
-                            >
-                              <option value="" disabled>Select Transaction Type</option>
-                              <option value="Sale Deed (కంపల్సరీ సేల్ డీడ్)">Sale Deed (కంపల్సరీ సేల్ డీడ్)</option>
-                              <option value="Gift Deed (బహుమతి పత్రం)">Gift Deed (బహుమతి పత్రం)</option>
-                              <option value="Partition Deed (విభజన పత్రం)">Partition Deed (విభజన పత్రం)</option>
-                              <option value="Development Agreement (అభివృద్ధి ఒప్పందం)">Development Agreement (అభివృద్ధి ఒప్పందం)</option>
-                            </select>
+                              className="w-full px-2.5 py-1.5 border border-slate-300 rounded-md text-xs font-bold text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] placeholder:font-normal placeholder:text-slate-400"
+                              placeholder="Enter Nature of Transaction (e.g. Sale Deed, Gift Deed)..."
+                            />
                           </div>
                         </div>
 
@@ -2926,709 +4593,6 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                             </table>
                           </div>
                         </div>
-
-                        {/* JURISDICTION OF THE PROPERTY SECTION */}
-                        <div className="mb-6">
-                          <div className="bg-slate-700 text-white px-3 py-1 text-[11px] font-black uppercase tracking-wider rounded-t-lg border border-slate-700 flex items-center justify-between gap-1.5">
-                            <div className="flex items-center gap-3">
-                              <h3 className="text-xs font-black text-white uppercase tracking-wider flex items-center gap-1.5">
-                                <MapPin className="w-3.5 h-3.5 text-slate-300" /> JURISDICTION OF THE PROPERTY (ఆస్తి ప్రాంతీయ కార్యాలయాలు)
-                              </h3>
-                              {jurisdictionsList.length > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => setEditingJurisdiction(!editingJurisdiction)}
-                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
-                                    editingJurisdiction
-                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
-                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
-                                  }`}
-                                  title={editingJurisdiction ? "Click to lock editing" : "Click to edit fields"}
-                                >
-                                  {editingJurisdiction ? (
-                                    <>
-                                      <Unlock className="w-3 h-3" /> Editing
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Lock className="w-3 h-3" /> Edit
-                                    </>
-                                  )}
-                                </button>
-                              )}
-                            </div>
-                            <div className="flex gap-2">
-                              <label className="relative cursor-pointer">
-                                <input
-                                  type="file"
-                                  accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
-                                  onChange={handleLinkDocumentUpload}
-                                  className="hidden"
-                                  disabled={uploadingLinkDocument}
-                                />
-                                <span className="bg-blue-600 hover:bg-blue-700 text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1">
-                                  {uploadingLinkDocument ? (
-                                    <>
-                                      <RefreshCw className="w-3 h-3 animate-spin" /> Processing...
-                                    </>
-                                  ) : (
-                                    <>
-                                      <UploadCloud className="w-3 h-3" /> Upload Link Document
-                                    </>
-                                  )}
-                                </span>
-                              </label>
-                              <button
-                                type="button"
-                                onClick={addEmptyJurisdiction}
-                                disabled={jurisdictionsList.some(j =>
-                                  j.district === "" && j.mandal === "" && j.village === ""
-                                )}
-                                className="bg-[#0a4d4a] hover:bg-[#073937] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1 transition-colors"
-                                title={jurisdictionsList.some(j => j.district === "" && j.mandal === "" && j.village === "")
-                                  ? "Fill the current row before adding a new one"
-                                  : "Add new jurisdiction"}
-                              >
-                                <Plus className="w-3 h-3" /> Add
-                              </button>
-                            </div>
-                          </div>
-
-                          <table className="w-full border-collapse border border-slate-300 text-xs">
-                            <thead>
-                              <tr className="bg-slate-50">
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left w-16">Jur.No.</th>
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">District Registrar</th>
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Sub-Registrar</th>
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">District</th>
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Mandal</th>
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Village</th>
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-left">Pin Code</th>
-                                <th className="border border-slate-300 p-2 font-bold text-slate-700 text-[11px] text-center w-20">Actions</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {jurisdictionsList.length === 0 ? (
-                                <tr>
-                                  <td colSpan={8} className="p-4 text-center text-slate-500 border border-slate-300">
-                                    No jurisdiction details added yet. Click "+ Add" or "Upload Link Document" to add jurisdiction details.
-                                  </td>
-                                </tr>
-                              ) : (
-                                jurisdictionsList.map((jur, idx) => (
-                                  <tr key={jur.id} className="hover:bg-slate-50">
-                                    <td className="border border-slate-300 p-1 bg-slate-50 text-center font-mono text-slate-600">
-                                      {idx + 1}
-                                    </td>
-                                    <td className="border border-slate-300 p-1">
-                                      <input
-                                        type="text"
-                                        value={jur.districtRegistrar}
-                                        onChange={(e) => updateJurisdiction(jur.id, "districtRegistrar", e.target.value)}
-                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
-                                        placeholder="District Registrar"
-                                      />
-                                    </td>
-                                    <td className="border border-slate-300 p-1">
-                                      <input
-                                        type="text"
-                                        value={jur.subRegistrar}
-                                        onChange={(e) => updateJurisdiction(jur.id, "subRegistrar", e.target.value)}
-                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
-                                        placeholder="Sub-Registrar"
-                                      />
-                                    </td>
-                                    <td className="border border-slate-300 p-1">
-                                      <input
-                                        type="text"
-                                        value={jur.district}
-                                        onChange={(e) => updateJurisdiction(jur.id, "district", e.target.value)}
-                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
-                                        placeholder="District"
-                                      />
-                                    </td>
-                                    <td className="border border-slate-300 p-1">
-                                      <input
-                                        type="text"
-                                        value={jur.mandal}
-                                        onChange={(e) => updateJurisdiction(jur.id, "mandal", e.target.value)}
-                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
-                                        placeholder="Mandal"
-                                      />
-                                    </td>
-                                    <td className="border border-slate-300 p-1">
-                                      <input
-                                        type="text"
-                                        value={jur.village}
-                                        onChange={(e) => updateJurisdiction(jur.id, "village", e.target.value)}
-                                        className="w-full border-0 focus:outline-none text-xs font-semibold p-1 bg-transparent"
-                                        placeholder="Village"
-                                      />
-                                    </td>
-                                    <td className="border border-slate-300 p-1">
-                                      <input
-                                        type="text"
-                                        value={jur.pincode}
-                                        onChange={(e) => updateJurisdiction(jur.id, "pincode", e.target.value)}
-                                        className="w-full border-0 focus:outline-none text-xs font-mono font-bold p-1 bg-transparent"
-                                        placeholder="Pin Code"
-                                      />
-                                    </td>
-                                    <td className="border border-slate-300 p-1 text-center">
-                                      <button
-                                        type="button"
-                                        onClick={() => deleteJurisdiction(jur.id)}
-                                        className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors"
-                                        title="Delete jurisdiction"
-                                      >
-                                        <Trash2 className="w-3.5 h-3.5" />
-                                      </button>
-                                    </td>
-                                  </tr>
-                                ))
-                              )}
-                            </tbody>
-                          </table>
-                        </div>
-
-                        {/* LINK DOCUMENT TYPE SELECTION */}
-                        <div className="mb-4 bg-white border border-slate-300 rounded-lg p-3">
-                          <label className="text-[10px] font-black text-slate-700 uppercase mb-2 block">
-                            Link Document Type <span className="text-red-600">*</span>
-                          </label>
-                          <div className="flex gap-4">
-                            <label className="flex items-center gap-2 cursor-pointer">
-                              <input
-                                type="radio"
-                                name="linkDocumentType"
-                                value="Sale Deed"
-                                checked={linkDocumentType === "Sale Deed"}
-                                onChange={(e) => setLinkDocumentType(e.target.value as any)}
-                                className="w-4 h-4 text-[#0a4d4a] focus:ring-[#0a4d4a]"
-                              />
-                              <span className="text-xs font-semibold text-slate-700">Sale Deed</span>
-                            </label>
-                            <label className="flex items-center gap-2 cursor-pointer">
-                              <input
-                                type="radio"
-                                name="linkDocumentType"
-                                value="Release Deed"
-                                checked={linkDocumentType === "Release Deed"}
-                                onChange={(e) => setLinkDocumentType(e.target.value as any)}
-                                className="w-4 h-4 text-[#0a4d4a] focus:ring-[#0a4d4a]"
-                              />
-                              <span className="text-xs font-semibold text-slate-700">Release Deed</span>
-                            </label>
-                            <label className="flex items-center gap-2 cursor-pointer">
-                              <input
-                                type="radio"
-                                name="linkDocumentType"
-                                value="Gift Deed"
-                                checked={linkDocumentType === "Gift Deed"}
-                                onChange={(e) => setLinkDocumentType(e.target.value as any)}
-                                className="w-4 h-4 text-[#0a4d4a] focus:ring-[#0a4d4a]"
-                              />
-                              <span className="text-xs font-semibold text-slate-700">Gift Deed</span>
-                            </label>
-                          </div>
-                        </div>
-
-                        {/* LINK DOCUMENT DETAILS OF THE PROPERTY */}
-                        <div className="mb-6">
-                          <div className="flex justify-between items-center bg-slate-700 text-white px-3 py-1.5 border border-slate-700 rounded-t-lg">
-                            <div className="flex items-center gap-3">
-                              <h3 className="text-[11px] font-black uppercase tracking-wider flex items-center gap-1.5">
-                                <FileText className="w-3.5 h-3.5 text-slate-300" /> LINK DOCUMENT DETAILS OF THE PROPERTY (లింక్ పత్రాల క్రమ వివరాలు)
-                              </h3>
-                              {linkDocumentsList.length > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => setEditingLinkDocuments(!editingLinkDocuments)}
-                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
-                                    editingLinkDocuments
-                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
-                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
-                                  }`}
-                                  title={editingLinkDocuments ? "Click to lock editing" : "Click to edit fields"}
-                                >
-                                  {editingLinkDocuments ? (
-                                    <>
-                                      <Unlock className="w-3 h-3" /> Editing
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Lock className="w-3 h-3" /> Edit
-                                    </>
-                                  )}
-                                </button>
-                              )}
-                            </div>
-                            <div className="flex gap-2">
-                              <label className="relative cursor-pointer">
-                                <input
-                                  type="file"
-                                  accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
-                                  onChange={handleLinkDocumentUpload}
-                                  className="hidden"
-                                  disabled={uploadingLinkDocument}
-                                />
-                                <span className="bg-blue-600 hover:bg-blue-700 text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1">
-                                  {uploadingLinkDocument ? (
-                                    <>
-                                      <RefreshCw className="w-3 h-3 animate-spin" /> Processing...
-                                    </>
-                                  ) : (
-                                    <>
-                                      <UploadCloud className="w-3 h-3" /> Add by Upload
-                                    </>
-                                  )}
-                                </span>
-                              </label>
-                              <button
-                                type="button"
-                                onClick={addEmptyLinkDocument}
-                                disabled={linkDocumentsList.some(doc =>
-                                  doc.layoutFileNo === "" && doc.linkDocType === "" && doc.linkDocNo === "" &&
-                                  doc.subRegistrar === "" && doc.subRegistrarCode === "" && doc.pattadarPassbookNo === "" &&
-                                  doc.nalaOrderNo === "" && doc.houseTaxReceipt === ""
-                                )}
-                                className="bg-[#0a4d4a] hover:bg-[#073937] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1"
-                                title={linkDocumentsList.some(doc =>
-                                  doc.layoutFileNo === "" && doc.linkDocType === "" && doc.linkDocNo === "" &&
-                                  doc.subRegistrar === "" && doc.subRegistrarCode === "" && doc.pattadarPassbookNo === "" &&
-                                  doc.nalaOrderNo === "" && doc.houseTaxReceipt === ""
-                                ) ? "Fill the current row before adding a new one" : "Add new link document"}
-                              >
-                                <Plus className="w-3 h-3" /> Add
-                              </button>
-                            </div>
-                          </div>
-
-                          <div className="overflow-x-auto">
-                            <table className="w-full border-collapse border border-slate-300 text-left">
-                              <thead>
-                                <tr className="bg-slate-100 border-b border-slate-300 text-[10px] text-slate-700 font-bold">
-                                  <th className="p-2 border border-slate-300 w-12 text-center">Doc.No.</th>
-                                  <th className="p-2 border border-slate-300 min-w-[120px]">Layout File No.</th>
-                                  <th className="p-2 border border-slate-300 min-w-[120px]">Link Doct.Type</th>
-                                  <th className="p-2 border border-slate-300 min-w-[130px]">Link Doct.No/s</th>
-                                  <th className="p-2 border border-slate-300 min-w-[120px]">Sub-Registrar</th>
-                                  <th className="p-2 border border-slate-300 w-32">Sub Registrar Code</th>
-                                  <th className="p-2 border border-slate-300 min-w-[140px]">Pattadar Pass Book No.</th>
-                                  <th className="p-2 border border-slate-300 w-32">Nala Order No</th>
-                                  <th className="p-2 border border-slate-300 min-w-[120px]">House Tax Receipt</th>
-                                  <th className="p-2 border border-slate-300 w-16 text-center">Actions</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {linkDocumentsList.length === 0 ? (
-                                  <tr>
-                                    <td colSpan={10} className="p-4 text-center text-slate-500 text-sm">
-                                      No link documents added yet. Click "+ Add" or "Add by Upload" to add link documents.
-                                    </td>
-                                  </tr>
-                                ) : (
-                                  linkDocumentsList.map((doc, idx) => (
-                                    <tr key={doc.id} className="border-b border-slate-300 hover:bg-slate-50">
-                                      <td className="p-2 border border-slate-300 text-xs font-bold text-slate-500 text-center">
-                                        {idx + 1}
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.layoutFileNo}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'layoutFileNo', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="Layout File No"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.linkDocType}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'linkDocType', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="Doc Type"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.linkDocNo}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'linkDocNo', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono font-bold text-slate-800 p-1"
-                                          placeholder="Doc Number"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.subRegistrar}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'subRegistrar', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="Sub-Registrar"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.subRegistrarCode}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'subRegistrarCode', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono text-slate-800 p-1"
-                                          placeholder="Code"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.pattadarPassbookNo}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'pattadarPassbookNo', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono font-bold text-slate-800 p-1"
-                                          placeholder="Passbook No"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.nalaOrderNo}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'nalaOrderNo', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono text-slate-800 p-1"
-                                          placeholder="Nala No"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={doc.houseTaxReceipt}
-                                          onChange={(e) => updateLinkDocument(doc.id, 'houseTaxReceipt', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="Tax Receipt"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300 text-center">
-                                        <button
-                                          type="button"
-                                          onClick={() => deleteLinkDocument(doc.id)}
-                                          className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors cursor-pointer"
-                                          title="Delete link document"
-                                        >
-                                          <Trash2 className="w-3.5 h-3.5 mx-auto" />
-                                        </button>
-                                      </td>
-                                    </tr>
-                                  ))
-                                )}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-
-                        {/* DYNAMIC PROPERTY SPECIFICATION SECTION - Multi-Row Support */}
-                        <div className="mb-6">
-                          <div className="flex justify-between items-center bg-slate-100 px-3 py-1.5 border border-slate-300 rounded-t-lg">
-                            <div className="flex items-center gap-3">
-                              <h3 className="text-[10px] font-black text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
-                                <Building2 className="w-4 h-4" /> PROPERTY DETAILS (ఆస్తి వివరాలు)
-                              </h3>
-                              {propertiesList.length > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => setEditingProperties(!editingProperties)}
-                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
-                                    editingProperties
-                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
-                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
-                                  }`}
-                                  title={editingProperties ? "Click to lock editing" : "Click to edit fields"}
-                                >
-                                  {editingProperties ? (
-                                    <>
-                                      <Unlock className="w-3 h-3" /> Editing
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Lock className="w-3 h-3" /> Edit
-                                    </>
-                                  )}
-                                </button>
-                              )}
-                            </div>
-                            <button
-                              type="button"
-                              onClick={addEmptyProperty}
-                              disabled={propertiesList.some(p => p.propertyType === "" && p.plotNo === "" && p.surveyNo === "")}
-                              className="bg-[#0a4d4a] hover:bg-[#073937] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1"
-                              title={propertiesList.some(p => p.propertyType === "" && p.plotNo === "" && p.surveyNo === "") ? "Fill the current row before adding a new one" : "Add new property"}
-                            >
-                              <Plus className="w-3 h-3" /> Add
-                            </button>
-                          </div>
-
-                          <div className="overflow-x-auto">
-                            <table className="w-full border-collapse border border-slate-300 text-left">
-                              <thead>
-                                <tr className="bg-slate-100 border-b border-slate-300 text-[10px] text-slate-700 font-bold">
-                                  <th className="p-2 border border-slate-300 w-12 text-center">Prop.No.</th>
-                                  <th className="p-2 border border-slate-300 min-w-[140px]">Property Type</th>
-                                  <th className="p-2 border border-slate-300 w-28">Plot/Flat No</th>
-                                  <th className="p-2 border border-slate-300 w-28">Survey No</th>
-                                  <th className="p-2 border border-slate-300 w-32">Extent (Sq.yards)</th>
-                                  <th className="p-2 border border-slate-300 w-32">Extent (Sq.meters)</th>
-                                  <th className="p-2 border border-slate-300 w-28">Near/Bearing H.No.</th>
-                                  <th className="p-2 border border-slate-300 min-w-[120px]">Locality</th>
-                                  <th className="p-2 border border-slate-300 w-36">Market Value (Rs.)</th>
-                                  <th className="p-2 border border-slate-300 w-16 text-center">Actions</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {propertiesList.length === 0 ? (
-                                  <tr>
-                                    <td colSpan={10} className="p-4 text-center text-slate-500 text-sm">
-                                      No properties added yet. Click "+ Add" to add property details.
-                                    </td>
-                                  </tr>
-                                ) : (
-                                  propertiesList.map((prop, idx) => (
-                                    <tr key={prop.id} className="border-b border-slate-300 hover:bg-slate-50">
-                                      <td className="p-2 border border-slate-300 text-xs font-bold text-slate-500 text-center">
-                                        {idx + 1}
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <select
-                                          value={prop.propertyType}
-                                          onChange={(e) => updateProperty(prop.id, 'propertyType', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1 bg-white"
-                                        >
-                                          <option value="">Select Type</option>
-                                          <option value="Open plot">Open plot</option>
-                                          <option value="House">House</option>
-                                          <option value="Demolished House">Demolished House</option>
-                                          <option value="Part of open place">Part of open place</option>
-                                          <option value="Flat">Flat</option>
-                                        </select>
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={prop.propertyType === "Flat" ? prop.flatNo : prop.plotNo}
-                                          onChange={(e) => updateProperty(prop.id, prop.propertyType === "Flat" ? 'flatNo' : 'plotNo', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder={prop.propertyType === "Flat" ? "Flat No" : "Plot No"}
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={prop.surveyNo}
-                                          onChange={(e) => updateProperty(prop.id, 'surveyNo', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="Survey No"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={prop.propertyType === "Flat" ? prop.flatUndividedSqYards : prop.extentSqYards}
-                                          onChange={(e) => updateProperty(prop.id, prop.propertyType === "Flat" ? 'flatUndividedSqYards' : 'extentSqYards', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono text-slate-800 p-1"
-                                          placeholder="Sq.yards"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={prop.propertyType === "Flat" ? prop.flatUndividedSqMeters : prop.extentSqMeters}
-                                          onChange={(e) => updateProperty(prop.id, prop.propertyType === "Flat" ? 'flatUndividedSqMeters' : 'extentSqMeters', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono text-slate-800 p-1"
-                                          placeholder="Sq.meters"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={
-                                            prop.propertyType === "Flat" ? prop.flatBearingHNo :
-                                            prop.propertyType === "Demolished House" ? prop.demoBearingHNo :
-                                            prop.propertyType === "Part of open place" ? prop.partBearingHNo :
-                                            prop.nearHNo
-                                          }
-                                          onChange={(e) => {
-                                            const field = prop.propertyType === "Flat" ? 'flatBearingHNo' :
-                                              prop.propertyType === "Demolished House" ? 'demoBearingHNo' :
-                                              prop.propertyType === "Part of open place" ? 'partBearingHNo' :
-                                              'nearHNo';
-                                            updateProperty(prop.id, field as keyof PropertyRow, e.target.value);
-                                          }}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="H.No."
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={
-                                            prop.propertyType === "Flat" ? prop.flatLocality :
-                                            prop.propertyType === "Demolished House" ? prop.demoLocality :
-                                            prop.propertyType === "Part of open place" ? prop.partLocality :
-                                            prop.locality
-                                          }
-                                          onChange={(e) => {
-                                            const field = prop.propertyType === "Flat" ? 'flatLocality' :
-                                              prop.propertyType === "Demolished House" ? 'demoLocality' :
-                                              prop.propertyType === "Part of open place" ? 'partLocality' :
-                                              'locality';
-                                            updateProperty(prop.id, field as keyof PropertyRow, e.target.value);
-                                          }}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="Locality"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={prop.propertyType === "Flat" ? prop.flatMarketValueTotal : prop.marketValueTotal}
-                                          onChange={(e) => updateProperty(prop.id, prop.propertyType === "Flat" ? 'flatMarketValueTotal' : 'marketValueTotal', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-mono font-bold text-slate-800 p-1"
-                                          placeholder="Market Value"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300 text-center">
-                                        <button
-                                          type="button"
-                                          onClick={() => deleteProperty(prop.id)}
-                                          className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors cursor-pointer"
-                                          title="Delete property"
-                                        >
-                                          <Trash2 className="w-3.5 h-3.5 mx-auto" />
-                                        </button>
-                                      </td>
-                                    </tr>
-                                  ))
-                                )}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-                        {/* BOUNDARIES SECTION */}
-                        <div>
-                          <div className="flex justify-between items-center bg-[#1e40af] text-white px-3 py-1.5 border border-[#1e40af] rounded-t-lg">
-                            <div className="flex items-center gap-3">
-                              <h3 className="text-[11px] font-black uppercase tracking-wider flex items-center gap-1.5">
-                                <BookOpen className="w-3.5 h-3.5 text-blue-200" /> BOUNDARIES (సరిహద్దుల వివరాలు)
-                              </h3>
-                              {boundariesList.length > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => setEditingBoundaries(!editingBoundaries)}
-                                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-bold uppercase transition-colors ${
-                                    editingBoundaries
-                                      ? 'bg-orange-100 text-orange-700 border border-orange-300 hover:bg-orange-200'
-                                      : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200'
-                                  }`}
-                                  title={editingBoundaries ? "Click to lock editing" : "Click to edit fields"}
-                                >
-                                  {editingBoundaries ? (
-                                    <>
-                                      <Unlock className="w-3 h-3" /> Editing
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Lock className="w-3 h-3" /> Edit
-                                    </>
-                                  )}
-                                </button>
-                              )}
-                            </div>
-                            <button
-                              type="button"
-                              onClick={addEmptyBoundary}
-                              disabled={boundariesList.some(b => b.east === "" && b.west === "" && b.north === "" && b.south === "")}
-                              className="bg-[#1e40af] hover:bg-[#1e3a8a] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1"
-                              title={boundariesList.some(b => b.east === "" && b.west === "" && b.north === "" && b.south === "") ? "Fill the current row before adding a new one" : "Add new boundary set"}
-                            >
-                              <Plus className="w-3 h-3" /> Add
-                            </button>
-                          </div>
-
-                          <div className="overflow-x-auto">
-                            <table className="w-full border-collapse border border-slate-300 text-left">
-                              <thead>
-                                <tr className="bg-slate-100 border-b border-slate-300 text-[10px] text-slate-700 font-bold">
-                                  <th className="p-2 border border-slate-300 w-12 text-center">Set No.</th>
-                                  <th className="p-2 border border-slate-300 min-w-[200px]">East (తూర్పు)</th>
-                                  <th className="p-2 border border-slate-300 min-w-[200px]">West (పడమర)</th>
-                                  <th className="p-2 border border-slate-300 min-w-[200px]">North (ఉత్తరం)</th>
-                                  <th className="p-2 border border-slate-300 min-w-[200px]">South (దక్షిణం)</th>
-                                  <th className="p-2 border border-slate-300 w-16 text-center">Actions</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {boundariesList.length === 0 ? (
-                                  <tr>
-                                    <td colSpan={6} className="p-4 text-center text-slate-500 text-sm">
-                                      No boundaries added yet. Click "+ Add" to add boundary details.
-                                    </td>
-                                  </tr>
-                                ) : (
-                                  boundariesList.map((boundary, idx) => (
-                                    <tr key={boundary.id} className="border-b border-slate-300 hover:bg-slate-50">
-                                      <td className="p-2 border border-slate-300 text-xs font-bold text-slate-500 text-center">
-                                        {idx + 1}
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={boundary.east}
-                                          onChange={(e) => updateBoundary(boundary.id, 'east', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="East boundary"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={boundary.west}
-                                          onChange={(e) => updateBoundary(boundary.id, 'west', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="West boundary"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={boundary.north}
-                                          onChange={(e) => updateBoundary(boundary.id, 'north', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="North boundary"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
-                                          type="text"
-                                          value={boundary.south}
-                                          onChange={(e) => updateBoundary(boundary.id, 'south', e.target.value)}
-                                          className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#1e40af] text-xs font-semibold text-slate-800 p-1"
-                                          placeholder="South boundary"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300 text-center">
-                                        <button
-                                          type="button"
-                                          onClick={() => deleteBoundary(boundary.id)}
-                                          className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors cursor-pointer"
-                                          title="Delete boundary set"
-                                        >
-                                          <Trash2 className="w-3.5 h-3.5 mx-auto" />
-                                        </button>
-                                      </td>
-                                    </tr>
-                                  ))
-                                )}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-
                       </div>
                     </div>
                   )}
@@ -3859,61 +4823,6 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                           </div>
                         )}
                       </div>
-
-                      <div className="flex items-center gap-3">
-                        <div className="h-px flex-1 bg-slate-200" />
-                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">or choose a library template</span>
-                        <div className="h-px flex-1 bg-slate-200" />
-                      </div>
-
-                      {templatesLoading ? (
-                        <div className="flex flex-col items-center justify-center py-12 gap-3">
-                          <div className="relative w-12 h-12 flex items-center justify-center">
-                            <div className="absolute inset-0 border-4 border-[#eef6f5] rounded-full"></div>
-                            <div className="absolute inset-0 border-4 border-[#0a4d4a] border-t-transparent rounded-full animate-spin"></div>
-                          </div>
-                          <p className="text-xs text-slate-400">Loading template library…</p>
-                        </div>
-                      ) : serverTemplates.length === 0 ? (
-                        <div className="text-center py-12 space-y-3">
-                          <FileText className="w-12 h-12 text-slate-300 mx-auto" />
-                          <p className="text-xs text-slate-400">No templates found. Ensure the server is running.</p>
-                          <button onClick={loadTemplates} className="text-xs font-bold text-[#0a4d4a] underline">Retry</button>
-                        </div>
-                      ) : (
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          {serverTemplates.map((t) => {
-                            const selected = selectedTemplateId === t.id;
-                            return (
-                              <button
-                                key={t.id}
-                                type="button"
-                                onClick={() => setSelectedTemplateId(t.id)}
-                                className={`text-left p-4 rounded-xl border-2 transition-all ${selected ? "border-[#0a4d4a] bg-[#eef6f5] shadow-sm" : "border-slate-200 bg-white hover:border-[#0a4d4a]/40"}`}
-                              >
-                                <div className="flex items-start justify-between gap-2">
-                                  <div className="flex items-center gap-2">
-                                    <div className={`p-1.5 rounded-lg ${selected ? "bg-[#0a4d4a] text-white" : "bg-slate-100 text-slate-500"}`}>
-                                      <FileText className="w-4 h-4" />
-                                    </div>
-                                    <h4 className="font-extrabold text-[13px] text-slate-900 leading-tight">{t.name}</h4>
-                                  </div>
-                                  {selected && <CheckCircle2 className="w-5 h-5 text-[#0a4d4a] shrink-0" />}
-                                </div>
-                                <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">{t.description}</p>
-                                <div className="flex flex-wrap gap-1.5 mt-3">
-                                  {t.registrationTypes?.map((rt) => (
-                                    <span key={rt} className="text-[9px] font-bold uppercase tracking-wide bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{rt}</span>
-                                  ))}
-                                  {t.isSeed && (
-                                    <span className="text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">Sample</span>
-                                  )}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
                     </div>
                   )}
 
@@ -4075,15 +4984,28 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
 
                           {report.allDiscrepancies?.length > 0 && (
                             <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
-                              {report.allDiscrepancies.map((item: any, idx: number) => (
-                                <div key={idx} className="p-3 bg-red-50/50 border border-red-100 rounded-lg text-[11px] space-y-1">
-                                  <div className="flex items-center justify-between">
-                                    <span className="text-[9px] bg-red-100 text-red-800 font-bold px-2 py-0.5 rounded-full uppercase">{item.severity}</span>
-                                    <span className="text-[10px] text-slate-400 font-semibold">{item.category}</span>
+                              {report.allDiscrepancies.map((item: any, idx: number) => {
+                                const teluguCat = getTeluguCategory(item.category);
+                                const teluguDesc = item.descriptionTe || getTeluguDescription(item.description);
+                                return (
+                                  <div key={idx} className="p-3 bg-red-50/50 border border-red-100 rounded-lg text-[11px] space-y-1.5">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-[9px] bg-red-100 text-red-800 font-bold px-2 py-0.5 rounded-full uppercase">
+                                        {item.severity} ({item.severity === "CRITICAL" ? "తీవ్రమైనది" : "హెచ్చరిక"})
+                                      </span>
+                                      <span className="text-[10px] text-slate-500 font-bold">
+                                        {item.category} {teluguCat && <span className="text-[#0a4d4a]">· {teluguCat}</span>}
+                                      </span>
+                                    </div>
+                                    <p className="font-extrabold text-slate-800">{item.description}</p>
+                                    {teluguDesc && (
+                                      <p className="text-[10px] text-[#0a4d4a] font-semibold bg-emerald-50/70 p-1.5 rounded border border-emerald-100 font-sans">
+                                        <strong>తెలుగు:</strong> {teluguDesc}
+                                      </p>
+                                    )}
                                   </div>
-                                  <p className="font-bold text-slate-800">{item.description}</p>
-                                </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
 
@@ -4275,8 +5197,266 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                     );
                   })()}
 
-                  {/* STEP 7: Download (docx + pdf) & Print */}
+                  {/* STEP 7: Generate Property Plan (Hand-Drawn Sketch -> CAD AI Image) */}
                   {currentStep === 7 && (
+                    <div className="space-y-6">
+                      {/* Top Header Card */}
+                      <div className="p-4 bg-[#eef6f5] border border-[#c3dedb] rounded-xl flex items-start justify-between gap-4 flex-wrap">
+                        <div className="flex items-start gap-3">
+                          <div className="p-2.5 bg-[#0a4d4a] text-white rounded-lg shadow-xs">
+                            <Sparkles className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h4 className="font-extrabold text-sm text-slate-900 flex items-center gap-2">
+                              <span>Property Plan Generator &amp; Boundary Verifier</span>
+                              <span className="text-[10px] text-[#0a4d4a] bg-white px-2 py-0.5 rounded border border-[#c3dedb] font-black uppercase">
+                                ప్లాన్ జనరేషన్
+                              </span>
+                            </h4>
+                            <p className="text-xs text-slate-600 mt-1 max-w-xl">
+                              Upload a hand-drawn sketch of the plot or house. Gemini AI converts it into a neat, computerized architectural blueprint drawing and cross-checks all boundaries against your Step 1 Registration Form.
+                            </p>
+                          </div>
+                        </div>
+
+                        {sketchImage && (
+                          <button
+                            onClick={() => handleGeneratePlan()}
+                            disabled={planGenerating}
+                            className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 text-white font-bold text-xs py-2.5 px-4 rounded-lg flex items-center gap-2 shadow-xs cursor-pointer"
+                          >
+                            <RefreshCw className={`w-4 h-4 ${planGenerating ? "animate-spin" : ""}`} />
+                            {planGenerating ? "Generating CAD Plan..." : "Re-Generate AI Plan"}
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Custom Prompt Box on Top */}
+                      <div className="bg-white p-4 border border-slate-200 rounded-xl space-y-3 shadow-2xs">
+                        <label className="text-xs font-bold text-slate-800 flex items-center justify-between">
+                          <span className="flex items-center gap-1.5">
+                            <Edit2 className="w-3.5 h-3.5 text-[#0a4d4a]" /> Custom AI Plan Prompt &amp; Editing Instructions
+                          </span>
+                          <span className="text-[10px] text-slate-400 font-normal">Optional customization</span>
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={planCustomPrompt}
+                            onChange={(e) => setPlanCustomPrompt(e.target.value)}
+                            placeholder="e.g. Draw 18' Road in South in blue accent, highlight RCC house in light green, clean CAD font style..."
+                            className="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0a4d4a]"
+                          />
+                          <button
+                            onClick={() => handleGeneratePlan()}
+                            disabled={planGenerating || !sketchImage}
+                            className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 text-white font-bold text-xs py-2 px-4 rounded-lg flex items-center gap-1.5 shrink-0 cursor-pointer shadow-3xs"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" /> Apply Prompt
+                          </button>
+                        </div>
+
+                        {/* Collapsible Master System Prompt View */}
+                        <details className="text-[11px] text-slate-500 pt-1">
+                          <summary className="cursor-pointer font-bold text-[#0a4d4a] hover:underline flex items-center gap-1">
+                            <Info className="w-3.5 h-3.5" /> View Comprehensive AI Master Architectural Prompt
+                          </summary>
+                          <div className="mt-2 p-3 bg-slate-900 text-slate-200 rounded-lg font-mono text-[10px] whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto">
+                            {planMasterPrompt || "Master prompt will be compiled automatically upon image upload..."}
+                          </div>
+                        </details>
+                      </div>
+
+                      {/* Split View: Left (Hand Sketch Upload) vs Right (Computerized AI CAD Image Preview) */}
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        
+                        {/* LEFT PANEL: Hand Drawn Image Upload & Preview */}
+                        <div className="bg-white p-5 border border-slate-200 rounded-xl space-y-4 shadow-2xs">
+                          <div className="flex items-center justify-between">
+                            <h5 className="font-bold text-xs text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                              <UploadCloud className="w-4 h-4 text-[#0a4d4a]" /> Hand-Drawn Plot Sketch
+                            </h5>
+                            {sketchImage && (
+                              <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded font-bold border border-emerald-200">
+                                Uploaded: {sketchFileName || "sketch.png"}
+                              </span>
+                            )}
+                          </div>
+
+                          {!sketchImage ? (
+                            <div className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center space-y-4 bg-slate-50/50 hover:bg-slate-50 transition-colors">
+                              <div className="w-12 h-12 bg-[#0a4d4a]/10 text-[#0a4d4a] rounded-full flex items-center justify-center mx-auto">
+                                <UploadCloud className="w-6 h-6" />
+                              </div>
+                              <div>
+                                <p className="text-xs font-bold text-slate-800">Upload Hand-Drawn Plot Sketch</p>
+                                <p className="text-[11px] text-slate-400 mt-0.5">Select a photo or scan of a hand-drawn house or land layout</p>
+                              </div>
+                              <label className="inline-flex items-center gap-2 bg-[#0a4d4a] hover:bg-[#073937] text-white font-bold text-xs py-2.5 px-5 rounded-lg cursor-pointer shadow-xs">
+                                <UploadCloud className="w-4 h-4" /> Browse Image
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  onChange={handleSketchUpload}
+                                  className="hidden"
+                                />
+                              </label>
+                            </div>
+                          ) : (
+                            <div className="space-y-3">
+                              <div className="relative rounded-lg overflow-hidden border border-slate-200 bg-slate-900 max-h-80 flex items-center justify-center p-2">
+                                <img
+                                  src={sketchImage}
+                                  alt="Hand drawn sketch"
+                                  className="max-h-72 object-contain rounded"
+                                />
+                              </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <label className="text-[11px] font-bold text-[#0a4d4a] hover:underline cursor-pointer flex items-center gap-1">
+                                  <UploadCloud className="w-3.5 h-3.5" /> Replace Sketch Image
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    onChange={handleSketchUpload}
+                                    className="hidden"
+                                  />
+                                </label>
+                                <button
+                                  onClick={() => {
+                                    setSketchImage(null);
+                                    setGeneratedPlanImage(null);
+                                    setPlanVerificationReport(null);
+                                  }}
+                                  className="text-[11px] font-bold text-red-600 hover:underline cursor-pointer"
+                                >
+                                  Clear Image
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* RIGHT PANEL: Computerized AI CAD Image Preview */}
+                        <div className="bg-white p-5 border border-slate-200 rounded-xl space-y-4 shadow-2xs">
+                          <div className="flex items-center justify-between">
+                            <h5 className="font-bold text-xs text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                              <Sparkles className="w-4 h-4 text-[#0a4d4a]" /> Computerized AI Plot Plan
+                            </h5>
+                            {generatedPlanImage && (
+                              <a
+                                href={generatedPlanImage}
+                                download="computerized-plot-plan.png"
+                                className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1"
+                              >
+                                <Download className="w-3 h-3" /> Download Plan
+                              </a>
+                            )}
+                          </div>
+
+                          {planGenerating ? (
+                            <div className="h-80 border border-slate-200 rounded-xl bg-slate-50 flex flex-col items-center justify-center p-6 text-center space-y-3">
+                              <RefreshCw className="w-8 h-8 text-[#0a4d4a] animate-spin" />
+                              <p className="text-xs font-bold text-slate-800">Converting Hand Sketch into AI Computerized Plan...</p>
+                              <p className="text-[11px] text-slate-500 max-w-xs">Reading handwritten measurements, boundaries, and rendering vector CAD lines.</p>
+                            </div>
+                          ) : generatedPlanImage ? (
+                            <div className="space-y-3">
+                              <div className="relative rounded-lg overflow-hidden border border-slate-200 bg-white max-h-80 flex items-center justify-center p-2 shadow-inner">
+                                <img
+                                  src={generatedPlanImage}
+                                  alt="Computerized AI Plot Plan"
+                                  className="max-h-72 object-contain rounded"
+                                />
+                              </div>
+                              <p className="text-[10px] text-emerald-800 font-semibold bg-emerald-50 p-2 rounded border border-emerald-200 text-center">
+                                Clean vector CAD layout generated successfully with high contrast and legible typography.
+                              </p>
+                            </div>
+                          ) : (
+                            <div className="h-80 border border-dashed border-slate-300 rounded-xl bg-slate-50 flex flex-col items-center justify-center p-6 text-center space-y-2">
+                              <FileText className="w-10 h-10 text-slate-300" />
+                              <p className="text-xs font-bold text-slate-500">AI Computerized Plan Preview</p>
+                              <p className="text-[11px] text-slate-400 max-w-xs">Upload a hand sketch on the left to generate the computerized CAD drawing.</p>
+                            </div>
+                          )}
+                        </div>
+
+                      </div>
+
+                      {/* BOUNDARY VERIFICATION & DISCREPANCY AUDIT CARD */}
+                      {planVerificationReport && (
+                        <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4 shadow-2xs">
+                          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                            <h5 className="font-extrabold text-xs text-slate-900 uppercase tracking-wider flex items-center gap-2">
+                              <Search className="w-4 h-4 text-[#0a4d4a]" /> Plan vs Registration Form Boundary Cross-Check
+                              <span className="text-[10px] text-[#0a4d4a] bg-[#eef6f5] px-2 py-0.5 rounded border border-[#c3dedb]">
+                                సరిహద్దుల పోలిక
+                              </span>
+                            </h5>
+                            <span className={`text-[10px] font-black px-2.5 py-1 rounded-full uppercase ${
+                              planVerificationReport.isMatch ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-900"
+                            }`}>
+                              {planVerificationReport.isMatch ? "Boundaries Approved" : "Discrepancy Detected"}
+                            </span>
+                          </div>
+
+                          {/* Extracted Sketch Summary Grid */}
+                          {planVerificationReport.extractedFromSketch && (
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 bg-slate-50 p-3 rounded-lg text-[11px] border border-slate-200">
+                              <div>
+                                <span className="text-slate-400 block text-[9px] font-bold uppercase">East (తూర్పు):</span>
+                                <span className="font-semibold text-slate-800">{planVerificationReport.extractedFromSketch.east || "N/A"}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-400 block text-[9px] font-bold uppercase">West (పడమర):</span>
+                                <span className="font-semibold text-slate-800">{planVerificationReport.extractedFromSketch.west || "N/A"}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-400 block text-[9px] font-bold uppercase">North (ఉత్తరం):</span>
+                                <span className="font-semibold text-slate-800">{planVerificationReport.extractedFromSketch.north || "N/A"}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-400 block text-[9px] font-bold uppercase">South (దక్షిణం):</span>
+                                <span className="font-semibold text-slate-800">{planVerificationReport.extractedFromSketch.south || "N/A"}</span>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Discrepancies List */}
+                          {planVerificationReport.discrepancies?.length === 0 ? (
+                            <div className="bg-emerald-50 border border-emerald-200 p-3 rounded-lg text-xs text-emerald-800 flex items-center gap-2 font-bold">
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                              All boundaries and measurements in the hand sketch match the Step 1 Registration Form!
+                            </div>
+                          ) : (
+                            <div className="space-y-2.5">
+                              {planVerificationReport.discrepancies?.map((disc: any, i: number) => (
+                                <div key={i} className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs space-y-1">
+                                  <div className="flex items-center justify-between font-bold text-red-900 text-[11px]">
+                                    <span>{disc.direction} Discrepancy: {disc.description}</span>
+                                    <span className="bg-red-200 text-red-800 px-1.5 py-0.5 rounded text-[9px]">{disc.severity}</span>
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-2 text-[10px] bg-white p-2 rounded border border-red-100">
+                                    <div><span className="text-slate-400 block">Registration Form:</span> <span className="font-mono text-emerald-700 font-bold">{disc.formDetail}</span></div>
+                                    <div><span className="text-slate-400 block">Hand-Drawn Sketch:</span> <span className="font-mono text-red-600 font-bold">{disc.sketchDetail}</span></div>
+                                  </div>
+                                  {disc.descriptionTe && (
+                                    <p className="text-[11px] text-[#0a4d4a] font-semibold pt-1 border-t border-red-100">
+                                      <span className="bg-[#0a4d4a]/10 text-[#0a4d4a] font-bold px-1 rounded text-[9px] mr-1">తెలుగు</span>
+                                      {disc.descriptionTe}
+                                    </p>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* STEP 8: Download (docx + pdf) & Print */}
+                  {currentStep === 8 && (
                     <div className="flex flex-col items-center justify-center text-center p-8 space-y-6">
                       <FileText className="w-16 h-16 text-[#0a4d4a]/20 mx-auto" />
                       <div>
@@ -4332,11 +5512,11 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                 <ChevronLeft className="w-4 h-4" /> Previous Step
               </button>
 
-              {currentStep < 7 ? (
+              {currentStep < 8 ? (
                 <button
                   disabled={filling || auditing || (currentStep === 3 && !selectedTemplateId)}
                   onClick={() => {
-                    // Step validation or quick triggers for the 7-step flow
+                    // Step validation or quick triggers for the 8-step flow
                     if (currentStep === 1) {
                       setCurrentStep(2); // proceed to Review Details
                     } else if (currentStep === 2) {
@@ -4344,17 +5524,15 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                     } else if (currentStep === 3) {
                       if (selectedTemplateId) setCurrentStep(4); // proceed to Auto-Fill
                     } else if (currentStep === 4) {
-                      // The footer button always moves the flow forward: if the
-                      // document hasn't been generated yet, generate it and advance
-                      // to Re-Verify in one click; otherwise just advance.
                       if (filledDeedText) setCurrentStep(5);
                       else generateDocument(true);
                     } else if (currentStep === 5) {
-                      // Run the audit first; once a report exists, advance to the stamp preview.
                       if (report) setCurrentStep(6);
                       else triggerDeedVerificationAudit();
                     } else if (currentStep === 6) {
-                      setCurrentStep(7); // proceed to Download
+                      setCurrentStep(7); // proceed to Generate Plan
+                    } else if (currentStep === 7) {
+                      setCurrentStep(8); // proceed to Download & Print
                     }
                   }}
                   className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs py-2 px-5 rounded-lg flex items-center gap-1.5 shadow-sm cursor-pointer"
@@ -4364,7 +5542,8 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
                   {currentStep === 3 && (selectedTemplateId ? "Proceed to Auto-Fill" : "Select a template first")}
                   {currentStep === 4 && (filling ? "Generating…" : filledDeedText ? "Proceed to Re-Verify" : "Generate & Fill Document")}
                   {currentStep === 5 && (auditing ? "Auditing…" : report ? "Proceed to Stamp Preview" : "Run Verification Audit")}
-                  {currentStep === 6 && "Proceed to Download"}
+                  {currentStep === 6 && "Proceed to Generate Plan"}
+                  {currentStep === 7 && "Proceed to Download & Print"}
                   {" "}<ChevronRight className="w-4 h-4" />
                 </button>
               ) : (
@@ -4394,44 +5573,88 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
             {/* AUDIT LOG STATUS BAR */}
             {report && (
               <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
-                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                  <Search className="w-4 h-4 text-[#0a4d4a]" /> Discrepancy Registry
+                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-3 flex items-center justify-between">
+                  <span className="flex items-center gap-1.5">
+                    <Search className="w-4 h-4 text-[#0a4d4a]" /> Discrepancy Registry
+                  </span>
+                  <span className="text-[10px] text-[#0a4d4a] font-black uppercase tracking-widest bg-[#eef6f5] px-2 py-0.5 rounded border border-[#c3dedb]">
+                    తేడాల రిజిస్ట్రీ
+                  </span>
                 </h3>
                 
                 {report.allDiscrepancies?.length === 0 ? (
                   <div className="bg-emerald-50 border border-emerald-100 p-3.5 rounded-lg text-xs text-emerald-800 flex items-start gap-2.5">
                     <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     <div>
-                      <p className="font-extrabold text-[11px] uppercase tracking-wider">Deed is 100% Compliant!</p>
-                      <p className="mt-0.5 text-slate-500 font-sans leading-relaxed">All spelling digits, age caps, and survey boundaries are approved.</p>
+                      <p className="font-extrabold text-[11px] uppercase tracking-wider flex items-center gap-1.5 flex-wrap">
+                        <span>Deed is 100% Compliant!</span>
+                        <span className="text-emerald-700 font-bold">· దస్తావేజు 100% సరిగ్గా ఉంది!</span>
+                      </p>
+                      <p className="mt-1 text-slate-600 font-sans leading-relaxed text-[11px]">
+                        All spelling digits, age caps, and survey boundaries are approved.
+                        <span className="block text-emerald-800 font-semibold mt-0.5">
+                          అక్షరక్రమం, వయస్సు పరిమితులు, సర్వే నంబర్లు మరియు సరిహద్దులు అన్నీ సరిగ్గా సరిపోలాయి.
+                        </span>
+                      </p>
                     </div>
                   </div>
                 ) : (
-                  <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1">
-                    {report.allDiscrepancies?.map((item: any, idx: number) => (
-                      <div key={idx} className="p-3 bg-red-50/50 border border-red-100 rounded-lg text-[11px] space-y-1.5">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[9px] bg-red-100 text-red-800 font-bold px-2 py-0.5 rounded-full uppercase">
-                            {item.severity}
-                          </span>
-                          <span className="text-[10px] text-slate-400 font-semibold">{item.category}</span>
-                        </div>
-                        <p className="font-extrabold text-slate-800">{item.description}</p>
-                        <div className="grid grid-cols-2 gap-2 text-[10px] bg-white p-2 rounded-md border border-slate-200">
-                          <div>
-                            <span className="text-slate-400 block font-bold">EXPECTED:</span>
-                            <span className="text-emerald-700 font-bold font-mono">{item.expected}</span>
+                  <div className="space-y-3 max-h-[350px] overflow-y-auto pr-1">
+                    {report.allDiscrepancies?.map((item: any, idx: number) => {
+                      const teluguCat = getTeluguCategory(item.category);
+                      const teluguDesc = item.descriptionTe || getTeluguDescription(item.description);
+                      const teluguRec = item.recommendationTe || getTeluguRecommendation(item.recommendation);
+                      return (
+                        <div key={idx} className="p-3 bg-red-50/50 border border-red-200 rounded-lg text-[11px] space-y-2 shadow-2xs">
+                          <div className="flex items-center justify-between gap-2 flex-wrap">
+                            <span className="text-[9px] bg-red-100 text-red-800 font-black px-2 py-0.5 rounded-full uppercase flex items-center gap-1">
+                              <span>{item.severity}</span>
+                              <span className="text-red-700 font-bold">({item.severity === "CRITICAL" ? "తీవ్రమైనది" : "హెచ్చరిక"})</span>
+                            </span>
+                            <span className="text-[10px] text-slate-600 font-bold bg-white px-2 py-0.5 rounded border border-slate-200">
+                              {item.category} {teluguCat && <span className="text-[#0a4d4a] font-semibold">· {teluguCat}</span>}
+                            </span>
                           </div>
-                          <div>
-                            <span className="text-slate-400 block font-bold">FOUND:</span>
-                            <span className="text-red-600 font-bold font-mono">{item.found}</span>
+
+                          {/* Description in English and Telugu */}
+                          <div className="space-y-1 bg-white p-2.5 rounded-md border border-red-100">
+                            <p className="font-bold text-slate-900 leading-snug">{item.description}</p>
+                            {teluguDesc && (
+                              <p className="text-[11px] text-[#0a4d4a] font-semibold font-sans leading-relaxed border-t border-slate-100 pt-1">
+                                <span className="bg-[#0a4d4a]/10 text-[#0a4d4a] font-extrabold px-1 rounded text-[9px] mr-1 uppercase">తెలుగు</span>
+                                {teluguDesc}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Expected vs Found values */}
+                          <div className="grid grid-cols-2 gap-2 text-[10px] bg-white p-2 rounded-md border border-slate-200">
+                            <div>
+                              <span className="text-slate-500 block font-bold uppercase text-[9px]">EXPECTED / ఆశించినది:</span>
+                              <span className="text-emerald-700 font-black font-mono text-[11px]">{item.expected}</span>
+                            </div>
+                            <div>
+                              <span className="text-slate-500 block font-bold uppercase text-[9px]">FOUND / కనుగొనబడినది:</span>
+                              <span className="text-red-600 font-black font-mono text-[11px]">{item.found}</span>
+                            </div>
+                          </div>
+
+                          {/* Recommendation in English and Telugu */}
+                          <div className="text-[10px] text-slate-700 bg-amber-50/60 p-2 rounded-md border border-amber-200 space-y-1">
+                            <p className="leading-relaxed">
+                              <strong className="text-amber-900 font-extrabold uppercase text-[9px] mr-1">Recommendation:</strong>
+                              <span className="font-medium text-slate-800">{item.recommendation}</span>
+                            </p>
+                            {teluguRec && (
+                              <p className="leading-relaxed text-amber-950 font-semibold font-sans border-t border-amber-200/60 pt-1 text-[10.5px]">
+                                <strong className="text-[#0a4d4a] font-extrabold mr-1">తెలుగు సూచన:</strong>
+                                {teluguRec}
+                              </p>
+                            )}
                           </div>
                         </div>
-                        <p className="text-[10px] text-slate-500 font-medium leading-relaxed bg-[#fcf8f8] p-1.5 rounded-md border border-red-100">
-                          <strong className="text-red-700">Suggestion:</strong> {item.recommendation}
-                        </p>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

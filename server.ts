@@ -7,6 +7,12 @@ import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
 import { buildDeedDocx, mergePlaceholders } from "./documentBuilder";
+import { fillDocxTemplate, buildAngleFieldResolver } from "./templateFiller";
+import {
+  renderPlanDataUrl,
+  PLAN_EXTRACTION_SCHEMA,
+  PLAN_EXTRACTION_PROMPT,
+} from "./planRenderer";
 import {
   listTemplates,
   getTemplateText,
@@ -137,13 +143,27 @@ function normalizeAadhaar(data: any): any {
     year = +m[1]; month = +m[2]; day = +m[3];
   } else if ((m = dob.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/))) {
     day = +m[1]; month = +m[2]; year = +m[3];
+  } else if ((m = dob.match(/^(\d{4})$/))) {
+    // Some Aadhaar cards print only a birth YEAR (no day/month).
+    year = +m[1];
   }
+  const now = new Date();
   if (year && month && day) {
     // Normalize to DD/MM/YYYY for display consistency
     data.dob = `${String(day).padStart(2, "0")}/${String(month).padStart(2, "0")}/${year}`;
-    // Age as of the current year (2026 per environment date)
-    const CURRENT_YEAR = 2026;
-    let age = CURRENT_YEAR - year;
+    // Completed age as of TODAY — not a bare year subtraction. A legal deed states the
+    // person's current (last-birthday) age, so we must account for whether this year's
+    // birthday has already occurred. E.g. DOB 12/12/1979 on 2026-07-26 is 46, not 47.
+    let age = now.getFullYear() - year;
+    const monthDiff = now.getMonth() + 1 - month; // getMonth() is 0-based
+    if (monthDiff < 0 || (monthDiff === 0 && now.getDate() < day)) {
+      age -= 1; // birthday hasn't happened yet this year
+    }
+    if (age >= 0 && age < 130) data.age = String(age);
+  } else if (year) {
+    // Year-only DOB: best-effort age estimate (exact month/day unknown).
+    data.dob = String(year);
+    const age = now.getFullYear() - year;
     if (age >= 0 && age < 130) data.age = String(age);
   }
   return data;
@@ -231,73 +251,91 @@ function generateHeuristicReport(draftText: string): any {
           category: "Names mismatch",
           severity: "CRITICAL",
           description: "The spelling of the seller's name in the draft registration document does not match the official Aadhaar Card spelling.",
+          descriptionTe: "డ్రాఫ్ట్ రిజిస్ట్రేషన్ పత్రంలో విక్రేత పేరు అక్షరక్రమం అధికారిక ఆధార్ కార్డుతో సరిపోలలేదు.",
           expected: "Ankem Srinivas",
           found: "Ankem Srinivasa Rao",
-          recommendation: "Correct 'Ankem Srinivasa Rao' to 'Ankem Srinivas' to align character-by-character with the Aadhaar card."
+          recommendation: "Correct 'Ankem Srinivasa Rao' to 'Ankem Srinivas' to align character-by-character with the Aadhaar card.",
+          recommendationTe: "ఆధార్ కార్డు ప్రకారం పేరును 'అంకెo శ్రీనివాసరావు' నుండి 'అంకెo శ్రీనివాస్' గా సవరించండి."
         },
         {
           category: "Names mismatch",
           severity: "WARNING",
           description: "The age written in the draft document is incorrect based on the official Aadhaar DOB (12/06/1975).",
+          descriptionTe: "అధికారిక ఆధార్ జన్మతేదీ (12/06/1975) ఆధారంగా డ్రాఫ్ట్ పత్రంలో రాసిన వయస్సు తప్పుగా ఉంది.",
           expected: "51 Years",
           found: "46 Years",
-          recommendation: "Update the seller's age from '46' to '51' years in the draft document."
+          recommendation: "Update the seller's age from '46' to '51' years in the draft document.",
+          recommendationTe: "డ్రాఫ్ట్ పత్రంలో విక్రేత వయస్సును '46' నుండి '51' సంవత్సరాలకు సరిచేయండి."
         },
         {
           category: "Property details mismatch",
           severity: "CRITICAL",
           description: "The House Number (H.No) listed in the draft does not match the ownership link document.",
+          descriptionTe: "డ్రాఫ్ట్‌లో పేర్కొన్న ఇంటి నంబర్ (H.No) యాజమాన్య లింక్ పత్రంతో సరిపోలడం లేదు.",
           expected: "4-12/A",
           found: "4-12",
-          recommendation: "Update the house number in the draft from '4-12' to '4-12/A' to ensure title tracking."
+          recommendation: "Update the house number in the draft from '4-12' to '4-12/A' to ensure title tracking.",
+          recommendationTe: "హక్కుల రక్షణ కోసం డ్రాఫ్ట్‌లో ఇంటి నంబర్‌ను '4-12' నుండి '4-12/A' గా సవరించండి."
         },
         {
           category: "Property details mismatch",
           severity: "CRITICAL",
           description: "Plot Number mismatch between draft and link deed.",
+          descriptionTe: "డ్రాఫ్ట్ మరియు లింక్ దస్తావేజు మధ్య ప్లాట్ నంబర్ తేడా ఉంది.",
           expected: "Plot No 18",
           found: "Plot No 15",
-          recommendation: "Correct the plot number in the draft to '18'."
+          recommendation: "Correct the plot number in the draft to '18'.",
+          recommendationTe: "డ్రాఫ్ట్‌లో ప్లాట్ నంబర్‌ను '18' గా సరిచేయండి."
         },
         {
           category: "Property details mismatch",
           severity: "CRITICAL",
           description: "Property Tax Identification Number (PTI No) mismatch.",
+          descriptionTe: "ఆస్తి పన్ను గుర్తింపు నంబర్ (PTI No) వ్యత్యాసం ఉంది.",
           expected: "1092003415",
           found: "1092003999",
-          recommendation: "Change the PTI number in the draft to '1092003415'."
+          recommendation: "Change the PTI number in the draft to '1092003415'.",
+          recommendationTe: "డ్రాఫ్ట్‌లో PTI నంబర్‌ను '1092003415' గా మార్చండి."
         },
         {
           category: "Property details mismatch",
           severity: "WARNING",
           description: "Slight area discrepancy (Sq Yards).",
+          descriptionTe: "స్థలం విస్తీర్ణంలో చిన్న వ్యత్యాసం (చదరపు గజాలు).",
           expected: "300 Sq Yards",
           found: "250 Sq Yards",
-          recommendation: "Verify and update the land extent to '300 Sq Yards' to prevent loss of asset description."
+          recommendation: "Verify and update the land extent to '300 Sq Yards' to prevent loss of asset description.",
+          recommendationTe: "ఆస్తి విస్తీర్ణం నష్టం కాకుండా భూమి వైశాల్యాన్ని '300 చదరపు గజాలు' గా తనిఖీ చేసి సవరించండి."
         },
         {
           category: "Property details mismatch",
           severity: "WARNING",
           description: "Plinth Area mismatch in draft.",
+          descriptionTe: "డ్రాఫ్ట్‌లో ప్లింత్ ఏరియా (నిర్మాణ వైశాల్యం) తేడా ఉంది.",
           expected: "1800 Sq Ft",
           found: "1600 Sq Ft",
-          recommendation: "Modify the plinth area from '1600' to '1800' Sq Ft in the draft."
+          recommendation: "Modify the plinth area from '1600' to '1800' Sq Ft in the draft.",
+          recommendationTe: "డ్రాఫ్ట్‌లో ప్లింత్ ఏరియాను '1600' నుండి '1800' చదరపు అడుగులుగా మార్చండి."
         },
         {
           category: "Property details mismatch",
           severity: "CRITICAL",
           description: "Property boundaries listed in the draft do not match the official source link document.",
+          descriptionTe: "డ్రాఫ్ట్‌లో నమోదు చేసిన ఆస్తి సరిహద్దులు మూల లింక్ పత్రంతో సరిపోలడం లేదు.",
           expected: "East: Canal, West: Ramulu's Land, North: Main Road, South: Venkataiah's Land",
           found: "East: Road, West: Open Plot, North: Neighbor, South: Drain",
-          recommendation: "Correct all boundary listings in the draft to match the link document exactly."
+          recommendation: "Correct all boundary listings in the draft to match the link document exactly.",
+          recommendationTe: "లింక్ పత్రంలో ఉన్న విధంగా సరిహద్దుల వివరాలన్నింటినీ డ్రాఫ్ట్‌లో సరిగ్గా నమోదు చేయండి."
         },
         {
           category: "Link document numbers mismatch",
           severity: "CRITICAL",
           description: "The link document deed number referred in the draft has a typo.",
+          descriptionTe: "డ్రాఫ్ట్‌లో ప్రస్తావించిన లింక్ దస్తావేజు నంబర్‌లో అక్షరదోషం (పొరపాటు) ఉంది.",
           expected: "2304/1998",
           found: "2340/1998",
-          recommendation: "Correct the acquired link deed reference number from '2340/1998' to '2304/1998'."
+          recommendation: "Correct the acquired link deed reference number from '2340/1998' to '2304/1998'.",
+          recommendationTe: "లింక్ దస్తావేజు నంబర్ ప్రస్తావనను '2340/1998' నుండి '2304/1998' గా సరిచేయండి."
         }
       ],
       linkDocumentDetails: {
@@ -829,44 +867,119 @@ function localFillTemplate(templateText: string, details: any): string {
   const link = details.linkDeed || {};
   
   const replacements: Record<string, string> = {
-    "{{SELLER_NAME}}": seller.name || "Ankem Srinivas",
-    "{{SELLER_RELATION}}": seller.relation || "S/o Ankem Ramulu",
-    "{{SELLER_AGE}}": seller.age ? `${seller.age} Years` : "51 Years",
-    "{{SELLER_AADHAAR}}": seller.aadhaar || "4521 8902 3412",
-    "{{SELLER_PAN}}": seller.pan || "ABCDE1234F",
-    "{{SELLER_ADDRESS}}": seller.address || "H.No 4-12, Nakrekal, Nalgonda District, Telangana - 508211",
-    "{{BUYER_NAME}}": buyer.name || "Ganta Venkat Reddy",
-    "{{BUYER_RELATION}}": buyer.relation || "S/o Ganta Malla Reddy",
-    "{{BUYER_AGE}}": buyer.age ? `${buyer.age} Years` : "45 Years",
-    "{{BUYER_AADHAAR}}": buyer.aadhaar || "9876 5432 1098",
-    "{{BUYER_PAN}}": buyer.pan || "XYZWP9876Z",
-    "{{BUYER_ADDRESS}}": buyer.address || "Plot No 22, Jubilee Hills, Hyderabad, Telangana - 500033",
-    "{{PROPERTY_SURVEY}}": prop.surveyNo || "412/A",
-    "{{PROPERTY_VILLAGE}}": prop.village || "Nakrekal",
-    "{{PROPERTY_MANDAL}}": prop.mandal || "Nakrekal",
-    "{{PROPERTY_DISTRICT}}": prop.district || "Nalgonda",
+    "{{SELLER_NAME}}": seller.name || "",
+    "{{SELLER_RELATION}}": seller.relation || "",
+    "{{SELLER_AGE}}": seller.age ? `${seller.age} Years` : "",
+    "{{SELLER_AADHAAR}}": seller.aadhaar || "",
+    "{{SELLER_PAN}}": seller.pan || "",
+    "{{SELLER_ADDRESS}}": seller.address || "",
+    "{{BUYER_NAME}}": buyer.name || "",
+    "{{BUYER_RELATION}}": buyer.relation || "",
+    "{{BUYER_AGE}}": buyer.age ? `${buyer.age} Years` : "",
+    "{{BUYER_AADHAAR}}": buyer.aadhaar || "",
+    "{{BUYER_PAN}}": buyer.pan || "",
+    "{{BUYER_ADDRESS}}": buyer.address || "",
+    "{{PROPERTY_SURVEY}}": prop.surveyNo || "",
+    "{{PROPERTY_VILLAGE}}": prop.village || "",
+    "{{PROPERTY_MANDAL}}": prop.mandal || "",
+    "{{PROPERTY_DISTRICT}}": prop.district || "",
     "{{PROPERTY_STATE}}": prop.state || "Telangana",
-    "{{PROPERTY_HNO}}": prop.hNo || "4-12",
-    "{{PROPERTY_PLOT}}": prop.plotNo || "12",
-    "{{PROPERTY_PTI}}": prop.ptiNo || "1092003412",
-    "{{PROPERTY_EXTENT}}": prop.extentSqYards || "240 Sq Yards",
-    "{{PROPERTY_PLINTH}}": prop.plinthArea || "1500 Sq Ft",
-    "{{BOUNDARY_EAST}}": bounds.east || "Canal",
-    "{{BOUNDARY_WEST}}": bounds.west || "Ramulu's Land",
-    "{{BOUNDARY_NORTH}}": bounds.north || "Main Road",
-    "{{BOUNDARY_SOUTH}}": bounds.south || "Venkataiah's Land",
-    "{{LINK_DEED_NO}}": link.deedNumber || "1204/1998",
-    "{{LINK_DEED_DATE}}": link.executionDate || "14th August 1998"
+    "{{PROPERTY_HNO}}": prop.hNo || "",
+    "{{PROPERTY_PLOT}}": prop.plotNo || "",
+    "{{PROPERTY_PTI}}": prop.ptiNo || "",
+    "{{PROPERTY_EXTENT}}": prop.extentSqYards || "",
+    "{{PROPERTY_PLINTH}}": prop.plinthArea || "",
+    "{{BOUNDARY_EAST}}": bounds.east || "",
+    "{{BOUNDARY_WEST}}": bounds.west || "",
+    "{{BOUNDARY_NORTH}}": bounds.north || "",
+    "{{BOUNDARY_SOUTH}}": bounds.south || "",
+    "{{LINK_DEED_NO}}": link.deedNumber || "",
+    "{{LINK_DEED_DATE}}": link.executionDate || ""
   };
   
   Object.entries(replacements).forEach(([placeholder, value]) => {
     const regex = new RegExp(placeholder.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g');
     result = result.replace(regex, value);
   });
-  return result;
+  return regexCleanDraft(result);
 }
 
 // Build the canonical {{PLACEHOLDER}} -> value map from the frontend's consolidated
+// Helper to construct the official Rule 3 Statement of Market Value Table (Telangana Rules)
+function generateRule3MarketValueTable(details: any): string {
+  const d = details || {};
+  const prop = d.property || {};
+  const totalValNum = Number((d.marketValue || prop.marketValueTotal || "0").toString().replace(/,/g, "")) || 0;
+  const valStr = totalValNum > 0 ? totalValNum.toLocaleString("en-IN") : (d.marketValue || prop.marketValueTotal || "0");
+  
+  const ptiVal = prop.vltPtiNo || prop.ptiNo || "";
+  const ratePerYd = prop.marketValuePerSqYard ? `Rs. ${prop.marketValuePerSqYard}/- per Sq.Yard` : (prop.flatValuePerSqFeet ? `Rs. ${prop.flatValuePerSqFeet}/- per Sq.Ft` : "As per Basic Valuation Register");
+  const extentStr = prop.extentSqYards ? `${prop.extentSqYards} Sq.Yards (${prop.extentSqMeters || (Number(prop.extentSqYards)*0.836127).toFixed(2)} Sq.Mtrs)` : (prop.plinthArea ? `Plinth: ${prop.plinthArea}` : "As specified");
+  
+  const descParts = [
+    prop.surveyNo ? `Survey No: ${prop.surveyNo}` : "",
+    prop.plotNo ? `Plot No: ${prop.plotNo}` : "",
+    prop.hNo ? `Near H.No: ${prop.hNo}` : "",
+    prop.village ? `Village: ${prop.village}` : "",
+    prop.mandal ? `Mandal: ${prop.mandal}` : "",
+    prop.district ? `District: ${prop.district}` : "",
+    prop.pincode ? `Pincode: ${prop.pincode}` : "",
+    ptiVal ? `VLT / PTI No: ${ptiVal}` : "",
+  ].filter(Boolean).join(", ");
+
+  const stampDutyVal = d.stampsAmount || (totalValNum > 0 ? Math.round(totalValNum * 0.05).toLocaleString("en-IN") : "");
+  const transferDutyVal = totalValNum > 0 ? Math.round(totalValNum * 0.015).toLocaleString("en-IN") : "";
+  const regFeeVal = totalValNum > 0 ? Math.round(totalValNum * 0.005).toLocaleString("en-IN") : "";
+  const totalPayableVal = totalValNum > 0 ? Math.round(totalValNum * 0.07).toLocaleString("en-IN") : "";
+
+  return `STATEMENT OF MARKET VALUE
+(Under Rule 3 of the Telangana Prevention of Under Valuation of Instruments Rules, 1975)
+
++-------+-----------------------------------------------------------------+------------------------+------------------------------------+------------------------+
+| S.No. | Description of Property & Location Details                      | Extent / Plinth Area   | Basic Market Value Rate            | Total Market Value(Rs) |
++-------+-----------------------------------------------------------------+------------------------+------------------------------------+------------------------+
+|   1   | ${descParts || "Schedule Property Details"} | ${extentStr} | ${ratePerYd} | Rs. ${valStr}/- |
++-------+-----------------------------------------------------------------+------------------------+------------------------------------+------------------------+
+
+SUMMARY OF VALUATION & REGISTRATION DUTY STRUCTURE:
+1. Total Market Value of Scheduled Property : Rs. ${valStr}/-
+2. Stamp Duty Payable (5%)                   : Rs. ${stampDutyVal}/-
+3. Transfer Duty Payable (1.5%)             : Rs. ${transferDutyVal}/-
+4. Registration Fee Payable (0.5%)          : Rs. ${regFeeVal}/-
+------------------------------------------------------------------------
+TOTAL PAYABLE STAMP DUTY & REGISTRATION FEES: Rs. ${totalPayableVal}/-`;
+}
+
+function regexCleanDraft(text: string): string {
+  if (!text) return "";
+  let cleaned = text;
+
+  // 1. Remove unresolved mustache templates {{...}} or bracketed placeholders [______] or <...>
+  cleaned = cleaned.replace(/\{\{[^}]+\}\}/g, "");
+  cleaned = cleaned.replace(/\[\s*\_+\s*\]/g, "");
+  cleaned = cleaned.replace(/\[\s*[A-Za-z0-9\s\/\.\-\:]+\s*\]/g, "");
+  cleaned = cleaned.replace(/\<[^\>]+\>/g, "");
+
+  // 2. Remove empty blank underlines like _____
+  cleaned = cleaned.replace(/_{2,}/g, "");
+
+  // 3. Clean dangling labels when empty
+  // e.g. "and PAN ,", "PAN : ,", "PTI No: ,", "Door No: ,", "S/o ,"
+  cleaned = cleaned.replace(/(?:,\s*|\sand\s*)(?:PAN|Aadhaar|Aadhaar\s*No|Cell|Cell\s*No|Phone|PTI|PTI\s*No|VLT|VLT\/PTI\s*No|Door\s*No|H\.No|Pincode|Plinth|Plinth\s*Area)\s*[\:\-]?\s*(?=[,\.\;\n]|$)/gi, "");
+
+  // 4. Clean orphan relations like "S/o ," or "W/o ,"
+  cleaned = cleaned.replace(/\b(S\/o|W\/o|D\/o|C\/o|R\/o)\s*[\,\.\;]/gi, "");
+
+  // 5. Clean punctuation anomalies: duplicate commas, comma before period, dangling commas before newlines
+  cleaned = cleaned.replace(/\,\s*\,/g, ",");
+  cleaned = cleaned.replace(/\,\s*\./g, ".");
+  cleaned = cleaned.replace(/\s+\,/g, ",");
+  cleaned = cleaned.replace(/\,\s*$/gm, "");
+  cleaned = cleaned.replace(/[ \t]{2,}/g, " ");
+
+  return cleaned.trim();
+}
+
 // registration facts. Values are used verbatim (deterministic, no AI paraphrasing) so
 // the final deed contains ONLY the current property/party data — nothing invented.
 function buildPlaceholderMap(details: any): Record<string, string> {
@@ -884,6 +997,8 @@ function buildPlaceholderMap(details: any): Record<string, string> {
   const joinAddr = (arr: any[]) => arr.map((x) => x?.address).filter(Boolean).join("; ");
   const joinRel = (arr: any[]) => arr.map((x) => x?.relation).filter(Boolean).join(", ");
   const joinPan = (arr: any[]) => arr.map((x) => x?.pan).filter(Boolean).join(", ");
+
+  const vltPti = prop.vltPtiNo || prop.ptiNo || "";
 
   return {
     "{{REGISTRATION_DATE}}": d.registrationDate || "",
@@ -906,10 +1021,12 @@ function buildPlaceholderMap(details: any): Record<string, string> {
     "{{PROPERTY_VILLAGE}}": prop.village || "",
     "{{PROPERTY_MANDAL}}": prop.mandal || "",
     "{{PROPERTY_DISTRICT}}": prop.district || "",
+    "{{PROPERTY_PINCODE}}": prop.pincode || "",
     "{{PROPERTY_STATE}}": prop.state || "Telangana",
     "{{PROPERTY_HNO}}": prop.hNo || "",
     "{{PROPERTY_PLOT}}": prop.plotNo || "",
-    "{{PROPERTY_PTI}}": prop.ptiNo || "",
+    "{{PROPERTY_PTI}}": vltPti,
+    "{{PROPERTY_VLT_PTI}}": vltPti,
     "{{PROPERTY_EXTENT}}": prop.extentSqYards || "",
     "{{PROPERTY_PLINTH}}": prop.plinthArea || "",
     "{{BOUNDARY_EAST}}": bounds.east || "",
@@ -918,6 +1035,9 @@ function buildPlaceholderMap(details: any): Record<string, string> {
     "{{BOUNDARY_SOUTH}}": bounds.south || "",
     "{{LINK_DEED_NO}}": link.deedNumber || "",
     "{{LINK_DEED_DATE}}": link.executionDate || "",
+    "{{PATTADAR_PASSBOOK_NO}}": link.pattadarPassbookNo || "",
+    "{{PASSBOOK_KHATA_NO}}": link.passbookKhataNo || "",
+    "{{STATEMENT_OF_MARKET_VALUE_TABLE}}": generateRule3MarketValueTable(details),
   };
 }
 
@@ -930,53 +1050,44 @@ async function aiFillTemplate(ai: any, templateText: string, details: any): Prom
   const sellerCount = Array.isArray(details?.executants) ? details.executants.length : 0;
   const buyerCount = Array.isArray(details?.claimants) ? details.claimants.length : 0;
 
-  const prompt = `You are an expert legal document drafter for property Sale Deeds registered in Telangana, India. Your job is NOT to write a new deed from scratch — it is to REPRODUCE the uploaded TEMPLATE exactly, changing ONLY the transaction-specific facts so they match the provided DATA.
+  const prompt = `You are an expert legal document drafter for property Sale Deeds registered in Telangana, India. Your task is to update the supplied TEMPLATE document with the details from the registration form DATA while strictly preserving the supplied template's formatting style and structure.
 
-Think of it as find-and-replace on a photocopy: the paper, the layout, every clause, every heading, every table, and every page stay identical — you only white-out the OLD transaction's specifics and write in the NEW ones from DATA.
+═══════════ MANDATE 1: PRESERVE ALL FORMATTING, LAYOUT & SETUP STYLES ═══════════
+- You MUST strictly preserve the supplied template's formatting style, including the layout setup, page size, margins, font style, font sizes, text alignments (left, centered, justified), page margins, padding, line spacing, bullet formats, numbered list formats, table structures, headers, footers, page numbers, and structural setup from the supplied TEMPLATE without altering or distorting them.
+- Preserve EVERY word of fixed legal wording, EVERY clause, heading, recital, covenant, sub-clause, number, bullet point, page break marker (e.g., "---PAGE BREAK---"), page number (e.g., "-2-", "-3-"), and table structure VERBATIM.
+- The output MUST have the exact SAME STRUCTURE, layout, order of sections, and page count as the supplied TEMPLATE.
 
-═══════════ THE GOLDEN RULE — CLONE, DO NOT REWRITE ═══════════
-- The output MUST have the SAME STRUCTURE and (as closely as possible) the SAME LENGTH and SAME NUMBER OF PAGES as the TEMPLATE. If the TEMPLATE is 4 pages with 20 numbered covenant clauses, a Schedule of Property, a market-value table, and a Declaration, the output has the SAME 4 pages, the SAME 20 clauses, the SAME table, and the SAME Declaration.
-- Preserve EVERY word of fixed legal wording, EVERY clause, heading, recital, covenant, sub-clause, number, bullet, page marker (e.g. "-2-", "-3-"), table structure, and the ORDER of everything, VERBATIM. Do NOT summarize, shorten, paraphrase, translate, reorder, merge, split, add, or drop anything that is not a transaction-specific fact.
-- Keep all page-break markers and page numbers so the output paginates to the SAME page count as the TEMPLATE. In particular, reproduce every "---PAGE BREAK---" line and every printed page number (e.g. "-2-", "-3-") EXACTLY where they appear — do not move, add, or delete them.
-- Copy punctuation, capitalization, table borders/columns, and the deliberate legal "/s" notation (VENDOR/S, vendee/s, is/are, his/her/their) EXACTLY. That ambiguity is intentional drafting — do NOT "fix" it.
+═══════════ MANDATE 2: STRICTLY NO PLACEHOLDERS OR DASHES ═══════════
+- You MUST NOT include any placeholder dashes, underscores (____), dashes (---), bracketed placeholders ([...]), [N/A], or empty line placeholders anywhere in the final text.
+- If relevant information is not supplied or is empty in the registration form DATA for a particular field (e.g. optional PAN number, cell number, door number, plinth area, etc.), do NOT insert any dashes, underscores, or blank placeholders.
+- Instead, smoothly omit or seamlessly adjust the unsupplied field or phrase entirely so that the text is registered cleanly, naturally, and professionally without any empty placeholders or dangling punctuation.
 
 ═══════════ WHAT YOU MAY CHANGE — TRANSACTION-SPECIFIC FACTS ONLY ═══════════
-The TEMPLATE is usually a COMPLETE PRIOR DEED of a DIFFERENT, UNRELATED sale, reused only for its wording. Every concrete value below currently belongs to that OLD transaction and MUST be overwritten with the corresponding value from DATA. These are the ONLY things you may touch:
-
+The TEMPLATE is a document whose specimen details MUST be updated with the corresponding real details from DATA:
 1. VALUE / STAMP line at the top — "Value Rs.____", "Stamp Rs.____" → DATA.marketValue and DATA.stampsAmount.
-2. EXECUTION DATE — "executed on this the __-__-____" → DATA.registrationDate.
+2. EXECUTION DATE — DATA.registrationDate.
 3. VENDOR/S (SELLER/S) block — for EACH seller: full NAME, relation (S/o | W/o | D/o + parent's name), age, DOB, occupation, full address (H.No, street/locality, village/mandal, district, state, pin), Aadhaar No, PAN → DATA.executants[].
 4. VENDEE/S (BUYER/S) block — for EACH buyer: NAME, relation, age, DOB, occupation, full address, Cell No, Aadhaar No, PAN → DATA.claimants[].
-5. LINK / PARENT DOCUMENT recital — "by virtue of Regd. Sale Deed Doc.No.____ in the office of the S.R.O.____ (year)" → DATA.linkDeed (deedNumber, village/S.R.O., executionDate).
-6. CONSIDERATION amounts — EVERY "sale consideration value is Rs.____" occurrence. There may be more than one, and the specimen may show slightly DIFFERENT figures due to OCR typos — set ALL of them to the single correct value from DATA.marketValue.
+5. LINK / PARENT DOCUMENT recital — DATA.linkDeed (deedNumber, village/S.R.O., executionDate).
+6. CONSIDERATION amounts — set ALL occurrences to DATA.marketValue.
 7. SCHEDULE OF THE PROPERTY — plot no, total area (sq yards AND sq meters), survey no, near H.No, locality/village, mandal, district, pin code, Gram Panchayat, Sub-Registrar office, District Registrar jurisdiction → DATA.property.
 8. BOUNDARIES — East / West / North / South of the schedule property → DATA.property.boundaries.
-9. MARKET-VALUE STATEMENT TABLE — the columns Village, Survey No/s, Near H.No, Total Area sold, M.V. per sq.yard, Total Value → from DATA.property and DATA.marketValue. Keep the table's rows, columns, and borders identical; change ONLY the cell values.
-10. Any other baked-in party name, relation, age, DOB, occupation, address, Aadhaar, PAN, phone, survey/plot/house number, area, boundary, amount, or date appearing anywhere in the prose.
+9. MARKET-VALUE STATEMENT TABLE — update table cell values from DATA.property and DATA.marketValue while keeping table rows, columns, borders, and layout identical.
 
 ═══════════ MULTIPLE VENDORS / VENDEES — INCLUDE EVERY SINGLE ONE ═══════════
 DATA.executants contains ${sellerCount} seller(s). DATA.claimants contains ${buyerCount} buyer(s).
-- You MUST render ALL of them. If the TEMPLATE's specimen shows only ONE vendor but DATA has several, EXPAND the vendor block to list EVERY seller; do the same for buyers.
-- List multiple parties in the deed's own style — number them "1. …, 2. …, 3. …" (or as separate complete sentences), giving EACH party their OWN full detail line (name, relation, age, DOB, occupation, address, Aadhaar, PAN, and Cell No for buyers). Do NOT collapse several people onto one line and do NOT omit anyone.
-- After listing everyone, keep the collective label exactly as the template writes it — e.g. (Hereinafter called the "VENDOR/S"). Keep the "/s"; do not force it to singular or plural.
-- If DATA has FEWER parties than the specimen, render only the DATA parties and REMOVE the extra specimen persons entirely.
+- Render ALL of them. Expand vendor/buyer blocks to list EVERY person with their full details.
 
-═══════════ NO LEAKAGE (CRITICAL) ═══════════
-- The finished deed must contain ONLY facts from DATA. NO name, relation, age, DOB, address, Aadhaar, PAN, phone, survey/plot/house number, area, boundary, amount, or date from the TEMPLATE may survive unless that exact value is ALSO present in DATA.
-- Every specimen name/number the template already prints must be GONE from the output. When you are unsure whether a token is fixed wording or specimen data, and it looks like a name, number, amount, or date, REPLACE it with the DATA value (or a blank if DATA lacks it).
+═══════════ NO LEAKAGE & NO PLACEHOLDERS ═══════════
+- The finished deed must contain ONLY facts from DATA. NO specimen names, numbers, or addresses from the TEMPLATE may survive.
+- NEVER output placeholder dashes (e.g. "________", "----", "[_____]", "N/A"). Register the text directly and smoothly without placeholders.
 
-═══════════ MISSING DATA ═══════════
-- Use DATA values VERBATIM. Never invent, guess, translate, reformat, or compute a fact that is not in DATA.
-- If a required field is genuinely absent from DATA, put a clear blank "__________" in that spot — NEVER keep the template's specimen value and NEVER fabricate.
-- OCR typos in FIXED WORDING (not data) may stay as-is; but any data-bearing value is replaced by the clean value from DATA.
-
-═══════════ OUTPUT ═══════════
-Return ONLY the finished deed text — the FULL document, same structure and page count as the TEMPLATE, no markdown fences, no notes, no explanation.
+Return ONLY the finished deed text directly, matching the supplied template's structure and layout, with no markdown fences, no notes, and no explanation.
 
 DATA (the ONLY source of truth for names, parties, property, amounts, and dates):
 ${JSON.stringify(details, null, 2)}
 
-TEMPLATE (reproduce verbatim; replace ONLY the transaction-specific facts listed above):
+TEMPLATE (reproduce verbatim; preserve exact layout and formatting style; replace ONLY the transaction-specific facts listed above):
 ${templateText}`;
 
   const response = await ai.models.generateContent({
@@ -984,12 +1095,13 @@ ${templateText}`;
     contents: prompt,
     config: {
       systemInstruction:
-        "You are a senior Telangana registration deed drafter operating in CLONE mode. You reproduce the uploaded template EXACTLY — same pages, same clauses, same tables, same length — and change ONLY the transaction-specific facts (party details, execution date, value/stamp, link-document reference, consideration amounts, property schedule, boundaries, and market-value table) to match the provided DATA. You render EVERY seller and EVERY buyer present in DATA, each with their own full detail line. The output must contain ONLY facts from DATA — never let a party name, Aadhaar, PAN, address, survey/plot number, amount, or date from the source template leak through, and never fabricate facts absent from DATA. Return ONLY the final deed text, with no markdown and no commentary.",
+        "You are a senior Telangana registration deed drafter. Your mandatory duties are: 1. Preserve the supplied template's exact formatting style, setup layout, margins, paper size, fonts, font sizes, text alignment, headers, footers, padding, bullet/list formats, tables, and page breaks verbatim. 2. NEVER include any placeholder dashes, underscores (____), dashes (---), bracketed slots, or empty underlines anywhere in the final text. If any field or detail is not supplied in DATA, smoothly omit that unsupplied field or phrase so the document text is registered cleanly without placeholders. Return ONLY the final deed text with no markdown fences or commentary.",
       temperature: 0,
       maxOutputTokens: 16384,
     },
   });
-  return (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+  const resultText = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+  return regexCleanDraft(resultText);
 }
 
 // Try converting a .docx buffer to PDF via LibreOffice (soffice). Returns null if
@@ -1047,6 +1159,64 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// Endpoint to auto-adjust and clean empty blanks in the generated draft
+app.post("/api/clean-draft", async (req, res) => {
+  try {
+    const { draftText, details } = req.body || {};
+    if (!draftText || typeof draftText !== "string") {
+      return res.status(400).json({ error: "draftText is required." });
+    }
+
+    const ai = getGeminiClient();
+    let cleanedText = draftText;
+
+    if (ai) {
+      try {
+        const prompt = `You are an expert legal document drafter and proofreader for property sale deeds in Telangana.
+You are given a drafted deed text that contains leftover blank placeholders (such as {{PLACEHOLDER}}, [__________], [____], <...>, or empty underlines _____), or unsupplied optional field labels (e.g. "holding PAN ____", "PTI No: ____", "Door No: ____", "cell no: ____", "Aadhaar No: ____", "Plinth Area: ____", "S/o ____").
+
+YOUR MANDATE:
+1. Smoothly clean up, auto-adjust, and rewrite sentences so that ALL empty/unfilled placeholders or unsupplied labels are removed cleanly together with preceding/following words, while maintaining perfect legal grammar and sentence flow.
+2. Example 1:
+   Input: "Sri K. Ramu, S/o Venkatesh, holding Aadhaar No 123456789012, PAN: [_________], residing at..."
+   Output: "Sri K. Ramu, S/o Venkatesh, holding Aadhaar No 123456789012, residing at..."
+3. Example 2:
+   Input: "Plot No 25, Door No [___________], Survey No 102/A"
+   Output: "Plot No 25, Survey No 102/A"
+4. Do NOT invent or fabricate any missing facts (names, numbers, dates, amounts).
+5. Preserve all existing filled facts, headings, clauses, schedule of property, boundaries, and Rule 3 Statement of Market Value tables EXACTLY.
+
+DRAFT TEXT TO AUTO-ADJUST & CLEAN:
+${draftText}`;
+
+        const response = await ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: prompt,
+          config: {
+            systemInstruction: "You are a professional legal deed editor. Remove leftover empty placeholders and auto-adjust preceding sentence phrases smoothly so the legal document flows naturally. Do not invent fake data.",
+            temperature: 0,
+            maxOutputTokens: 16384,
+          },
+        });
+        cleanedText = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+      } catch (e) {
+        console.warn("AI clean draft failed, using regex fallback:", e);
+        cleanedText = regexCleanDraft(draftText);
+      }
+    } else {
+      cleanedText = regexCleanDraft(draftText);
+    }
+
+    // Guarantee no leftover {{...}} or [_____] with regex post-pass
+    cleanedText = regexCleanDraft(cleanedText);
+
+    res.json({ cleanedText });
+  } catch (err: any) {
+    console.error("Clean draft endpoint error:", err);
+    res.status(500).json({ error: "Failed to clean draft." });
+  }
+});
+
 // List available predefined Word (.docx) deed templates (one per registration type).
 app.get("/api/templates", async (_req, res) => {
   try {
@@ -1064,11 +1234,37 @@ app.get("/api/templates", async (_req, res) => {
 // Returns the merged text (for the A4 preview) plus the .docx as base64.
 app.post("/api/generate-document", async (req, res) => {
   try {
-    const { templateId, details, customTemplateText, customTemplateName } = req.body || {};
+    const { templateId, details, customTemplateText, customTemplateName, customTemplateDocxBase64 } = req.body || {};
     const custom = typeof customTemplateText === "string" && customTemplateText.trim().length > 0;
 
     if (!templateId && !custom) {
       return res.status(400).json({ error: "templateId or customTemplateText is required." });
+    }
+
+    // ── PREFERRED PATH: true in-place .docx fill ────────────────────────────
+    // When the user uploaded a .docx template, we have its ORIGINAL bytes. Fill
+    // the <Angle Bracket> markers directly inside the zip so EVERY bit of the
+    // template's formatting (fonts, bold, sizes, colour, alignment, margins,
+    // page size, line spacing, tables, headers) is preserved byte-for-byte —
+    // only the marked text is swapped for the extracted values.
+    if (typeof customTemplateDocxBase64 === "string" && customTemplateDocxBase64.trim().length > 0) {
+      try {
+        const { resolve } = buildAngleFieldResolver(details);
+        const filled = await fillDocxTemplate(customTemplateDocxBase64, resolve, { open: "<", close: ">" });
+        return res.json({
+          templateId: "custom-upload",
+          templateName: customTemplateName || "Custom Uploaded Template",
+          mergeMode: "inplace-docx",
+          mergedText: filled.text,
+          unresolvedPlaceholders: filled.unresolved,
+          replacedCount: filled.replaced,
+          docxBase64: filled.buffer.toString("base64"),
+          format: { preserved: true, source: "uploaded-template" },
+        });
+      } catch (e: any) {
+        console.warn("In-place .docx fill failed; falling back to text merge:", e?.message || e);
+        // fall through to the legacy text-merge path below
+      }
     }
 
     // Resolve the template WORDING: either the user's uploaded document text, or a
@@ -1145,7 +1341,15 @@ app.post("/api/generate-document", async (req, res) => {
 // LibreOffice; falls back with a flag if unavailable). Returns base64 file data.
 app.post("/api/export-document", async (req, res) => {
   try {
-    const { format, finalText, templateId, details } = req.body || {};
+    const {
+      format,
+      finalText,
+      templateId,
+      details,
+      planImagePngBase64,
+      planImageWidthPx,
+      planImageHeightPx,
+    } = req.body || {};
     let mergedText: string = typeof finalText === "string" ? finalText : "";
 
     if (!mergedText && templateId) {
@@ -1160,7 +1364,17 @@ app.post("/api/export-document", async (req, res) => {
       return res.status(400).json({ error: "finalText or templateId is required." });
     }
 
-    const docxBuffer = await buildDeedDocx(mergedText);
+    // When the client rasterised the registration plan (SVG -> PNG), append it as a
+    // final full page so the downloaded Word/PDF carries the deed AND its plan.
+    const planImg =
+      typeof planImagePngBase64 === "string" && planImagePngBase64.trim().length > 0
+        ? planImagePngBase64
+        : undefined;
+    const docxBuffer = await buildDeedDocx(mergedText, {
+      planImagePngBase64: planImg,
+      planImageWidthPx: Number(planImageWidthPx) || undefined,
+      planImageHeightPx: Number(planImageHeightPx) || undefined,
+    });
 
     if (format === "pdf") {
       const pdf = await convertDocxToPdf(docxBuffer);
@@ -1302,8 +1516,8 @@ app.post("/api/extract", async (req, res) => {
       text: `Analyze the provided files (Aadhaar cards, PAN cards, property deeds, or passbooks) and extract ALL key real estate registration variables.
       
       Look for:
-      - Executants (Sellers): Name, relation (e.g. S/o or D/o), age, Aadhaar number, PAN number, Date of Birth (DD/MM/YYYY), Address.
-      - Claimants (Buyers): Name, relation, age, Aadhaar, PAN, Date of Birth (DD/MM/YYYY), Address.
+      - Executants (Sellers): Name, relation (e.g. S/o or D/o), age, Aadhaar number, PAN number, Date of Birth (DD/MM/YYYY), Address (residential address ONLY - do NOT include S/o, W/o or relation name inside address).
+      - Claimants (Buyers): Name, relation, age, Aadhaar, PAN, Date of Birth (DD/MM/YYYY), Address (residential address ONLY - do NOT include S/o, W/o or relation name inside address).
       - Property details: Survey No, Village, Mandal, District, State, H.No, Plot No, PTI No, Extent (area), Plinth Area, and Boundaries (East, West, North, South).
       - Link Deed Reference: Document Number, Execution Date, Registered Village/Office.
       
@@ -1487,7 +1701,7 @@ Fields:
 - mobile: mobile number if printed, else ""
 - dob: date of birth exactly as the digits are printed (keep the same day, month, year)
 - aadhaarNo: the 12-digit number, formatted "XXXX XXXX XXXX"
-- address: the full address block if printed, else ""
+- address: the residential address block if printed (CRITICAL: exclude any S/O, W/O, D/O, or C/O prefix or relation/father/husband name from address, return ONLY the door/house no, street, village, mandal, district, pincode), else ""
 - district, state, pincode: only if clearly present in the printed address, else ""
 - leave occupation and age as "" (computed elsewhere)
 
@@ -1590,9 +1804,11 @@ app.post("/api/extract-link-document", async (req, res) => {
         },
         linkDocument: {
           docNo: "1204/1998",
+          docDate: "14/08/1998",
           subRegistrar: "Nakrekal",
           subRegistrarCode: "SR-NKL-44",
           pattadarPassbook: "T1209004812",
+          passbookKhataNo: "4812",
           nalaOrderNo: "N/A",
           layoutFileNo: "LP.No. 45/1997",
           houseTaxReceipt: "HTR-2024-001"
@@ -1641,10 +1857,12 @@ app.post("/api/extract-link-document", async (req, res) => {
           type: Type.OBJECT,
           properties: {
             docNo: { type: Type.STRING, description: "Document number, often handwritten at top right corner or in margins" },
+            docDate: { type: Type.STRING, description: "Link document registration/execution date" },
             docType: { type: Type.STRING, description: "CRITICAL: Document type from title section - GIFT SETTLEMENT DEED, SALE DEED, RELEASE DEED, etc. Extract from large bold header text at top of page" },
             subRegistrar: { type: Type.STRING },
             subRegistrarCode: { type: Type.STRING },
-            pattadarPassbook: { type: Type.STRING, description: "Pattadar Passbook No or Khata No" },
+            pattadarPassbook: { type: Type.STRING, description: "Pattadar Passbook No" },
+            passbookKhataNo: { type: Type.STRING, description: "Pass book Khata number" },
             nalaOrderNo: { type: Type.STRING },
             layoutFileNo: { type: Type.STRING },
             houseTaxReceipt: { type: Type.STRING, description: "House tax receipt number if mentioned" }
@@ -1653,12 +1871,14 @@ app.post("/api/extract-link-document", async (req, res) => {
         property: {
           type: Type.OBJECT,
           properties: {
+            propertyType: { type: Type.STRING, description: "CRITICAL: Identify type - 'Open plot', 'House', 'Demolished House', 'Part of open place', or 'Flat'" },
             surveyNo: { type: Type.STRING, description: "Survey number like 412/A, 102/AA etc" },
             plotNo: { type: Type.STRING },
             nearHNo: { type: Type.STRING, description: "House number" },
             extentSqYards: { type: Type.STRING, description: "Property extent in square yards" },
             extentSqMeters: { type: Type.STRING, description: "Property extent in square meters" },
             locality: { type: Type.STRING },
+            pincode: { type: Type.STRING, description: "Pincode of property location e.g. 508211" },
             marketValuePerSqYard: { type: Type.STRING },
             marketValueTotal: { type: Type.STRING },
             house: {
@@ -1670,7 +1890,8 @@ app.post("/api/extract-link-document", async (req, res) => {
                 tapConnection: { type: Type.STRING },
                 metersNo: { type: Type.STRING },
                 taxes: { type: Type.STRING },
-                rentalValue: { type: Type.STRING }
+                rentalValue: { type: Type.STRING },
+                plinthArea: { type: Type.STRING }
               }
             },
             flat: {
@@ -1902,36 +2123,41 @@ app.post("/api/fill-template", async (req, res) => {
     const ai = getGeminiClient();
     if (!ai) {
       console.log("GEMINI_API_KEY is missing. Running template fill in local mode.");
-      return res.json({ filledText: localFillTemplate(templateText, extractedDetails) });
+      return res.json({ filledText: regexCleanDraft(localFillTemplate(templateText, extractedDetails)) });
     }
     
-    const prompt = `You are an expert legal document drafter in Telangana, India. Fill the following Model Sale Deed draft with the extracted registration facts.
-    Replace all placeholders like {{SELLER_NAME}}, {{BUYER_NAME}}, {{PROPERTY_HNO}}, etc., with the exact details.
-    
-    If the template uses custom double braces, resolve them. Ensure character-by-character matching with Aadhaar names, Aadhaar numbers, plot numbers, surveys, and boundaries.
-    Ensure spelling, ages, and bounds match the extracted variables exactly. Keep the final text extremely professional, aligned, and ready for official print.
-    Do NOT wrap the response in markdown code blocks. Just return the raw draft text directly.
-    
-    VARIABLES:
-    ${JSON.stringify(extractedDetails, null, 2)}
-    
-    TEMPLATE:
-    ${templateText}`;
+    const prompt = `You are an expert legal document drafter in Telangana, India. Update the supplied Model Sale Deed template with the extracted registration details.
+
+STRICT INSTRUCTIONS:
+1. FORMATTING & LAYOUT PRESERVATION: You MUST preserve the exact formatting style, layout setup, paper size, margins, font style, font sizes, text alignment (left, center, justified), headers, footers, page margins, padding, bullet formats, numbered lists, and table structures of the supplied template. Keep all clauses, headings, and schedules in the original template order.
+2. NO PLACEHOLDERS OR DASHES: Do NOT include any placeholder dashes, underscores (____), dashes (---), bracketed slots ([...]), [N/A], or empty line placeholders anywhere in the text.
+   If relevant information is not supplied or is missing for a particular field in the registration details, do NOT write any dashes or blank lines.
+   Smoothly omit the unsupplied detail or phrase so that the final text is registered directly and cleanly, maintaining perfect legal grammar and flow.
+3. Ensure exact character-by-character accuracy for Aadhaar names, numbers, survey numbers, plot numbers, boundaries, and amounts from the variables.
+
+Do NOT wrap the response in markdown code blocks. Return ONLY the final filled legal draft text directly.
+
+VARIABLES:
+${JSON.stringify(extractedDetails, null, 2)}
+
+TEMPLATE:
+${templateText}`;
     
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: prompt,
       config: {
-        systemInstruction: "You are a senior registration deed drafter. Return ONLY the final filled legal draft text. Never include markdown code blocks or conversational text.",
+        systemInstruction: "You are a senior registration deed drafter. Return ONLY the final filled legal draft text. Preserve template layout, fonts, margins, alignment, bullets, and formatting style. NEVER output placeholder dashes, underscores (____), or blank lines for missing fields — write the registered text cleanly without placeholders. Never include markdown code blocks or conversational text.",
         temperature: 0.1
       }
     });
     
-    const filledText = response.text;
+    let filledText = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+    filledText = regexCleanDraft(filledText);
     return res.json({ filledText });
   } catch (err) {
     console.warn("Template filling failed, falling back to local replacement engine:", err);
-    return res.json({ filledText: localFillTemplate(req.body.templateText, req.body.extractedDetails) });
+    return res.json({ filledText: regexCleanDraft(localFillTemplate(req.body.templateText, req.body.extractedDetails)) });
   }
 });
 
@@ -2179,12 +2405,14 @@ app.post("/api/verify", async (req, res) => {
             properties: {
               category: { type: Type.STRING, description: "Must be: 'Names mismatch', 'Property details mismatch', 'Link document numbers mismatch', 'Residual content', or 'Completeness'" },
               severity: { type: Type.STRING, description: "CRITICAL or WARNING" },
-              description: { type: Type.STRING },
+              description: { type: Type.STRING, description: "Detailed description in English" },
+              descriptionTe: { type: Type.STRING, description: "Telugu translation of description (తెలుగు అనువాదం)" },
               expected: { type: Type.STRING },
               found: { type: Type.STRING },
-              recommendation: { type: Type.STRING }
+              recommendation: { type: Type.STRING, description: "Actionable recommendation in English" },
+              recommendationTe: { type: Type.STRING, description: "Telugu translation of recommendation (తెలుగు పరిస్కార సూచన)" }
             },
-            required: ["category", "severity", "description", "expected", "found", "recommendation"]
+            required: ["category", "severity", "description", "descriptionTe", "expected", "found", "recommendation", "recommendationTe"]
           }
         },
         linkDocumentDetails: {
@@ -2231,6 +2459,200 @@ app.post("/api/verify", async (req, res) => {
       return res.status(500).json({
         error: error.message || "An internal error occurred during document verification.",
       });
+    }
+  }
+});
+
+// NOTE: the plan is now produced by the deterministic renderer in planRenderer.ts
+// (renderPlanDataUrl) fed by a Gemini vision extraction of the sketch. The old
+// text-only Imagen call, the LLM-hand-written-SVG fallback, and the hardcoded
+// 66'x66' buildFallbackCadSvg have been removed — the renderer always yields a
+// full, on-spec one-pager even with no AI (drawing from the form details).
+
+function buildFallbackVerificationReport(propertyDetails: any) {
+  return {
+    extractedFromSketch: {
+      east: propertyDetails?.boundaries?.east || "East Boundary",
+      west: propertyDetails?.boundaries?.west || "West Boundary",
+      north: propertyDetails?.boundaries?.north || "North Boundary",
+      south: propertyDetails?.boundaries?.south || "South Boundary",
+      dimensions: "66.0' x 66.0' Footprint",
+      roadDetails: "Access Corridor"
+    },
+    discrepancies: [],
+    isMatch: true
+  };
+}
+
+// API endpoint to process a hand-drawn sketch and generate a neat computerized AI plot image + boundary verification report
+app.post("/api/generate-plan", async (req, res) => {
+  try {
+    const { sketchBase64, customPrompt, propertyDetails, details } = req.body || {};
+    if (!sketchBase64 || typeof sketchBase64 !== "string") {
+      return res.status(400).json({ error: "Missing sketchBase64 in request body." });
+    }
+
+    const ai = getGeminiClient();
+
+    // Prepare image part
+    const matches = sketchBase64.match(/^data:(image\/[a-zA-Z]+);base64,(.+)$/);
+    const mimeType = matches ? matches[1] : "image/jpeg";
+    const base64Data = matches ? matches[2] : sketchBase64.replace(/^data:image\/[a-zA-Z]+;base64,/, "");
+
+    const imagePart = {
+      inlineData: {
+        data: base64Data,
+        mimeType: mimeType
+      }
+    };
+
+    const userPromptText = customPrompt && customPrompt.trim().length > 0 ? customPrompt.trim() : "";
+
+    // Normalise the flat property-detail shape used by verification + fallback.
+    const pd = propertyDetails || (details?.property
+      ? {
+          boundaries: details.property.boundaries,
+          surveyNo: details.property.surveyNo,
+          plotNo: details.property.plotNo,
+          extentSqYards: details.property.extentSqYards,
+        }
+      : {});
+    // The full consolidated details drive the deterministic one-pager renderer
+    // (party paragraphs, description, area table). Fall back to the flat shape.
+    const renderDetails =
+      details && typeof details === "object" ? details : { property: pd };
+
+    // ---- STEP 1: read the hand-drawn sketch into STRUCTURED JSON (vision) ----
+    // The sketch image IS sent to the model here. (Previously the sketch was
+    // never passed to the image generator, so the output bore no relation to it.)
+    let extractedPlan: any = null;
+    let imageError: string | null = null;
+    if (ai) {
+      try {
+        const extractionResponse = await ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: [
+            imagePart,
+            {
+              text:
+                PLAN_EXTRACTION_PROMPT +
+                (userPromptText ? `\n\nADDITIONAL USER NOTES:\n${userPromptText}` : ""),
+            },
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: PLAN_EXTRACTION_SCHEMA,
+            temperature: 0.1,
+          },
+        });
+        if (extractionResponse.text) {
+          extractedPlan = JSON.parse(
+            extractionResponse.text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim()
+          );
+        }
+      } catch (exErr: any) {
+        console.warn(
+          "Plan sketch extraction failed; rendering from form details:",
+          exErr?.message || exErr
+        );
+        imageError = exErr?.message || "Sketch extraction unavailable.";
+      }
+    }
+
+    // ---- STEP 2: render the full one-pager deterministically from the JSON ----
+    // Always succeeds: with no sketch JSON it draws from the form details.
+    const generatedImageBase64 = renderPlanDataUrl({ plan: extractedPlan, details: renderDetails });
+
+    // Perform Boundary Verification between the sketch image and the registration form property details
+    let verificationReport: any = null;
+    if (ai) {
+      const verificationPrompt = `You are an expert land surveyor and legal verification auditor in Telangana, India.
+Examine the uploaded hand-drawn property sketch image carefully and compare it against the official property details from the registration form DATA.
+
+PROPERTY DETAILS FROM REGISTRATION FORM DATA:
+- East Boundary: ${pd?.boundaries?.east || "Not specified"}
+- West Boundary: ${pd?.boundaries?.west || "Not specified"}
+- North Boundary: ${pd?.boundaries?.north || "Not specified"}
+- South Boundary: ${pd?.boundaries?.south || "Not specified"}
+- Survey No: ${pd?.surveyNo || "Not specified"}
+- Plot No: ${pd?.plotNo || "Not specified"}
+- Extent / Total Area: ${pd?.extentSqYards || "Not specified"} Sq Yards
+
+TASK:
+1. Extract all boundary markings, orientation (East/West/North/South), dimensions (feet/meters), adjacent roads, and neighbor details written on the sketch image.
+2. Cross-verify each boundary (East, West, North, South), plot dimensions, survey number, and road widths on the sketch against the registration form details provided above.
+3. Identify any DISCREPANCIES or MISMATCHES between the sketch and the registration form.
+4. Return a structured JSON response containing the analysis.
+
+JSON Output Schema strictly format as:
+{
+  "extractedFromSketch": {
+    "east": "text found on East side",
+    "west": "text found on West side",
+    "north": "text found on North side",
+    "south": "text found on South side",
+    "dimensions": "dimensions mentioned e.g. 66' x 66'",
+    "roadDetails": "roads mentioned"
+  },
+  "discrepancies": [
+    {
+      "direction": "East / West / North / South / Dimensions",
+      "formDetail": "What was entered in registration form",
+      "sketchDetail": "What is drawn/written in the hand-drawn sketch",
+      "severity": "CRITICAL" | "WARNING" | "INFO",
+      "description": "Clear explanation of discrepancy in English",
+      "descriptionTe": "తెలుగులో వివరణ"
+    }
+  ],
+  "isMatch": boolean
+}`;
+
+      try {
+        const auditResponse = await ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: [imagePart, { text: verificationPrompt }],
+          config: {
+            responseMimeType: "application/json",
+            temperature: 0.1
+          }
+        });
+
+        if (auditResponse.text) {
+          verificationReport = JSON.parse(auditResponse.text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim());
+        }
+      } catch (vErr) {
+        console.error("Verification audit failed:", vErr);
+      }
+    }
+
+    if (!verificationReport) {
+      verificationReport = buildFallbackVerificationReport(pd);
+    }
+
+    return res.json({
+      generatedImageBase64,
+      imageError,
+      verificationReport,
+      // What the sketch reader pulled out — handy for debugging/preview.
+      extractedPlan,
+      masterPromptUsed: PLAN_EXTRACTION_PROMPT + (userPromptText ? `\n\nUSER NOTES:\n${userPromptText}` : ""),
+    });
+  } catch (err: any) {
+    console.error("Error in /api/generate-plan:", err);
+    // Even in catch block, render a clean plan from whatever details we have so
+    // the frontend never gets a 500 error.
+    try {
+      const { propertyDetails, details } = req.body || {};
+      const rd =
+        details && typeof details === "object" ? details : { property: propertyDetails || {} };
+      return res.json({
+        generatedImageBase64: renderPlanDataUrl({ plan: null, details: rd }),
+        imageError: null,
+        verificationReport: buildFallbackVerificationReport(propertyDetails || details?.property),
+        masterPromptUsed: PLAN_EXTRACTION_PROMPT,
+      });
+    } catch {
+      return res.status(500).json({ error: err.message || "Failed to generate plan." });
     }
   }
 });

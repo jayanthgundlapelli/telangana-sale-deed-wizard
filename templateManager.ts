@@ -101,6 +101,8 @@ West by  : {{BOUNDARY_WEST}}
 North by : {{BOUNDARY_NORTH}}
 South by : {{BOUNDARY_SOUTH}}
 
+{{STATEMENT_OF_MARKET_VALUE_TABLE}}
+
 IN WITNESS WHEREOF the Seller and Buyer have signed this Sale Deed on the day, month, and year first written above.
 
 Seller's Signature: __________________        Buyer's Signature: __________________

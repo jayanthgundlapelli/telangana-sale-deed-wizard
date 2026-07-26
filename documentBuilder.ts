@@ -19,6 +19,7 @@ import {
   Paragraph,
   TextRun,
   PageBreak,
+  ImageRun,
   AlignmentType,
   convertInchesToTwip,
   convertMillimetersToTwip,
@@ -35,9 +36,21 @@ export interface DeedFormatOptions {
   /** Point size of the body font. Default 14. */
   fontSizePt?: number;
   fontFamily?: string;
+  /**
+   * Optional registration-plan image (PNG) to append as a FINAL full page after the
+   * deed body. Pass the raw base64 (no data-URL prefix). When present, a page break
+   * plus a centered, page-fitted image is added. The .docx (and any PDF derived from
+   * it) then carries the plan as its last page.
+   */
+  planImagePngBase64?: string;
+  /** Natural pixel dimensions of the plan image, used to preserve aspect ratio. */
+  planImageWidthPx?: number;
+  planImageHeightPx?: number;
 }
 
-const DEFAULTS: Required<DeedFormatOptions> = {
+const DEFAULTS: Required<
+  Omit<DeedFormatOptions, "planImagePngBase64" | "planImageWidthPx" | "planImageHeightPx">
+> = {
   firstPageBodyStartInches: 5.8,
   topMarginInches: 1,
   leftMarginInches: 0.75,
@@ -130,6 +143,45 @@ export async function buildDeedDocx(
         spacing: { before: spacerTwips },
       })
     );
+  }
+
+  // ── Append the registration plan as a FINAL full page (if provided) ──────────
+  // The one-pager plan is rendered on the client as an SVG, rasterised there to a
+  // PNG (Word/PDF cannot embed a raw SVG reliably), and passed here as base64. We
+  // add a page break then a centered image fitted to the usable content area, so
+  // both the .docx and any PDF derived from it carry the plan as their last page.
+  if (opts.planImagePngBase64 && opts.planImagePngBase64.trim().length > 0) {
+    try {
+      const imgW = opts.planImageWidthPx && opts.planImageWidthPx > 0 ? opts.planImageWidthPx : 800;
+      const imgH = opts.planImageHeightPx && opts.planImageHeightPx > 0 ? opts.planImageHeightPx : 1131;
+      // Usable content area (A4 minus the pages-2..n margins), in px at 96 DPI.
+      const A4_WIDTH_IN = 210 / 25.4; // 8.2677"
+      const A4_HEIGHT_IN = 297 / 25.4; // 11.6929"
+      const usableWpx = (A4_WIDTH_IN - opts.leftMarginInches - opts.rightMarginInches) * 96;
+      const usableHpx = (A4_HEIGHT_IN - opts.topMarginInches - opts.bottomMarginInches) * 96;
+      const scale = Math.min(usableWpx / imgW, usableHpx / imgH);
+      const dispW = Math.max(1, Math.round(imgW * scale));
+      const dispH = Math.max(1, Math.round(imgH * scale));
+      const data = Buffer.from(opts.planImagePngBase64.replace(/^data:[^,]+,/, ""), "base64");
+
+      paragraphs.push(new Paragraph({ children: [new PageBreak()] }));
+      paragraphs.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 0, after: 0, line: 240 },
+          children: [
+            new ImageRun({
+              type: "png",
+              data,
+              transformation: { width: dispW, height: dispH },
+            }),
+          ],
+        })
+      );
+    } catch (e: any) {
+      console.warn("Failed to append plan image page:", e?.message || e);
+      // Non-fatal: the deed is still produced without the plan page.
+    }
   }
 
   const doc = new Document({
