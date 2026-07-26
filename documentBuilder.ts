@@ -24,6 +24,7 @@ import {
   convertInchesToTwip,
   convertMillimetersToTwip,
 } from "docx";
+import { stripInvalidXmlChars } from "./templateFiller";
 
 export interface DeedFormatOptions {
   /** Inches from the top edge of PAGE 1 where the body should begin. Default 5.8. */
@@ -88,7 +89,10 @@ export async function buildDeedDocx(
   const opts = { ...DEFAULTS, ...options };
   const halfPointSize = Math.round(opts.fontSizePt * 2); // docx sizes are in half-points
 
-  const lines = (mergedText || "").replace(/\r\n/g, "\n").split("\n");
+  // Strip characters that are illegal in XML 1.0 (NUL, vertical tab, form feed,
+  // other C0/C1 controls, lone surrogates) BEFORE they reach a <w:t> run — else
+  // Word rejects the file with "problems with the contents … /word/document.xml".
+  const lines = stripInvalidXmlChars((mergedText || "").replace(/\r\n/g, "\n")).split("\n");
 
   // Spacer to push the first line of page 1 down to `firstPageBodyStartInches`.
   // The section top margin already accounts for `topMarginInches`.
@@ -216,6 +220,163 @@ export async function buildDeedDocx(
   });
 
   return Packer.toBuffer(doc);
+}
+
+// -----------------------------------------------------------------------------
+// Append the registration plan as a FINAL image page INTO AN EXISTING .docx,
+// WITHOUT rebuilding it — so an uploaded template that was filled in place keeps
+// its exact fonts / margins / tables / page setup, and merely gains one more page.
+//
+// We manipulate the OOXML zip directly (JSZip): add the JPEG to word/media, wire a
+// relationship, ensure the content-type + required namespaces exist, then insert a
+// page-break paragraph + a centred <w:drawing> just before the body's trailing
+// <w:sectPr>. The image is fitted to the template's own usable page area (parsed
+// from that sectPr), preserving aspect ratio.
+// -----------------------------------------------------------------------------
+export interface AppendPlanOptions {
+  /** Base64 (data-URL or raw) of the plan image to embed. JPEG recommended. */
+  imageBase64: string;
+  /** Natural pixel width/height of the image (for aspect ratio). */
+  imageWidthPx?: number;
+  imageHeightPx?: number;
+}
+
+// EMU (English Metric Units): 914400 per inch, 635 per twip, 9525 per px @96dpi.
+const EMU_PER_TWIP = 635;
+const EMU_PER_PX = 9525;
+
+// Parse the template's own usable page area (width/height in EMU) from the body
+// section's <w:sectPr> so the appended image fits that template — not a guess.
+function usablePageEmu(documentXml: string): { availW: number; availH: number } {
+  // A4 portrait defaults (twips) with 0.75" L/R, 1" T/B margins.
+  let pgW = 11906, pgH = 16838, mL = 1080, mR = 1080, mT = 1440, mB = 1440;
+  const sect = documentXml.lastIndexOf("<w:sectPr");
+  if (sect !== -1) {
+    let end = documentXml.indexOf("</w:sectPr>", sect);
+    end = end === -1 ? documentXml.length : end + "</w:sectPr>".length;
+    const seg = documentXml.slice(sect, end);
+    const wsz = seg.match(/<w:pgSz\b[^>]*\bw:w="(\d+)"/);
+    const hsz = seg.match(/<w:pgSz\b[^>]*\bw:h="(\d+)"/);
+    if (wsz) pgW = parseInt(wsz[1], 10);
+    if (hsz) pgH = parseInt(hsz[1], 10);
+    const mar = seg.match(/<w:pgMar\b[^>]*\/?>/);
+    if (mar) {
+      const g = (k: string) => {
+        const m = mar[0].match(new RegExp(`\\bw:${k}="(-?\\d+)"`));
+        return m ? parseInt(m[1], 10) : null;
+      };
+      mL = g("left") ?? mL;
+      mR = g("right") ?? mR;
+      mT = g("top") ?? mT;
+      mB = g("bottom") ?? mB;
+    }
+  }
+  return {
+    availW: Math.max(1, pgW - mL - mR) * EMU_PER_TWIP,
+    availH: Math.max(1, pgH - mT - mB) * EMU_PER_TWIP,
+  };
+}
+
+export async function appendPlanPageToDocx(
+  docxBuffer: Buffer,
+  opts: AppendPlanOptions
+): Promise<Buffer> {
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(docxBuffer);
+
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) throw new Error("Not a valid .docx (missing word/document.xml).");
+  let xml = await docFile.async("string");
+
+  // 1) Image bytes + fitted size.
+  const raw = (opts.imageBase64 || "").replace(/^data:[^,]+,/, "");
+  const imgData = Buffer.from(raw, "base64");
+  if (imgData.length === 0) return docxBuffer; // nothing to add
+  const imgWpx = opts.imageWidthPx && opts.imageWidthPx > 0 ? opts.imageWidthPx : 800;
+  const imgHpx = opts.imageHeightPx && opts.imageHeightPx > 0 ? opts.imageHeightPx : 1131;
+  const { availW, availH } = usablePageEmu(xml);
+  const natW = imgWpx * EMU_PER_PX;
+  const natH = imgHpx * EMU_PER_PX;
+  const scale = Math.min(availW / natW, availH / natH);
+  const cx = Math.max(1, Math.round(natW * scale));
+  const cy = Math.max(1, Math.round(natH * scale));
+
+  // 2) Add the media file (unique name to avoid clobbering template media).
+  const imgName = "registration-plan-appended.jpg";
+  zip.file(`word/media/${imgName}`, imgData);
+
+  // 3) Ensure [Content_Types].xml declares the jpg extension.
+  const ctFile = zip.file("[Content_Types].xml");
+  if (ctFile) {
+    let ct = await ctFile.async("string");
+    if (!/<Default\b[^>]*Extension="jpe?g"/i.test(ct)) {
+      ct = ct.replace(/<\/Types>/, '<Default Extension="jpg" ContentType="image/jpeg"/></Types>');
+      zip.file("[Content_Types].xml", ct);
+    }
+  }
+
+  // 4) Wire a relationship in word/_rels/document.xml.rels (unique rId).
+  const relsPath = "word/_rels/document.xml.rels";
+  const relsFile = zip.file(relsPath);
+  let rId = "rId900001";
+  if (relsFile) {
+    let rels = await relsFile.async("string");
+    const ids = [...rels.matchAll(/Id="rId(\d+)"/g)].map((m) => parseInt(m[1], 10));
+    rId = "rId" + ((ids.length ? Math.max(...ids) : 0) + 1);
+    rels = rels.replace(
+      /<\/Relationships>/,
+      `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${imgName}"/></Relationships>`
+    );
+    zip.file(relsPath, rels);
+  }
+
+  // 5) Ensure the drawing namespaces exist on <w:document>.
+  xml = xml.replace(/<w:document\b([^>]*)>/, (_m, attrs) => {
+    let a = attrs as string;
+    if (!/xmlns:r=/.test(a)) a += ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    if (!/xmlns:wp=/.test(a)) a += ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"';
+    return `<w:document${a}>`;
+  });
+
+  // 6) Build the page-break + centred image paragraphs.
+  const drawingId = 424242;
+  const planXml =
+    `<w:p><w:r><w:br w:type="page"/></w:r></w:p>` +
+    `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>` +
+    `<wp:inline distT="0" distB="0" distL="0" distR="0">` +
+    `<wp:extent cx="${cx}" cy="${cy}"/>` +
+    `<wp:effectExtent l="0" t="0" r="0" b="0"/>` +
+    `<wp:docPr id="${drawingId}" name="RegistrationPlan"/>` +
+    `<wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
+    `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+    `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+    `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+    `<pic:nvPicPr><pic:cNvPr id="${drawingId}" name="${imgName}"/><pic:cNvPicPr/></pic:nvPicPr>` +
+    `<pic:blipFill><a:blip r:embed="${rId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+    `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
+    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
+    `</pic:pic></a:graphicData></a:graphic></wp:inline>` +
+    `</w:drawing></w:r></w:p>`;
+
+  // 7) Insert before the body's trailing <w:sectPr> (which must remain last in
+  //    <w:body>). If there is no body-level sectPr, insert before </w:body>.
+  const bodyClose = xml.lastIndexOf("</w:body>");
+  const lastSect = xml.lastIndexOf("<w:sectPr");
+  const lastParaClose = xml.lastIndexOf("</w:p>");
+  let insertAt: number;
+  if (lastSect !== -1 && lastSect < bodyClose && lastSect > lastParaClose) {
+    insertAt = lastSect; // body-level sectPr → put our pages just before it
+  } else {
+    insertAt = bodyClose === -1 ? xml.length : bodyClose;
+  }
+  xml = xml.slice(0, insertAt) + planXml + xml.slice(insertAt);
+  zip.file("word/document.xml", xml);
+
+  return zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
 }
 
 // Deterministic placeholder merge — exact, no paraphrasing, no hallucination.

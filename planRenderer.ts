@@ -108,6 +108,23 @@ export const PLAN_EXTRACTION_SCHEMA: any = {
             required: ["x", "y", "text"],
           },
         },
+        roads: {
+          type: T.ARRAY,
+          description:
+            "Roads abutting the plot; one entry per road. Provide this IN ADDITION to any road text in labels[].",
+          items: {
+            type: T.OBJECT,
+            properties: {
+              side: {
+                type: T.STRING,
+                description:
+                  "Which side of the PLOT the road runs along: NORTH, SOUTH, EAST or WEST. A road drawn below the plot is SOUTH, above is NORTH, to the left is WEST, to the right is EAST.",
+              },
+              label: { type: T.STRING, description: "Road name/width exactly as written, e.g. \"40' ROAD\"." },
+            },
+            required: ["side", "label"],
+          },
+        },
       },
     },
   },
@@ -127,6 +144,7 @@ RULES:
 - Inner structures (TINSHED / R.C.C.) go in interiorBoxes as {x,y,w,h} in the same space.
 - Fill the AREA / PLINTH / SCALE table values if written on the sketch; otherwise leave them as empty strings.
 - Copy the title, the property-description sentence, and each party block (DONOR/S, DONEE/S, VENDOR/S, VENDEE/S) verbatim into parties[].
+- For EVERY road that borders the plot, add an entry to drawing.roads giving the plot side it runs along (NORTH / SOUTH / EAST / WEST) and its label (e.g. "40' ROAD"). A road drawn below the plot is SOUTH, above is NORTH, to the left is WEST, to the right is EAST. Also keep the road's text in labels[].
 
 Return ONLY the JSON matching the provided schema.`;
 
@@ -366,6 +384,73 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
 
   // Region bounds for keeping label text inside the drawing box.
   const regL = RX + 4, regR = RX + RW - 4, regT = RY + 4, regB = RY + RH - 4;
+
+  // ---- Roads: draw abutting roads as strips just OUTSIDE the plot edge --------
+  // Faithful to the hand-drawn sketch, where each road is a band running along a
+  // side of the plot. Roads come from two sources: (a) the explicit drawing.roads[]
+  // the model returns with a plot side, and (b) inferred from any role:"road" label
+  // by which edge its anchor lies beyond. We draw ONE strip per side. The road NAME
+  // for label-sourced roads is drawn by the labels loop below (already positioned &
+  // rotated), so here we add text only for roads that have no matching label.
+  {
+    let plotL: number, plotR: number, plotT: number, plotB: number;
+    if (poly.length >= 3) {
+      const mxs = poly.map((p) => mapX(p.x));
+      const mys = poly.map((p) => mapY(p.y));
+      plotL = Math.min(...mxs); plotR = Math.max(...mxs);
+      plotT = Math.min(...mys); plotB = Math.max(...mys);
+    } else {
+      plotL = RX + 40; plotT = RY + 30; plotR = RX + 40 + (RW - 90); plotB = RY + 30 + (RH - 90);
+    }
+    const cxp = (plotL + plotR) / 2, cyp = (plotT + plotB) / 2;
+    const normSide = (s: any): "N" | "S" | "E" | "W" | "" => {
+      const t = String(s || "").trim().toUpperCase();
+      return t.startsWith("N") ? "N" : t.startsWith("S") ? "S" : t.startsWith("E") ? "E" : t.startsWith("W") ? "W" : "";
+    };
+    const roadBySide = new Map<string, { label: string; fromLabel: boolean }>();
+    // (a) infer from role:"road" labels by which edge their anchor lies beyond.
+    for (const lb of labels) {
+      if (!lb || !lb.text || !isFinite(lb.x) || !isFinite(lb.y)) continue;
+      if (!/road/i.test(String(lb.role || ""))) continue;
+      const ax = mapX(lb.x), ay = mapY(lb.y);
+      const dBelow = ay - plotB, dAbove = plotT - ay, dLeft = plotL - ax, dRight = ax - plotR;
+      const m = Math.max(dBelow, dAbove, dLeft, dRight);
+      let side: string;
+      if (m <= 0) {
+        // anchor sits inside the plot box — fall back to rotation / quadrant.
+        const rotv = isFinite(lb.rotation) ? lb.rotation : 0;
+        side = rotv === 90 || rotv === -90 ? (ax < cxp ? "W" : "E") : ay < cyp ? "N" : "S";
+      } else side = m === dBelow ? "S" : m === dAbove ? "N" : m === dLeft ? "W" : "E";
+      if (side && !roadBySide.has(side)) roadBySide.set(side, { label: String(lb.text), fromLabel: true });
+    }
+    // (b) explicit roads[] fills any side not already covered by a label.
+    for (const rd of Array.isArray(drawing.roads) ? drawing.roads : []) {
+      const side = normSide(rd?.side);
+      if (side && !roadBySide.has(side)) roadBySide.set(side, { label: String(rd?.label || ""), fromLabel: false });
+    }
+    const BAND = 15, GAP = 2.5;
+    for (const [side, info] of roadBySide) {
+      let bx = 0, by = 0, bw = 0, bh = 0, textRot = 0;
+      if (side === "S") {
+        bx = plotL; bw = plotR - plotL; by = plotB + GAP; bh = Math.min(BAND, regB - by);
+      } else if (side === "N") {
+        bx = plotL; bw = plotR - plotL; bh = BAND; by = plotT - GAP - bh;
+        if (by < regT) { by = regT; bh = plotT - GAP - by; }
+      } else if (side === "W") {
+        by = plotT; bh = plotB - plotT; bw = BAND; bx = plotL - GAP - bw; textRot = -90;
+        if (bx < regL) { bx = regL; bw = plotL - GAP - bx; }
+      } else {
+        by = plotT; bh = plotB - plotT; bx = plotR + GAP; bw = Math.min(BAND, regR - bx); textRot = -90;
+      }
+      if (!(bw > 3 && bh > 3)) continue; // no room for a readable strip on this side
+      S.push(`<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" fill="#ededed" stroke="#000" stroke-width="0.8"/>`);
+      if (!info.fromLabel && info.label) {
+        const tx = bx + bw / 2, ty = by + bh / 2 + (textRot ? 0 : 4);
+        const tr = textRot ? ` transform="rotate(${textRot} ${tx.toFixed(1)} ${ty.toFixed(1)})"` : "";
+        S.push(`<text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" text-anchor="middle" font-size="12"${tr}${HALO}>${esc(info.label)}</text>`);
+      }
+    }
+  }
 
   // Labels (dimensions, neighbours, roads, interior).
   for (const lb of labels) {

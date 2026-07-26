@@ -6,7 +6,7 @@ import { execFile } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
-import { buildDeedDocx, mergePlaceholders } from "./documentBuilder";
+import { buildDeedDocx, mergePlaceholders, appendPlanPageToDocx } from "./documentBuilder";
 import { fillDocxTemplate, buildAngleFieldResolver } from "./templateFiller";
 import {
   renderPlanDataUrl,
@@ -1346,35 +1346,70 @@ app.post("/api/export-document", async (req, res) => {
       finalText,
       templateId,
       details,
+      // The uploaded template's ORIGINAL .docx bytes. When present we preserve the
+      // template's exact formatting by filling it in place rather than rebuilding
+      // the deed from text — this is what makes the download open in Word cleanly
+      // and match the uploaded template. (Accept a couple of aliases for safety.)
+      templateDocxBase64,
+      customTemplateDocxBase64,
       planImagePngBase64,
       planImageWidthPx,
       planImageHeightPx,
     } = req.body || {};
-    let mergedText: string = typeof finalText === "string" ? finalText : "";
 
-    if (!mergedText && templateId) {
-      const templateText = await getTemplateText(templateId);
-      if (templateText == null) {
-        return res.status(404).json({ error: `Template '${templateId}' not found.` });
-      }
-      mergedText = mergePlaceholders(templateText, buildPlaceholderMap(details));
-    }
-
-    if (!mergedText) {
-      return res.status(400).json({ error: "finalText or templateId is required." });
-    }
-
-    // When the client rasterised the registration plan (SVG -> PNG), append it as a
-    // final full page so the downloaded Word/PDF carries the deed AND its plan.
+    // Plan image (already rasterised on the client). Appended as the LAST page of
+    // whatever docx we produce, so the download carries the deed AND its plan.
     const planImg =
       typeof planImagePngBase64 === "string" && planImagePngBase64.trim().length > 0
         ? planImagePngBase64
         : undefined;
-    const docxBuffer = await buildDeedDocx(mergedText, {
-      planImagePngBase64: planImg,
-      planImageWidthPx: Number(planImageWidthPx) || undefined,
-      planImageHeightPx: Number(planImageHeightPx) || undefined,
-    });
+    const planW = Number(planImageWidthPx) || undefined;
+    const planH = Number(planImageHeightPx) || undefined;
+
+    let docxBuffer: Buffer;
+
+    // ── PREFERRED PATH: preserve the uploaded template's format ────────────────
+    // Re-fill the ORIGINAL .docx in place (only <w:t> text changes → fonts,
+    // margins, tables, page setup are byte-preserved), then splice the plan page
+    // straight into that same docx. No text rebuild, so no format drift.
+    const tmplDocx =
+      (typeof templateDocxBase64 === "string" && templateDocxBase64.trim().length > 0 && templateDocxBase64) ||
+      (typeof customTemplateDocxBase64 === "string" && customTemplateDocxBase64.trim().length > 0 && customTemplateDocxBase64) ||
+      "";
+    if (tmplDocx) {
+      const { resolve } = buildAngleFieldResolver(details);
+      const filled = await fillDocxTemplate(tmplDocx, resolve, { open: "<", close: ">" });
+      docxBuffer = filled.buffer;
+      if (planImg) {
+        try {
+          docxBuffer = await appendPlanPageToDocx(docxBuffer, {
+            imageBase64: planImg,
+            imageWidthPx: planW,
+            imageHeightPx: planH,
+          });
+        } catch (e: any) {
+          console.warn("Failed to append plan page to in-place docx:", e?.message || e);
+        }
+      }
+    } else {
+      // ── FALLBACK PATH: rebuild from text (library templates / no upload) ──────
+      let mergedText: string = typeof finalText === "string" ? finalText : "";
+      if (!mergedText && templateId) {
+        const templateText = await getTemplateText(templateId);
+        if (templateText == null) {
+          return res.status(404).json({ error: `Template '${templateId}' not found.` });
+        }
+        mergedText = mergePlaceholders(templateText, buildPlaceholderMap(details));
+      }
+      if (!mergedText) {
+        return res.status(400).json({ error: "finalText, templateDocxBase64, or templateId is required." });
+      }
+      docxBuffer = await buildDeedDocx(mergedText, {
+        planImagePngBase64: planImg,
+        planImageWidthPx: planW,
+        planImageHeightPx: planH,
+      });
+    }
 
     if (format === "pdf") {
       const pdf = await convertDocxToPdf(docxBuffer);

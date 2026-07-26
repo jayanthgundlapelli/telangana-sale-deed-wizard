@@ -31,7 +31,9 @@ import {
   BookOpen,
   ArrowRight,
   Database,
-  Coins
+  Coins,
+  Maximize2,
+  X
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { PRESETS, MODEL_TEMPLATES, Preset, MockFile, ModelTemplate } from "./presets";
@@ -676,6 +678,8 @@ export default function App() {
   const [planError, setPlanError] = useState<string | null>(null);
   const [planMasterPrompt, setPlanMasterPrompt] = useState<string>("");
   const [planVerificationReport, setPlanVerificationReport] = useState<any | null>(null);
+  // Fullscreen expand/preview of the generated plan (with inline prompt refine).
+  const [planExpanded, setPlanExpanded] = useState(false);
 
   // General App states
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
@@ -2041,15 +2045,22 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  // Rasterise the registration-plan SVG (a data:image/svg+xml URL) into a PNG in the
-  // browser so the server can embed it in the Word/PDF. Word/LibreOffice cannot embed
-  // a raw SVG reliably, and there is no server-side rasteriser, so we render it here
-  // (the browser already draws this exact SVG) on a canvas at `scale`x for print
-  // crispness. Returns the raw base64 (no data-URL prefix) plus pixel dimensions.
-  const rasterizePlanToPng = (
+  // Rasterise the registration-plan SVG (a data:image/svg+xml URL) into a RASTER
+  // image in the browser so the server can embed it in the Word/PDF and the user
+  // can download a real image. Word/LibreOffice cannot embed a raw SVG reliably,
+  // and there is no server-side rasteriser, so we render it here (the browser
+  // already draws this exact SVG) on a canvas at `scale`x for print crispness.
+  //
+  // Returns the FULL data URL, the raw base64 (no prefix) and pixel dimensions.
+  // `mime` selects the output format — "image/jpeg" for a universally-openable
+  // download and a smaller Word payload; JPEG needs an opaque background, which we
+  // paint white first (the SVG's own bg is white anyway).
+  const rasterizePlan = (
     svgDataUrl: string,
-    scale = 2
-  ): Promise<{ pngBase64: string; width: number; height: number }> =>
+    scale = 2,
+    mime: "image/jpeg" | "image/png" = "image/jpeg",
+    quality = 0.92
+  ): Promise<{ dataUrl: string; base64: string; width: number; height: number }> =>
     new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => {
@@ -2063,15 +2074,16 @@ export default function App() {
           reject(new Error("Canvas 2D context unavailable"));
           return;
         }
-        // Flatten onto white — the SVG's own background is white, but be explicit so
-        // transparency never bleeds through in the .docx.
+        // Flatten onto white — essential for JPEG (no alpha) and explicit for PNG
+        // so transparency never bleeds through in the .docx.
         ctx.fillStyle = "#ffffff";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         try {
-          const dataUrl = canvas.toDataURL("image/png");
+          const dataUrl = canvas.toDataURL(mime, quality);
           resolve({
-            pngBase64: dataUrl.replace(/^data:image\/png;base64,/, ""),
+            dataUrl,
+            base64: dataUrl.replace(/^data:[^,]+,/, ""),
             width: canvas.width,
             height: canvas.height,
           });
@@ -2082,6 +2094,21 @@ export default function App() {
       img.onerror = () => reject(new Error("Failed to load plan SVG for rasterisation"));
       img.src = svgDataUrl;
     });
+
+  // Download the generated plan as a real JPG. The plan is held as an SVG data URL,
+  // so we rasterise it to JPEG first — previously the button just renamed the SVG
+  // bytes to ".png", producing a file image viewers could not open.
+  const downloadPlanImage = async () => {
+    if (!generatedPlanImage) return;
+    try {
+      const { base64 } = await rasterizePlan(generatedPlanImage, 2, "image/jpeg");
+      const nameForFile = (executantsList[0]?.name || executantName || "plot").replace(/\s+/g, "_");
+      downloadBase64(base64, "image/jpeg", `registration-plan-${nameForFile}.jpg`);
+    } catch (e) {
+      console.error("Plan download failed:", e);
+      setError("Could not prepare the plan image for download. Please re-generate the plan and try again.");
+    }
+  };
 
   // Step 7: export the final deed as .docx (mandatory) or .pdf (best-effort).
   const exportDocument = async (format: "docx" | "pdf") => {
@@ -2095,20 +2122,33 @@ export default function App() {
       let planFields: Record<string, unknown> = {};
       if (generatedPlanImage) {
         try {
-          const png = await rasterizePlanToPng(generatedPlanImage, 2);
+          const jpg = await rasterizePlan(generatedPlanImage, 2, "image/jpeg");
           planFields = {
-            planImagePngBase64: png.pngBase64,
-            planImageWidthPx: png.width,
-            planImageHeightPx: png.height,
+            planImagePngBase64: jpg.base64, // JPEG bytes; server embeds as-is
+            planImageWidthPx: jpg.width,
+            planImageHeightPx: jpg.height,
           };
         } catch (e) {
           console.warn("Could not rasterise plan for document append; exporting without it:", e);
         }
       }
+
+      // Preserve the uploaded template's EXACT formatting: send its original .docx
+      // bytes + the consolidated details so the server fills it IN PLACE (only the
+      // <Angle Bracket> text changes) and appends the plan into that same docx —
+      // instead of rebuilding the deed from text. Falls back to finalText when no
+      // .docx template was uploaded (library templates).
+      const details = buildConsolidatedDetails();
       const res = await fetch("/api/export-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ format, finalText: filledDeedText, ...planFields }),
+        body: JSON.stringify({
+          format,
+          finalText: filledDeedText,
+          templateDocxBase64: customTemplateDocxBase64 || undefined,
+          details,
+          ...planFields,
+        }),
       });
       if (!res.ok) throw new Error(`Server responded ${res.status}`);
       const data = await res.json();
@@ -5343,13 +5383,20 @@ const getTeluguRecommendation = (rec: string) => {
                               <Sparkles className="w-4 h-4 text-[#0a4d4a]" /> Computerized AI Plot Plan
                             </h5>
                             {generatedPlanImage && (
-                              <a
-                                href={generatedPlanImage}
-                                download="computerized-plot-plan.png"
-                                className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1"
-                              >
-                                <Download className="w-3 h-3" /> Download Plan
-                              </a>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  onClick={() => setPlanExpanded(true)}
+                                  className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer"
+                                >
+                                  <Maximize2 className="w-3 h-3" /> Expand &amp; Edit
+                                </button>
+                                <button
+                                  onClick={downloadPlanImage}
+                                  className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer"
+                                >
+                                  <Download className="w-3 h-3" /> Download JPG
+                                </button>
+                              </div>
                             )}
                           </div>
 
@@ -5361,15 +5408,23 @@ const getTeluguRecommendation = (rec: string) => {
                             </div>
                           ) : generatedPlanImage ? (
                             <div className="space-y-3">
-                              <div className="relative rounded-lg overflow-hidden border border-slate-200 bg-white max-h-80 flex items-center justify-center p-2 shadow-inner">
+                              <button
+                                type="button"
+                                onClick={() => setPlanExpanded(true)}
+                                title="Click to expand & edit"
+                                className="group relative rounded-lg overflow-hidden border border-slate-200 bg-white max-h-80 w-full flex items-center justify-center p-2 shadow-inner cursor-zoom-in"
+                              >
                                 <img
                                   src={generatedPlanImage}
                                   alt="Computerized AI Plot Plan"
                                   className="max-h-72 object-contain rounded"
                                 />
-                              </div>
+                                <span className="absolute top-2 right-2 bg-[#0a4d4a] text-white rounded-md px-2 py-1 text-[10px] font-bold flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                  <Maximize2 className="w-3 h-3" /> Expand
+                                </span>
+                              </button>
                               <p className="text-[10px] text-emerald-800 font-semibold bg-emerald-50 p-2 rounded border border-emerald-200 text-center">
-                                Clean vector CAD layout generated successfully with high contrast and legible typography.
+                                Clean vector CAD layout generated successfully. Click the preview to expand and refine it with a prompt.
                               </p>
                             </div>
                           ) : (
@@ -5450,6 +5505,86 @@ const getTeluguRecommendation = (rec: string) => {
                               ))}
                             </div>
                           )}
+                        </div>
+                      )}
+
+                      {/* ── EXPAND & EDIT MODAL: fullscreen plan preview + prompt refine ── */}
+                      {planExpanded && generatedPlanImage && (
+                        <div
+                          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+                          onClick={() => setPlanExpanded(false)}
+                        >
+                          <div
+                            className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[92vh] flex flex-col overflow-hidden"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {/* Modal header */}
+                            <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200 bg-[#eef6f5]">
+                              <h4 className="font-extrabold text-sm text-slate-900 flex items-center gap-2">
+                                <Maximize2 className="w-4 h-4 text-[#0a4d4a]" /> Registration Plan — Expand &amp; Edit
+                              </h4>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={downloadPlanImage}
+                                  className="text-[11px] font-extrabold text-[#0a4d4a] bg-white hover:bg-[#c3dedb] px-3 py-1.5 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer"
+                                >
+                                  <Download className="w-3.5 h-3.5" /> Download JPG
+                                </button>
+                                <button
+                                  onClick={() => setPlanExpanded(false)}
+                                  className="text-slate-500 hover:text-slate-900 p-1.5 rounded hover:bg-white cursor-pointer"
+                                  title="Close"
+                                >
+                                  <X className="w-5 h-5" />
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Large scrollable preview */}
+                            <div className="flex-1 overflow-auto bg-slate-100 p-4 flex items-start justify-center">
+                              {planGenerating ? (
+                                <div className="h-96 flex flex-col items-center justify-center gap-3 text-center">
+                                  <RefreshCw className="w-8 h-8 text-[#0a4d4a] animate-spin" />
+                                  <p className="text-xs font-bold text-slate-700">Applying your changes and re-rendering the plan…</p>
+                                </div>
+                              ) : (
+                                <img
+                                  src={generatedPlanImage}
+                                  alt="Registration plan (expanded)"
+                                  className="max-w-full shadow-lg rounded bg-white"
+                                />
+                              )}
+                            </div>
+
+                            {/* Prompt-refine bar */}
+                            <div className="px-5 py-4 border-t border-slate-200 bg-white space-y-2">
+                              <label className="text-[11px] font-bold text-slate-800 flex items-center gap-1.5">
+                                <Edit2 className="w-3.5 h-3.5 text-[#0a4d4a]" /> Modify the plan with a prompt
+                              </label>
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="text"
+                                  value={planCustomPrompt}
+                                  onChange={(e) => setPlanCustomPrompt(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" && sketchImage && !planGenerating) handleGeneratePlan();
+                                  }}
+                                  placeholder="e.g. Move the 18' road to the south edge, widen the RCC block, add a compound wall on the east…"
+                                  className="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0a4d4a]"
+                                />
+                                <button
+                                  onClick={() => handleGeneratePlan()}
+                                  disabled={planGenerating || !sketchImage}
+                                  className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 text-white font-bold text-xs py-2 px-4 rounded-lg flex items-center gap-1.5 shrink-0 cursor-pointer shadow-3xs"
+                                >
+                                  <Sparkles className="w-3.5 h-3.5" /> {planGenerating ? "Applying…" : "Apply & Re-generate"}
+                                </button>
+                              </div>
+                              <p className="text-[10px] text-slate-400">
+                                Your instruction is combined with the original hand-drawn sketch, so the plan is re-derived — not drawn from scratch.
+                              </p>
+                            </div>
+                          </div>
                         </div>
                       )}
                     </div>

@@ -22,6 +22,45 @@ import JSZip from "jszip";
 
 const BREAK_SENTINEL = ""; // one private-use char represents a <w:br/>
 
+// ---- XML 1.0 legality --------------------------------------------------------
+// Word refuses to open a .docx whose word/document.xml contains characters that
+// are ILLEGAL in XML 1.0 — the classic "The Office Open XML file cannot be opened
+// because there are problems with the contents … Location: /word/document.xml"
+// error. OCR, Gemini output, and copy-paste routinely inject such chars (NUL,
+// vertical tab 0x0B, form feed 0x0C, other C0/C1 controls, lone UTF-16
+// surrogates, and the non-characters U+FFFE/U+FFFF). We strip them from any text
+// before it is written into a run. Tab (0x09), LF (0x0A) and CR (0x0D) are legal
+// and preserved; the <w:br/> sentinel is handled separately on the write path.
+// Ref: XML 1.0 §2.2 Char production.
+export function stripInvalidXmlChars(s: string): string {
+  if (!s) return "";
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    // C0 controls except TAB/LF/CR
+    if (code < 0x20) {
+      if (code === 0x09 || code === 0x0a || code === 0x0d) out += s[i];
+      continue;
+    }
+    // DEL + C1 control block (0x7F–0x9F) — invisible, frequently corrupt output.
+    if (code >= 0x7f && code <= 0x9f) continue;
+    // Non-characters.
+    if (code === 0xfffe || code === 0xffff) continue;
+    // Surrogates: keep only well-formed high+low pairs, drop lone ones.
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += s[i] + s[i + 1];
+        i++;
+      }
+      continue; // lone high surrogate -> drop
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) continue; // lone low surrogate -> drop
+    out += s[i];
+  }
+  return out;
+}
+
 // ---- XML entity helpers -----------------------------------------------------
 function decodeXml(s: string): string {
   return s
@@ -34,7 +73,7 @@ function decodeXml(s: string): string {
     .replace(/&amp;/g, "&"); // must be last
 }
 function encodeXml(s: string): string {
-  return s
+  return stripInvalidXmlChars(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
