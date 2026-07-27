@@ -191,6 +191,72 @@ function collapseEmptiedParagraphs(originalXml: string, filledXml: string): stri
   return removed > 0 ? out : filledXml;
 }
 
+// ---- Static-label cleanup for value-less markers ----------------------------
+// A deed template pairs each marker with a static label:
+//   "Stamp of Rs.<Stamp of Rs/->", "occu: <Executant Occupation>",
+//   "Cell No.<Executant Cell.No.>", ",Date: <Link Doct.Date>"
+// When the marker has no value, splicing out ONLY the marker leaves the label
+// dangling — the "Stamp of Rs.", "occu: ,", "Cell No. (", "Doct.No.,Date: ,"
+// fragments visible in the rendered deed. So we also scan LEFT for that label,
+// with hard guards so real content is never deleted:
+//   • stop at the end of another marker's span -> never eat a FILLED-IN value
+//     (e.g. "the S.R.O.<Sub Registrar><Sub Registrar Code>": the text before the
+//     empty code marker is the resolved value "Sircilla" and must survive)
+//   • stop at a clause delimiter (, ;), a sentence end (". "), a line break, a
+//     paragraph edge, or a closing bracket
+//   • the candidate must LOOK like a label: ends in a lead-in glyph, <= 6 words,
+//     no digits — running deed prose fails this and is left untouched
+//   • length caps: generous when the marker ENDS its line (the whole clause is
+//     meaningless without its value, e.g. "Together with Vacant Land Tax No.__"),
+//     tight mid-sentence, where only a field-name tail is dropped so that
+//     "the open plot no.<Plot No.>, admeasuring" -> "the open plot, admeasuring"
+// Anything these rules cannot classify confidently is LEFT AS-IS: a stray label
+// is a far safer failure than silently deleting text from a legal document.
+const LABEL_TERMINATOR = /[.:\-/([=]$/;
+const FIELD_NAME_TAIL = /(?:^|[ \t])(?:no|nos|number|dt|date)\.?[ \t:]*$/i;
+
+function looksLikeLabel(candidate: string): boolean {
+  const t = candidate.split(BREAK_SENTINEL).join(" ").replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  if (/\d/.test(t)) return false; // values carry digits, labels don't
+  if (t.split(" ").length > 6) return false; // a long word run is prose
+  return LABEL_TERMINATOR.test(t); // must read as a lead-in to a value
+}
+
+function scanLabelStart(
+  V: string,
+  ps: number,
+  cap: number,
+  allBounds: Set<number>,
+  valueEnds: Set<number>,
+  paraBounds: Set<number>
+): { start: number; hitCap: boolean; atDelim: boolean; atValueEnd: boolean } {
+  let i = ps;
+  let steps = 0;
+  while (i > 0 && steps < cap) {
+    const ch = V[i - 1];
+    if (ch === "," || ch === ";")
+      return { start: i, hitCap: false, atDelim: true, atValueEnd: false };
+    // Boundary sets are keyed by absolute offset and INCLUDE this marker's own
+    // start (== ps), so the first iteration must skip them or the scan would
+    // stop dead at ps and never inspect the label to its left.
+    if (i !== ps) {
+      // A filled-in value ends here -> hard stop, and a SAFE one to cut at.
+      if (valueEnds.has(i)) return { start: i, hitCap: false, atDelim: false, atValueEnd: true };
+      // Hard boundaries we must not cross, but which don't license clause removal.
+      if (paraBounds.has(i) || allBounds.has(i)) break;
+    }
+    if (ch === "\n" || ch === ")") break;
+    if (ch === " " && i >= 2 && /[.!?]/.test(V[i - 2])) break; // previous sentence ended
+    // A <w:br/> may fall INSIDE the label Word fragmented ("Cell " | BR | "No."),
+    // so step over the sentinel rather than stopping — looksLikeLabel() collapses
+    // it to a space, and consuming it also removes the stray line break.
+    i--;
+    steps++;
+  }
+  return { start: i, hitCap: steps >= cap, atDelim: false, atValueEnd: false };
+}
+
 /**
  * Fill placeholders inside a raw document.xml string.
  *
@@ -235,11 +301,21 @@ export function fillDocumentXml(
     end: number;
     value: string;
   }
-  const plans: Plan[] = [];
-  const unresolved = new Set<string>();
-  let match: RegExpExecArray | null;
-  while ((match = phRe.exec(V))) {
-    const rawTok = match[0];
+
+  // PASS 1 — locate every marker and resolve it, WITHOUT deciding removals yet.
+  // The label-cleanup below must know where OTHER markers begin and end (so it
+  // never deletes a neighbouring marker's filled-in value), which means we need
+  // the full marker census before planning any splice.
+  interface Found {
+    index: number;
+    tok: string;
+    innerSpace: string;
+    value: string | null;
+  }
+  const found: Found[] = [];
+  let scan: RegExpExecArray | null;
+  while ((scan = phRe.exec(V))) {
+    const rawTok = scan[0];
     const rawInner = rawTok.slice(open.length, rawTok.length - close.length);
     // A <w:br/> may fall BETWEEN words ("Executant"|"Age" -> "Executant Age")
     // or MID-word ("Marke"|"t" -> "Market"), so try both joins and take the
@@ -248,6 +324,37 @@ export function fillDocumentXml(
     const innerJoin = rawInner.split(BREAK_SENTINEL).join("");
     let value = resolve(innerSpace);
     if (value == null && innerJoin !== innerSpace) value = resolve(innerJoin);
+    found.push({ index: scan.index, tok: rawTok, innerSpace, value });
+  }
+
+  // Boundary sets used by the left-scan:
+  //   allBounds  — every marker edge (never cross another marker)
+  //   valueEnds  — end of a marker that WILL be filled (safe, hard stop)
+  //   paraBounds — paragraph starts/ends in the virtual stream
+  const allBounds = new Set<number>();
+  const valueEnds = new Set<number>();
+  for (const f of found) {
+    allBounds.add(f.index);
+    allBounds.add(f.index + f.tok.length);
+    if (f.value != null) valueEnds.add(f.index + f.tok.length);
+  }
+  const paraBounds = new Set<number>();
+  {
+    // Recompute paragraph edges against the virtual stream by walking the same
+    // node order used to build V.
+    let pos = 0;
+    for (const n of nodes) {
+      if (n.type === "t") pos += n.text.length;
+      else if (n.type === "br") pos += 1;
+      else if (/<\/w:p>|<w:p\b/.test(n.raw)) paraBounds.add(pos);
+    }
+  }
+
+  const plans: Plan[] = [];
+  const unresolved = new Set<string>();
+  // PASS 2 — plan each splice, now that every marker's position and fate is known.
+  for (const f of found) {
+    const { tok: rawTok, innerSpace, value } = f;
     if (value == null) {
       // No value for this marker. Per requirement, the finished deed must NOT
       // show any raw <bracket> placeholder — so we splice it OUT (empty value)
@@ -263,15 +370,60 @@ export function fillDocumentXml(
       //   • else "A <m> B" (space on both sides)          -> collapse to "A B"
       //   • else a line-leading marker's trailing space   -> drop the space
       // (A whole paragraph left empty is removed later by collapseEmptiedParagraphs.)
-      let ps = match.index;
-      let pe = match.index + rawTok.length;
+      let ps = f.index;
+      let pe = f.index + rawTok.length;
+
+      // (a) Drop the dangling STATIC LABEL that introduced this missing value,
+      // so the deed shows no "Stamp of Rs." / "occu: ," / "Cell No. (" stub.
+      // Is the marker the last thing on its line? Then the whole clause is
+      // meaningless without the value and a generous cut is warranted.
+      let after = pe;
+      while (V[after] === " ") after++;
+      const endsLine =
+        after >= V.length ||
+        V[after] === BREAK_SENTINEL ||
+        V[after] === "\n" ||
+        paraBounds.has(after);
+      const cap = endsLine ? 60 : 24;
+      const scanned = scanLabelStart(V, ps, cap, allBounds, valueEnds, paraBounds);
+      const candidate = V.slice(scanned.start, ps);
+
+      if (!scanned.hitCap && looksLikeLabel(candidate)) {
+        // Full clause removal is safe when the clause is delimited (",Date: " ->
+        // cut at the comma), when the value ended just before it (S.R.O. case),
+        // or when the marker closes its line ("Together with Vacant Land Tax No.").
+        if (scanned.atDelim || scanned.atValueEnd || endsLine) {
+          ps = scanned.start;
+        } else {
+          // Mid-sentence: keep the prose, shave only the field-name tail so
+          // "the open plot no.<Plot No.>, admeasuring" -> "the open plot, admeasuring".
+          const tail = FIELD_NAME_TAIL.exec(candidate);
+          if (tail) ps = scanned.start + tail.index;
+        }
+      }
+
+      // (b) Then swallow the whitespace/line-break the removal leaves behind, so
+      // there is no blank line or double space where a value was missing.
+      //   • a trailing <w:br/>  (the marker's own line)  -> drop that blank line
+      //   • else a leading <w:br/>                        -> drop that blank line
+      //   • else "A <m> B" (space on both sides)          -> collapse to "A B"
+      //   • else a line-leading marker's trailing space   -> drop the space
+      // (A whole paragraph left empty is removed by collapseEmptiedParagraphs.)
       if (V[pe] === BREAK_SENTINEL) pe += 1;
       else if (ps > 0 && V[ps - 1] === BREAK_SENTINEL) ps -= 1;
       else if (V[pe] === " " && ps > 0 && V[ps - 1] === " ") pe += 1;
       else if (V[pe] === " " && (ps === 0 || V[ps - 1] === "\n")) pe += 1;
+
+      // (c) A clause cut at its leading comma can leave ", ," or " ,." — absorb
+      // the now-duplicated separator that follows the hole.
+      if (ps > 0 && (V[ps - 1] === "," || V[ps - 1] === ";")) {
+        let q = pe;
+        while (V[q] === " ") q++;
+        if (V[q] === "," || V[q] === ";") pe = q + 1;
+      }
       plans.push({ start: ps, end: pe, value: "" });
     } else {
-      plans.push({ start: match.index, end: match.index + rawTok.length, value });
+      plans.push({ start: f.index, end: f.index + rawTok.length, value });
     }
   }
 
