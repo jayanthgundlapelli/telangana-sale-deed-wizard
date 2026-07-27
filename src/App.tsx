@@ -2819,6 +2819,52 @@ const getTeluguRecommendation = (rec: string) => {
                 />
               )}
 
+              {/* PRACTICE-DATA NOTICE.
+                  The preset scenarios fill every field with fictional parties
+                  ("Ankem Srinivas", Aadhaar 4521 8902 3412) and mark each mock
+                  file isMock: true — but that flag was written and never read
+                  anywhere, and the scenario panel collapses the instant a preset
+                  is clicked. So the form then looked EXACTLY like one filled from
+                  real documents, which is the same "fabricated data presented as
+                  real" problem the error-handling work removed from the AI paths.
+                  Presets are a deliberate, clearly-labelled practice feature, so
+                  the fix is to honour the flag rather than delete the feature. */}
+              {activePresetId && (
+                <div
+                  role="status"
+                  className="mb-5 border border-amber-300 bg-amber-50 rounded-xl p-3.5 flex items-start gap-2.5"
+                >
+                  <Info className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                  <div className="flex-1 min-w-0 space-y-1">
+                    <p className="text-xs font-extrabold text-amber-900">
+                      Practice scenario loaded — this is not real data
+                    </p>
+                    <p className="text-[11px] font-semibold leading-relaxed text-amber-800">
+                      Every party, property and document below comes from a built-in training
+                      sample with fictional names and Aadhaar numbers. Clear it before entering
+                      a deed for registration.
+                    </p>
+                  </div>
+                  {/* Clears the sample DOCUMENTS and draft plus the flag itself.
+                      Deliberately does not blank the Step-1/2 text fields: by the
+                      time a user dismisses this they may have already corrected
+                      some of them by hand, and silently wiping real edits would
+                      be its own data-loss bug. */}
+                  <button
+                    onClick={() => {
+                      setActivePresetId(null);
+                      setAadhaarCards([]);
+                      setLinkDocuments([]);
+                      setFilledDeedText("");
+                      setReport(null);
+                    }}
+                    className="shrink-0 text-[11px] font-extrabold text-white bg-[#0a4d4a] hover:bg-[#0d5f5b] px-3 py-1.5 rounded cursor-pointer"
+                  >
+                    Clear sample data
+                  </button>
+                </div>
+              )}
+
               {/* STEP CONTENTS */}
               <AnimatePresence mode="wait">
                 <motion.div
