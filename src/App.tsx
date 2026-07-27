@@ -5581,9 +5581,17 @@ const getTeluguRecommendation = (rec: string) => {
                               </span>
                             </h5>
                             <span className={`text-[10px] font-black px-2.5 py-1 rounded-full uppercase ${
-                              planVerificationReport.isMatch ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-900"
+                              planVerificationReport.notVerified
+                                ? "bg-slate-200 text-slate-700"
+                                : planVerificationReport.isMatch
+                                  ? "bg-emerald-100 text-emerald-800"
+                                  : "bg-amber-100 text-amber-900"
                             }`}>
-                              {planVerificationReport.isMatch ? "Boundaries Approved" : "Discrepancy Detected"}
+                              {planVerificationReport.notVerified
+                                ? "Not Verified"
+                                : planVerificationReport.isMatch
+                                  ? "Boundaries Approved"
+                                  : "Discrepancy Detected"}
                             </span>
                           </div>
 
@@ -5609,8 +5617,15 @@ const getTeluguRecommendation = (rec: string) => {
                             </div>
                           )}
 
-                          {/* Discrepancies List */}
-                          {planVerificationReport.discrepancies?.length === 0 ? (
+                          {/* Discrepancies List. An audit that never ran must NOT
+                              render as a clean bill of health. */}
+                          {planVerificationReport.notVerified ? (
+                            <div className="bg-slate-50 border border-slate-300 p-3 rounded-lg text-xs text-slate-700 flex items-center gap-2 font-bold">
+                              <AlertTriangle className="w-4 h-4 text-slate-500 shrink-0" />
+                              {planVerificationReport.notVerifiedReason ||
+                                "The sketch could not be cross-checked automatically. Verify the boundaries manually before registration."}
+                            </div>
+                          ) : planVerificationReport.discrepancies?.length === 0 ? (
                             <div className="bg-emerald-50 border border-emerald-200 p-3 rounded-lg text-xs text-emerald-800 flex items-center gap-2 font-bold">
                               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                               All boundaries and measurements in the hand sketch match the Step 1 Registration Form!

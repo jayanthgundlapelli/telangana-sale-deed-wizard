@@ -35,6 +35,7 @@ const T = {
   STRING: "STRING" as const,
   NUMBER: "NUMBER" as const,
   ARRAY: "ARRAY" as const,
+  BOOLEAN: "BOOLEAN" as const,
 };
 
 // JSON Schema handed to Gemini so the vision extraction is strongly typed.
@@ -200,6 +201,47 @@ export const PLAN_EXTRACTION_SCHEMA: any = {
     },
   },
   required: ["title", "drawing"],
+};
+
+// Schema for the boundary cross-check. Without it the audit returned free-form
+// JSON that intermittently failed to parse (invalid `\'` escapes, unterminated
+// values) — silently discarding a correct audit and falling back to a report
+// that claimed "no discrepancies". Constraining the response makes the shape
+// predictable and the parse reliable.
+export const BOUNDARY_AUDIT_SCHEMA: any = {
+  type: T.OBJECT,
+  properties: {
+    extractedFromSketch: {
+      type: T.OBJECT,
+      description: "What is actually written on the SKETCH — never copied from the form data.",
+      properties: {
+        east: { type: T.STRING },
+        west: { type: T.STRING },
+        north: { type: T.STRING },
+        south: { type: T.STRING },
+        dimensions: { type: T.STRING, description: "e.g. \"66' x 66'\"" },
+        roadDetails: { type: T.STRING },
+      },
+    },
+    discrepancies: {
+      type: T.ARRAY,
+      description: "One entry per real mismatch between the sketch and the form. Empty if they agree.",
+      items: {
+        type: T.OBJECT,
+        properties: {
+          direction: { type: T.STRING, description: "East | West | North | South | Dimensions | Survey No" },
+          formDetail: { type: T.STRING, description: "Value from the registration form." },
+          sketchDetail: { type: T.STRING, description: "Value read off the sketch." },
+          severity: { type: T.STRING, description: "CRITICAL | WARNING | INFO" },
+          description: { type: T.STRING, description: "Plain-English explanation." },
+          descriptionTe: { type: T.STRING, description: "The same explanation in Telugu." },
+        },
+        required: ["direction", "formDetail", "sketchDetail", "severity", "description"],
+      },
+    },
+    isMatch: { type: T.BOOLEAN, description: "true ONLY when discrepancies is empty." },
+  },
+  required: ["extractedFromSketch", "discrepancies", "isMatch"],
 };
 
 export const PLAN_EXTRACTION_PROMPT = `You are a meticulous land surveyor and town-planning draftsman digitising a hand-drawn Telangana property registration sketch.

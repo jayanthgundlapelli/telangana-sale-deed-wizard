@@ -12,6 +12,7 @@ import {
   renderPlanDataUrl,
   PLAN_EXTRACTION_SCHEMA,
   PLAN_EXTRACTION_PROMPT,
+  BOUNDARY_AUDIT_SCHEMA,
 } from "./planRenderer";
 import {
   listTemplates,
@@ -129,6 +130,37 @@ function safeParseAadhaarJson(raw: string): any {
   }
   console.warn("⚠️ Aadhaar JSON was truncated/malformed; salvaged fields:", Object.keys(out).join(", "));
   return out;
+}
+
+// Vision models routinely emit JSON containing JS-style escapes that JSON.parse
+// REJECTS. Observed live on the boundary audit: the model quotes a dimension as
+//     "the sketch shows a '15\' Road' on the East"
+// `\'` is legal in JavaScript but illegal in JSON, so JSON.parse throws
+// "Bad escaped character in JSON at position N" and the whole (correct) audit is
+// discarded in favour of a fallback that reports "no discrepancies" — a FALSE
+// ALL-CLEAR on a legal document. Repair only the escapes JSON forbids and leave
+// every legal one (\" \\ \/ \b \f \n \r \t \uXXXX) untouched, so no real content
+// is altered. Returns the parsed value, or null if it is still unparseable.
+function parseModelJson(raw: string): any {
+  const text = (raw || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (firstErr) {
+    // Drop the backslash from any escape JSON doesn't define. `\'` -> `'`.
+    const repaired = text.replace(/\\([^"\\/bfnrtu])/g, "$1");
+    try {
+      const parsed = JSON.parse(repaired);
+      console.warn("⚠️ Model JSON had invalid escapes; repaired and parsed successfully.");
+      return parsed;
+    } catch {
+      console.warn(
+        "Model JSON unparseable even after escape repair:",
+        (firstErr as any)?.message || firstErr
+      );
+      return null;
+    }
+  }
 }
 
 // Post-process an Aadhaar extraction: compute age from DOB in code (models are
@@ -2528,18 +2560,28 @@ app.post("/api/verify", async (req, res) => {
 // 66'x66' buildFallbackCadSvg have been removed — the renderer always yields a
 // full, on-spec one-pager even with no AI (drawing from the form details).
 
-function buildFallbackVerificationReport(propertyDetails: any) {
+// Used ONLY when the boundary audit could not run (no AI key, upstream timeout,
+// unparseable response). It must NOT imply the boundaries were checked and
+// approved: echoing the form's own values back with `isMatch: true` renders a
+// green "Boundaries Approved" badge on a deed nobody verified. Report the
+// unverified state truthfully and let the UI warn instead.
+function buildFallbackVerificationReport(propertyDetails: any, reason?: string | null) {
   return {
     extractedFromSketch: {
-      east: propertyDetails?.boundaries?.east || "East Boundary",
-      west: propertyDetails?.boundaries?.west || "West Boundary",
-      north: propertyDetails?.boundaries?.north || "North Boundary",
-      south: propertyDetails?.boundaries?.south || "South Boundary",
-      dimensions: "66.0' x 66.0' Footprint",
-      roadDetails: "Access Corridor"
+      east: propertyDetails?.boundaries?.east || "Not specified",
+      west: propertyDetails?.boundaries?.west || "Not specified",
+      north: propertyDetails?.boundaries?.north || "Not specified",
+      south: propertyDetails?.boundaries?.south || "Not specified",
+      dimensions: "Not read from sketch",
+      roadDetails: "Not read from sketch",
     },
     discrepancies: [],
-    isMatch: true
+    isMatch: false,
+    // Distinguishes "audit ran, found nothing wrong" from "audit never ran".
+    notVerified: true,
+    notVerifiedReason:
+      (reason ? reason + " " : "") +
+      "Verify the boundaries manually before registration.",
   };
 }
 
@@ -2606,6 +2648,8 @@ app.post("/api/generate-plan", async (req, res) => {
     let extractedPlan: any = null;
     let imageError: string | null = null;
     let verificationReport: any = null;
+    // Why the cross-check did not run, in words the user can act on.
+    let auditFailure: string | null = null;
 
     // ---- STEP 1: read the hand-drawn sketch into STRUCTURED JSON (vision) ----
     // The sketch image IS sent to the model here. (Previously the sketch was
@@ -2631,6 +2675,20 @@ TASK:
 2. Cross-verify each boundary (East, West, North, South), plot dimensions, survey number, and road widths on the sketch against the registration form details provided above.
 3. Identify any DISCREPANCIES or MISMATCHES between the sketch and the registration form.
 4. Return a structured JSON response containing the analysis.
+
+CRITICAL RULES:
+- "extractedFromSketch" must contain ONLY what is genuinely drawn or written on the
+  IMAGE. Never copy a value from the form data above into it. If a side has no
+  text on the sketch, write "Not marked on sketch".
+- Read the sketch's own north arrow / compass rose to decide which side is which.
+  The compass may be rotated or inverted (north pointing DOWN is common), so a
+  label's position on the page does NOT determine its compass direction.
+- A boundary written as a ROAD does not match a boundary described as an open
+  place or a named neighbour. Report that as a discrepancy.
+- Also compare the AREA: multiply the sketch's plot dimensions and compare the
+  result against the form's Extent / Total Area. Report a mismatch if they differ
+  materially.
+- Set "isMatch" to true ONLY when "discrepancies" is empty.
 
 JSON Output Schema strictly format as:
 {
@@ -2681,7 +2739,11 @@ JSON Output Schema strictly format as:
         ai.models.generateContent({
           model: GEMINI_MODEL,
           contents: [imagePart, { text: verificationPrompt }],
-          config: { responseMimeType: "application/json", temperature: 0.1 },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: BOUNDARY_AUDIT_SCHEMA,
+            temperature: 0.1,
+          },
         }),
         PLAN_AI_TIMEOUT_MS,
         "Boundary verification"
@@ -2690,29 +2752,34 @@ JSON Output Schema strictly format as:
       const [exRes, auRes] = await Promise.allSettled([extractionCall, auditCall]);
 
       if (exRes.status === "fulfilled" && (exRes.value as any)?.text) {
-        try {
-          extractedPlan = JSON.parse(
-            (exRes.value as any).text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim()
-          );
-        } catch (pErr: any) {
-          imageError = "Sketch extraction returned unparseable data.";
-          console.warn("Plan extraction JSON parse failed:", pErr?.message || pErr);
-        }
+        extractedPlan = parseModelJson((exRes.value as any).text);
+        if (!extractedPlan) imageError = "Sketch extraction returned unparseable data.";
       } else if (exRes.status === "rejected") {
         imageError = exRes.reason?.message || "Sketch extraction unavailable.";
         console.warn("Plan sketch extraction failed; rendering from form details:", imageError);
       }
 
       if (auRes.status === "fulfilled" && (auRes.value as any)?.text) {
-        try {
-          verificationReport = JSON.parse(
-            (auRes.value as any).text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim()
-          );
-        } catch (pErr) {
-          console.warn("Verification JSON parse failed; using fallback:", pErr);
+        verificationReport = parseModelJson((auRes.value as any).text);
+        if (!verificationReport) {
+          console.warn("Verification JSON unparseable; using fallback.");
+          auditFailure = "The boundary cross-check returned data that could not be read.";
         }
       } else if (auRes.status === "rejected") {
-        console.error("Verification audit failed:", auRes.reason?.message || auRes.reason);
+        const raw = auRes.reason?.message || String(auRes.reason || "");
+        console.error("Verification audit failed:", raw);
+        // Tell the user WHICH failure this is: an exhausted API quota needs
+        // billing attention, a timeout just needs a retry. A generic message
+        // sends them looking at the sketch, which is not the problem.
+        if (/RESOURCE_EXHAUSTED|quota|credits are depleted|\b429\b/i.test(raw)) {
+          auditFailure =
+            "The AI service quota has been exhausted, so the boundaries were not cross-checked. Check the API billing/credits, then generate the plan again.";
+        } else if (/timed out/i.test(raw)) {
+          auditFailure =
+            "The boundary cross-check timed out. Generate the plan again to retry.";
+        } else {
+          auditFailure = "The boundary cross-check could not be completed.";
+        }
       }
     }
 
@@ -2721,7 +2788,7 @@ JSON Output Schema strictly format as:
     const generatedImageBase64 = renderPlanDataUrl({ plan: extractedPlan, details: renderDetails });
 
     if (!verificationReport) {
-      verificationReport = buildFallbackVerificationReport(pd);
+      verificationReport = buildFallbackVerificationReport(pd, auditFailure);
     }
 
     return res.json({
