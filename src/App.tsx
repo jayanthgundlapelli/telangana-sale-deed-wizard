@@ -2293,10 +2293,42 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
     return text;
   };
 
+  // Downscale a possibly-huge phone photo of a hand-drawn sketch to a sane size
+  // BEFORE sending it to the server for vision analysis. A raw 12MP JPEG can be
+  // 5-10MB of base64 and makes the Gemini vision call slow enough to stall; a
+  // ~1600px longest-edge JPEG keeps all the legible detail at a fraction of the
+  // bytes. Returns the original string unchanged if anything goes wrong.
+  const downscaleSketch = (dataUrl: string, maxEdge = 1600, quality = 0.82): Promise<string> =>
+    new Promise((resolve) => {
+      try {
+        if (!dataUrl.startsWith("data:image/")) return resolve(dataUrl);
+        const img = new Image();
+        img.onload = () => {
+          const { width, height } = img;
+          const longest = Math.max(width, height);
+          if (!longest || longest <= maxEdge) return resolve(dataUrl); // already small
+          const scale = maxEdge / longest;
+          const w = Math.round(width * scale);
+          const h = Math.round(height * scale);
+          const canvas = document.createElement("canvas");
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return resolve(dataUrl);
+          ctx.drawImage(img, 0, 0, w, h);
+          resolve(canvas.toDataURL("image/jpeg", quality));
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+      } catch {
+        resolve(dataUrl);
+      }
+    });
+
   // Function to call /api/generate-plan with the sketch base64 image and property details
   const handleGeneratePlan = async (overridePrompt?: string, overrideImage?: string) => {
-    const base64ToUse = overrideImage || sketchImage;
-    if (!base64ToUse) {
+    const base64Raw = overrideImage || sketchImage;
+    if (!base64Raw) {
       setError("Please upload a hand-drawn sketch image first.");
       return;
     }
@@ -2307,10 +2339,20 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
     const consolidated = buildConsolidatedDetails();
     const currentProp: any = consolidated.property || {};
 
+    // Client-side hard timeout so the spinner can NEVER hang forever, even if
+    // the server/upstream stalls. Aborts the fetch and surfaces a real error.
+    const controller = new AbortController();
+    const CLIENT_TIMEOUT_MS = 90000;
+    const timeoutId = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
+
     try {
+      // Shrink large images first (keeps the vision call fast + within limits).
+      const base64ToUse = await downscaleSketch(base64Raw);
+
       const response = await fetch("/api/generate-plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           sketchBase64: base64ToUse,
           customPrompt: overridePrompt !== undefined ? overridePrompt : planCustomPrompt,
@@ -2351,8 +2393,15 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       }
     } catch (err: any) {
       console.error("Error generating plan:", err);
-      setPlanError(err.message || "Failed to generate computerized plot image.");
+      if (err?.name === "AbortError") {
+        setPlanError(
+          "Plan generation timed out. Please try again, or upload a smaller/clearer photo of the sketch."
+        );
+      } else {
+        setPlanError(err.message || "Failed to generate computerized plot image.");
+      }
     } finally {
+      clearTimeout(timeoutId);
       setPlanGenerating(false);
     }
   };
@@ -5496,6 +5545,19 @@ const getTeluguRecommendation = (rec: string) => {
                               <p className="text-[10px] text-emerald-800 font-semibold bg-emerald-50 p-2 rounded border border-emerald-200 text-center">
                                 Clean vector CAD layout generated successfully. Click the preview to expand and refine it with a prompt.
                               </p>
+                            </div>
+                          ) : planError ? (
+                            <div className="h-80 border border-red-200 rounded-xl bg-red-50 flex flex-col items-center justify-center p-6 text-center space-y-3">
+                              <AlertTriangle className="w-9 h-9 text-red-500" />
+                              <p className="text-xs font-bold text-red-800 max-w-xs">{planError}</p>
+                              {sketchImage && (
+                                <button
+                                  onClick={() => handleGeneratePlan()}
+                                  className="text-[11px] font-extrabold text-white bg-[#0a4d4a] hover:bg-[#0d5f5b] px-3 py-1.5 rounded flex items-center gap-1.5 cursor-pointer"
+                                >
+                                  <RefreshCw className="w-3.5 h-3.5" /> Retry
+                                </button>
+                              )}
                             </div>
                           ) : (
                             <div className="h-80 border border-dashed border-slate-300 rounded-xl bg-slate-50 flex flex-col items-center justify-center p-6 text-center space-y-2">

@@ -2543,6 +2543,23 @@ function buildFallbackVerificationReport(propertyDetails: any) {
   };
 }
 
+// Bound a promise so a slow/stuck upstream call can never hang forever. The
+// underlying request may keep running in the background, but the winner of the
+// race lets us send the HTTP response on time (a stuck vision call would
+// otherwise leave the client's plan spinner spinning indefinitely).
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
 // API endpoint to process a hand-drawn sketch and generate a neat computerized AI plot image + boundary verification report
 app.post("/api/generate-plan", async (req, res) => {
   try {
@@ -2581,49 +2598,21 @@ app.post("/api/generate-plan", async (req, res) => {
     const renderDetails =
       details && typeof details === "object" ? details : { property: pd };
 
+    // Per-call ceiling for each Gemini vision request. Whichever call stalls,
+    // the race below still resolves so we ALWAYS send an HTTP response and the
+    // client's plan spinner never hangs. Overridable via env for slow hosts.
+    const PLAN_AI_TIMEOUT_MS = Number(process.env.PLAN_AI_TIMEOUT_MS) || 45000;
+
+    let extractedPlan: any = null;
+    let imageError: string | null = null;
+    let verificationReport: any = null;
+
     // ---- STEP 1: read the hand-drawn sketch into STRUCTURED JSON (vision) ----
     // The sketch image IS sent to the model here. (Previously the sketch was
     // never passed to the image generator, so the output bore no relation to it.)
-    let extractedPlan: any = null;
-    let imageError: string | null = null;
-    if (ai) {
-      try {
-        const extractionResponse = await ai.models.generateContent({
-          model: GEMINI_MODEL,
-          contents: [
-            imagePart,
-            {
-              text:
-                PLAN_EXTRACTION_PROMPT +
-                (userPromptText ? `\n\nADDITIONAL USER NOTES:\n${userPromptText}` : ""),
-            },
-          ],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: PLAN_EXTRACTION_SCHEMA,
-            temperature: 0.1,
-          },
-        });
-        if (extractionResponse.text) {
-          extractedPlan = JSON.parse(
-            extractionResponse.text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim()
-          );
-        }
-      } catch (exErr: any) {
-        console.warn(
-          "Plan sketch extraction failed; rendering from form details:",
-          exErr?.message || exErr
-        );
-        imageError = exErr?.message || "Sketch extraction unavailable.";
-      }
-    }
-
-    // ---- STEP 2: render the full one-pager deterministically from the JSON ----
-    // Always succeeds: with no sketch JSON it draws from the form details.
-    const generatedImageBase64 = renderPlanDataUrl({ plan: extractedPlan, details: renderDetails });
-
-    // Perform Boundary Verification between the sketch image and the registration form property details
-    let verificationReport: any = null;
+    // ---- (also) Boundary verification vs the registration-form details.
+    // Both are independent vision calls, so run them CONCURRENTLY (halves the
+    // wall-clock) and time-box EACH one so a stuck call can't hang the request.
     if (ai) {
       const verificationPrompt = `You are an expert land surveyor and legal verification auditor in Telangana, India.
 Examine the uploaded hand-drawn property sketch image carefully and compare it against the official property details from the registration form DATA.
@@ -2666,23 +2655,70 @@ JSON Output Schema strictly format as:
   "isMatch": boolean
 }`;
 
-      try {
-        const auditResponse = await ai.models.generateContent({
+      // Fire both vision calls together; each is independently time-boxed.
+      const extractionCall = withTimeout(
+        ai.models.generateContent({
           model: GEMINI_MODEL,
-          contents: [imagePart, { text: verificationPrompt }],
+          contents: [
+            imagePart,
+            {
+              text:
+                PLAN_EXTRACTION_PROMPT +
+                (userPromptText ? `\n\nADDITIONAL USER NOTES:\n${userPromptText}` : ""),
+            },
+          ],
           config: {
             responseMimeType: "application/json",
-            temperature: 0.1
-          }
-        });
+            responseSchema: PLAN_EXTRACTION_SCHEMA,
+            temperature: 0.1,
+          },
+        }),
+        PLAN_AI_TIMEOUT_MS,
+        "Plan sketch extraction"
+      );
 
-        if (auditResponse.text) {
-          verificationReport = JSON.parse(auditResponse.text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim());
+      const auditCall = withTimeout(
+        ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: [imagePart, { text: verificationPrompt }],
+          config: { responseMimeType: "application/json", temperature: 0.1 },
+        }),
+        PLAN_AI_TIMEOUT_MS,
+        "Boundary verification"
+      );
+
+      const [exRes, auRes] = await Promise.allSettled([extractionCall, auditCall]);
+
+      if (exRes.status === "fulfilled" && (exRes.value as any)?.text) {
+        try {
+          extractedPlan = JSON.parse(
+            (exRes.value as any).text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim()
+          );
+        } catch (pErr: any) {
+          imageError = "Sketch extraction returned unparseable data.";
+          console.warn("Plan extraction JSON parse failed:", pErr?.message || pErr);
         }
-      } catch (vErr) {
-        console.error("Verification audit failed:", vErr);
+      } else if (exRes.status === "rejected") {
+        imageError = exRes.reason?.message || "Sketch extraction unavailable.";
+        console.warn("Plan sketch extraction failed; rendering from form details:", imageError);
+      }
+
+      if (auRes.status === "fulfilled" && (auRes.value as any)?.text) {
+        try {
+          verificationReport = JSON.parse(
+            (auRes.value as any).text.replace(/^```[a-z]*\n?|\n?```$/g, "").trim()
+          );
+        } catch (pErr) {
+          console.warn("Verification JSON parse failed; using fallback:", pErr);
+        }
+      } else if (auRes.status === "rejected") {
+        console.error("Verification audit failed:", auRes.reason?.message || auRes.reason);
       }
     }
+
+    // ---- STEP 2: render the full one-pager deterministically from the JSON ----
+    // Always succeeds: with no sketch JSON it draws from the form details.
+    const generatedImageBase64 = renderPlanDataUrl({ plan: extractedPlan, details: renderDetails });
 
     if (!verificationReport) {
       verificationReport = buildFallbackVerificationReport(pd);
