@@ -20,6 +20,19 @@ import {
   getTemplateMeta,
   ensureTemplatesSeeded,
 } from "./templateManager";
+// Single source of truth for how an upstream AI failure is classified, reported
+// and logged. See aiErrors.ts for why this is centralised.
+import {
+  classifyAiError,
+  notConfiguredFailure,
+  aiErrorBody,
+  degradedMeta,
+  logAiFailure,
+  withAiTimeout,
+  AI_TIMEOUT_MS,
+  OK_META,
+  redact,
+} from "./aiErrors";
 
 const Type = {
   OBJECT: "OBJECT" as const,
@@ -201,691 +214,60 @@ function normalizeAadhaar(data: any): any {
   return data;
 }
 
-function generateHeuristicReport(draftText: string): any {
-  const normalizedDraft = (draftText || "").toLowerCase();
-  
-  // Heuristic Check 1: Is it Preset 2? (Comprehensive Audit - Warangal Mismatches)
-  if (normalizedDraft.includes("srinivasa rao") || normalizedDraft.includes("aged about 46")) {
-    return {
-      demoMode: true,
-      summary: {
-        status: "DISCREPANCY_FOUND",
-        sellersCount: 1,
-        discrepancyCount: 9,
-        message: "DEMO MODE (Simulation): Found critical errors across all 3 audit segments: Names, Property details, and Link document numbers."
-      },
-      sellers: [
-        {
-          id: "Seller 1",
-          aadhaarName: "Ankem Srinivas",
-          draftName: "Ankem Srinivasa Rao",
-          linkName: "Ankem Srinivas",
-          aadhaarNo: "4521 8902 3412",
-          draftAadhaarNo: "4521 8902 3412",
-          dob: "12/06/1975",
-          calculatedAge: 51,
-          draftAge: 46,
-          linkAge: 23,
-          status: "MISMATCH",
-          discrepancies: [
-            "Name spelling mismatch: Draft contains 'Ankem Srinivasa Rao' but Aadhaar Card is 'Ankem Srinivas'",
-            "Age mismatch: Draft says '46' but calculated rounded age is 51."
-          ]
-        }
-      ],
-      property: {
-        linkSurveyNumbers: ["412/A"],
-        draftSurveyNumbers: ["412/A"],
-        linkVillage: "Nakrekal",
-        draftVillage: "Nakrekal",
-        linkHNo: "4-12/A",
-        draftHNo: "4-12",
-        linkPlotNo: "18",
-        draftPlotNo: "15",
-        linkPTINo: "1092003415",
-        draftPTINo: "1092003999",
-        linkSqYards: "300 Sq Yards",
-        draftSqYards: "250 Sq Yards",
-        linkPlinthArea: "1800 Sq Ft",
-        draftPlinthArea: "1600 Sq Ft",
-        linkBoundaries: {
-          east: "Canal",
-          west: "Ramulu's Land",
-          north: "Main Road",
-          south: "Venkataiah's Land"
-        },
-        draftBoundaries: {
-          east: "Road",
-          west: "Open Plot",
-          north: "Neighbor",
-          south: "Drain"
-        },
-        status: "MISMATCH",
-        discrepancies: [
-          "H.No mismatch: Link deed says '4-12/A' but Draft has '4-12'",
-          "Plot No mismatch: Link deed says '18' but Draft has '15'",
-          "PTI No mismatch: Link deed has '1092003415' but Draft has '1092003999'",
-          "Sq Yards mismatch: Link deed says '300' but Draft has '250'",
-          "Plinth Area mismatch: Link deed says '1800' but Draft has '1600'",
-          "Boundaries mismatch: East, West, North, and South borders do not align."
-        ]
-      },
-      linkDocumentVerification: {
-        linkDeedNumber: "2304/1998",
-        draftMentionedLinkDeedNumber: "2340/1998",
-        status: "MISMATCH",
-        discrepancies: [
-          "Link Deed Document number typo: Link document has '2304/1998' but Draft mentions '2340/1998'"
-        ]
-      },
-      allDiscrepancies: [
-        {
-          category: "Names mismatch",
-          severity: "CRITICAL",
-          description: "The spelling of the seller's name in the draft registration document does not match the official Aadhaar Card spelling.",
-          descriptionTe: "డ్రాఫ్ట్ రిజిస్ట్రేషన్ పత్రంలో విక్రేత పేరు అక్షరక్రమం అధికారిక ఆధార్ కార్డుతో సరిపోలలేదు.",
-          expected: "Ankem Srinivas",
-          found: "Ankem Srinivasa Rao",
-          recommendation: "Correct 'Ankem Srinivasa Rao' to 'Ankem Srinivas' to align character-by-character with the Aadhaar card.",
-          recommendationTe: "ఆధార్ కార్డు ప్రకారం పేరును 'అంకెo శ్రీనివాసరావు' నుండి 'అంకెo శ్రీనివాస్' గా సవరించండి."
-        },
-        {
-          category: "Names mismatch",
-          severity: "WARNING",
-          description: "The age written in the draft document is incorrect based on the official Aadhaar DOB (12/06/1975).",
-          descriptionTe: "అధికారిక ఆధార్ జన్మతేదీ (12/06/1975) ఆధారంగా డ్రాఫ్ట్ పత్రంలో రాసిన వయస్సు తప్పుగా ఉంది.",
-          expected: "51 Years",
-          found: "46 Years",
-          recommendation: "Update the seller's age from '46' to '51' years in the draft document.",
-          recommendationTe: "డ్రాఫ్ట్ పత్రంలో విక్రేత వయస్సును '46' నుండి '51' సంవత్సరాలకు సరిచేయండి."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "The House Number (H.No) listed in the draft does not match the ownership link document.",
-          descriptionTe: "డ్రాఫ్ట్‌లో పేర్కొన్న ఇంటి నంబర్ (H.No) యాజమాన్య లింక్ పత్రంతో సరిపోలడం లేదు.",
-          expected: "4-12/A",
-          found: "4-12",
-          recommendation: "Update the house number in the draft from '4-12' to '4-12/A' to ensure title tracking.",
-          recommendationTe: "హక్కుల రక్షణ కోసం డ్రాఫ్ట్‌లో ఇంటి నంబర్‌ను '4-12' నుండి '4-12/A' గా సవరించండి."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "Plot Number mismatch between draft and link deed.",
-          descriptionTe: "డ్రాఫ్ట్ మరియు లింక్ దస్తావేజు మధ్య ప్లాట్ నంబర్ తేడా ఉంది.",
-          expected: "Plot No 18",
-          found: "Plot No 15",
-          recommendation: "Correct the plot number in the draft to '18'.",
-          recommendationTe: "డ్రాఫ్ట్‌లో ప్లాట్ నంబర్‌ను '18' గా సరిచేయండి."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "Property Tax Identification Number (PTI No) mismatch.",
-          descriptionTe: "ఆస్తి పన్ను గుర్తింపు నంబర్ (PTI No) వ్యత్యాసం ఉంది.",
-          expected: "1092003415",
-          found: "1092003999",
-          recommendation: "Change the PTI number in the draft to '1092003415'.",
-          recommendationTe: "డ్రాఫ్ట్‌లో PTI నంబర్‌ను '1092003415' గా మార్చండి."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "WARNING",
-          description: "Slight area discrepancy (Sq Yards).",
-          descriptionTe: "స్థలం విస్తీర్ణంలో చిన్న వ్యత్యాసం (చదరపు గజాలు).",
-          expected: "300 Sq Yards",
-          found: "250 Sq Yards",
-          recommendation: "Verify and update the land extent to '300 Sq Yards' to prevent loss of asset description.",
-          recommendationTe: "ఆస్తి విస్తీర్ణం నష్టం కాకుండా భూమి వైశాల్యాన్ని '300 చదరపు గజాలు' గా తనిఖీ చేసి సవరించండి."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "WARNING",
-          description: "Plinth Area mismatch in draft.",
-          descriptionTe: "డ్రాఫ్ట్‌లో ప్లింత్ ఏరియా (నిర్మాణ వైశాల్యం) తేడా ఉంది.",
-          expected: "1800 Sq Ft",
-          found: "1600 Sq Ft",
-          recommendation: "Modify the plinth area from '1600' to '1800' Sq Ft in the draft.",
-          recommendationTe: "డ్రాఫ్ట్‌లో ప్లింత్ ఏరియాను '1600' నుండి '1800' చదరపు అడుగులుగా మార్చండి."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "Property boundaries listed in the draft do not match the official source link document.",
-          descriptionTe: "డ్రాఫ్ట్‌లో నమోదు చేసిన ఆస్తి సరిహద్దులు మూల లింక్ పత్రంతో సరిపోలడం లేదు.",
-          expected: "East: Canal, West: Ramulu's Land, North: Main Road, South: Venkataiah's Land",
-          found: "East: Road, West: Open Plot, North: Neighbor, South: Drain",
-          recommendation: "Correct all boundary listings in the draft to match the link document exactly.",
-          recommendationTe: "లింక్ పత్రంలో ఉన్న విధంగా సరిహద్దుల వివరాలన్నింటినీ డ్రాఫ్ట్‌లో సరిగ్గా నమోదు చేయండి."
-        },
-        {
-          category: "Link document numbers mismatch",
-          severity: "CRITICAL",
-          description: "The link document deed number referred in the draft has a typo.",
-          descriptionTe: "డ్రాఫ్ట్‌లో ప్రస్తావించిన లింక్ దస్తావేజు నంబర్‌లో అక్షరదోషం (పొరపాటు) ఉంది.",
-          expected: "2304/1998",
-          found: "2340/1998",
-          recommendation: "Correct the acquired link deed reference number from '2340/1998' to '2304/1998'.",
-          recommendationTe: "లింక్ దస్తావేజు నంబర్ ప్రస్తావనను '2340/1998' నుండి '2304/1998' గా సరిచేయండి."
-        }
-      ],
-      linkDocumentDetails: {
-        language: "English",
-        docNumber: "2304/1998",
-        village: "Nakrekal",
-        surveyNumbers: ["412/A"],
-        sellersExtracted: ["Ankem Srinivas"]
-      }
-    };
-  }
+// Offline checks that are genuinely trustworthy without any AI, returned as
+// INFORMATION ONLY when the AI audit could not run.
+//
+// This deliberately replaces the former ~520-line preset "simulation engine",
+// which pattern-matched demo strings ("ankem srinivas", "k. ramu") and returned
+// fabricated names, ages and discrepancy lists for people who were not in the
+// document -- including a `status: "APPROVED", discrepancyCount: 0` verdict that
+// rendered as a green ALL CLEAR banner on an unaudited legal instrument.
+//
+// Note the shape: findings only, with NO `status` or `discrepancyCount` field.
+// A verdict is something only a real cross-document audit may produce, so there
+// is deliberately nothing here the UI could mistake for one.
+function buildOfflinePlaceholderChecks(draftText: unknown): {
+  ran: string[];
+  findings: { severity: string; category: string; description: string; recommendation: string }[];
+} {
+  const text = typeof draftText === "string" ? draftText : "";
+  const findings: { severity: string; category: string; description: string; recommendation: string }[] = [];
 
-  // Heuristic Check 2: Is it Preset 3? (Telugu Link Doc & Property Mismatches)
-  if (normalizedDraft.includes("k. ramu") || normalizedDraft.includes("120/aa")) {
-    return {
-      demoMode: true,
-      summary: {
-        status: "DISCREPANCY_FOUND",
-        sellersCount: 1,
-        discrepancyCount: 8,
-        message: "DEMO MODE (Simulation): Found critical errors across Telugu name mapping, land surveys, and boundaries."
-      },
-      sellers: [
-        {
-          id: "Seller 1",
-          aadhaarName: "Kethavath Ramulu",
-          draftName: "K. Ramu",
-          linkName: "కేతావత్ రాములు (Kethavath Ramulu)",
-          aadhaarNo: "9874 5612 3045",
-          draftAadhaarNo: "9874 5612 3045",
-          dob: "01/01/1968",
-          calculatedAge: 58,
-          draftAge: 58,
-          linkAge: null,
-          status: "MISMATCH",
-          discrepancies: [
-            "Spelling mismatch: Draft contains abbreviated name 'K. Ramu' but Aadhaar Card is full spelling 'Kethavath Ramulu'"
-          ]
-        }
-      ],
-      property: {
-        linkSurveyNumbers: ["102/AA"],
-        draftSurveyNumbers: ["120/AA"],
-        linkVillage: "Haveli Ghanpur",
-        draftVillage: "Haveli Ghanpur",
-        linkHNo: "2-104",
-        draftHNo: "2-100",
-        linkPlotNo: "55",
-        draftPlotNo: "50",
-        linkPTINo: "1088009944",
-        draftPTINo: "1088009000",
-        linkSqYards: "2.50 Acres",
-        draftSqYards: "2.10 Acres",
-        linkPlinthArea: "N/A",
-        draftPlinthArea: "N/A",
-        linkBoundaries: {
-          east: "రాము భూమి (Ramu's Land)",
-          west: "శేఖర్ భూమి (Sekhar's Land)",
-          north: "కాలువ (Canal)",
-          south: "చెరువు (Pond)"
-        },
-        draftBoundaries: {
-          east: "State Highway",
-          west: "Forest Land",
-          north: "Open space",
-          south: "Main Road"
-        },
-        status: "MISMATCH",
-        discrepancies: [
-          "Survey number mismatch: Link Document has '102/AA' but Draft has '120/AA'",
-          "H.No mismatch: Link Document has '2-104' but Draft has '2-100'",
-          "Plot No mismatch: Link Document has '55' but Draft has '50'",
-          "PTI No mismatch: Link Document has '1088009944' but Draft has '1088009000'",
-          "Extent mismatch: Link Document has '2.50 Acres' but Draft has '2.10 Acres'",
-          "Boundaries mismatch: East, West, North, South boundaries do not align with the original Telugu link deed."
-        ]
-      },
-      linkDocumentVerification: {
-        linkDeedNumber: "PP-5049/2010",
-        draftMentionedLinkDeedNumber: "PP-5000/2010",
-        status: "MISMATCH",
-        discrepancies: [
-          "Link Deed Document number mismatch: Original has 'PP-5049/2010' but Draft says 'PP-5000/2010'"
-        ]
-      },
-      allDiscrepancies: [
-        {
-          category: "Names mismatch",
-          severity: "CRITICAL",
-          description: "Seller's name in the draft uses abbreviation 'K. Ramu' and is misspelled compared to Aadhaar Card and Telugu link document.",
-          expected: "Kethavath Ramulu",
-          found: "K. Ramu",
-          recommendation: "Change the name 'K. Ramu' to 'Kethavath Ramulu' to match official Aadhaar spelling exactly."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "The property survey number listed in the draft does not match the official source link document / Pattadar Passbook.",
-          expected: "102/AA",
-          found: "120/AA",
-          recommendation: "Correct the survey number typo from '120/AA' to '102/AA' to prevent registration rejection."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "The House Number (H.No) listed in the draft is incorrect.",
-          expected: "2-104",
-          found: "2-100",
-          recommendation: "Update the H.No from '2-100' to '2-104' in the draft."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "Plot Number mismatch.",
-          expected: "55",
-          found: "50",
-          recommendation: "Correct the plot number from '50' to '55'."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "Property Tax Identification Number (PTI No) mismatch.",
-          expected: "1088009944",
-          found: "1088009000",
-          recommendation: "Modify the PTI number in the draft from '1088009000' to '1088009944'."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "WARNING",
-          description: "Extent mismatch in the draft document.",
-          expected: "2.50 Acres",
-          found: "2.10 Acres",
-          recommendation: "Correct the area size to '2.50 Acres'."
-        },
-        {
-          category: "Property details mismatch",
-          severity: "CRITICAL",
-          description: "Property boundaries listed in the draft do not match the Pattadar Passbook details.",
-          expected: "East: Ramu's Land, West: Sekhar's Land, North: Canal, South: Pond",
-          found: "East: State Highway, West: Forest Land, North: Open space, South: Main Road",
-          recommendation: "Correct all boundaries in the draft to match the original Telugu deeds."
-        },
-        {
-          category: "Link document numbers mismatch",
-          severity: "CRITICAL",
-          description: "The link document reference/deed number in the draft has a critical typo.",
-          expected: "PP-5049/2010",
-          found: "PP-5000/2010",
-          recommendation: "Change the acquired link deed reference from 'PP-5000/2010' to 'PP-5049/2010'."
-        }
-      ],
-      linkDocumentDetails: {
-        language: "Telugu",
-        docNumber: "PP-5049/2010",
-        village: "Haveli Ghanpur",
-        surveyNumbers: ["102/AA"],
-        sellersExtracted: ["కేతావత్ రాములు (Kethavath Ramulu)"]
-      }
-    };
-  }
-
-  // Heuristic Check 3: Default to Preset 1 / Perfect Match
-  if (normalizedDraft.includes("ankem srinivas")) {
-    return {
-      demoMode: true,
-      summary: {
-        status: "APPROVED",
-        sellersCount: 1,
-        discrepancyCount: 0,
-        message: "DEMO MODE (Simulation): All identity checks, property details, and link document deed numbers match exactly! No discrepancies found."
-      },
-      sellers: [
-        {
-          id: "Seller 1",
-          aadhaarName: "Ankem Srinivas",
-          draftName: "Ankem Srinivas",
-          linkName: "Ankem Srinivas (అంకెమ్ శ్రీనివాస్)",
-          aadhaarNo: "4521 8902 3412",
-          draftAadhaarNo: "4521 8902 3412",
-          dob: "12/06/1975",
-          calculatedAge: 51,
-          draftAge: 51,
-          linkAge: 23,
-          status: "MATCH",
-          discrepancies: []
-        }
-      ],
-      property: {
-        linkSurveyNumbers: ["412/A"],
-        draftSurveyNumbers: ["412/A"],
-        linkVillage: "Nakrekal",
-        draftVillage: "Nakrekal",
-        linkHNo: "4-12",
-        draftHNo: "4-12",
-        linkPlotNo: "12",
-        draftPlotNo: "12",
-        linkPTINo: "1092003412",
-        draftPTINo: "1092003412",
-        linkSqYards: "240 Sq Yards",
-        draftSqYards: "240 Sq Yards",
-        linkPlinthArea: "1500 Sq Ft",
-        draftPlinthArea: "1500 Sq Ft",
-        linkBoundaries: {
-          east: "Canal",
-          west: "Ramulu's Land",
-          north: "Main Road",
-          south: "Venkataiah's Land"
-        },
-        draftBoundaries: {
-          east: "Canal",
-          west: "Ramulu's Land",
-          north: "Main Road",
-          south: "Venkataiah's Land"
-        },
-        status: "MATCH",
-        discrepancies: []
-      },
-      linkDocumentVerification: {
-        linkDeedNumber: "1204/1998",
-        draftMentionedLinkDeedNumber: "1204/1998",
-        status: "MATCH",
-        discrepancies: []
-      },
-      allDiscrepancies: [],
-      linkDocumentDetails: {
-        language: "Telugu",
-        docNumber: "1204/1998",
-        village: "Nakrekal",
-        surveyNumbers: ["412/A"],
-        sellersExtracted: ["అంకెమ్ శ్రీనివాస్ (Ankem Srinivas)"]
-      }
-    };
-  }
-
-  // If the user uploaded custom files, let's parse them using regex heuristics to build an intelligent mock report!
-  const foundAadhaarRegex = /(\d{4}\s?\d{4}\s?\d{4})/g.exec(draftText);
-  const foundAadhaar = foundAadhaarRegex ? foundAadhaarRegex[0] : "4521 8902 3412";
-
-  const foundSurveyRegex = /(survey|sy\.?\s?no\.?\s?)(\d+\/[A-Z0-9]+|\d+)/i.exec(draftText);
-  const foundSurvey = foundSurveyRegex ? foundSurveyRegex[2] : "412/A";
-
-  const foundNameRegex = /(sri|mr\.?|seller:?)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)/i.exec(draftText);
-  const foundName = foundNameRegex ? foundNameRegex[2] : "Ankem Srinivas";
-
-  const foundAgeRegex = /(age|aged about)\s+(\d+)/i.exec(draftText);
-  const foundAge = foundAgeRegex ? parseInt(foundAgeRegex[2], 10) : 51;
-
-  const foundHNoRegex = /(h\.?no\.?\s?[0-9-/A-Za-z]+)/i.exec(draftText);
-  const foundHNo = foundHNoRegex ? foundHNoRegex[1] : "4-12";
-
-  const foundPlotRegex = /(plot\s?(no\.?)?\s?\d+)/i.exec(draftText);
-  const foundPlot = foundPlotRegex ? foundPlotRegex[1].replace(/plot\s?(no\.?)?\s?/i, "") : "12";
-
-  const foundPTIRegex = /(pti\s?(no\.?)?\s?\d+)/i.exec(draftText);
-  const foundPTI = foundPTIRegex ? foundPTIRegex[1].replace(/pti\s?(no\.?)?\s?/i, "") : "1092003412";
-
-  const foundDeedNoRegex = /(deed\s?no\.?\s?[0-9/]+|document\s?no\.?\s?[0-9/]+)/i.exec(draftText);
-  const foundDeedNo = foundDeedNoRegex ? foundDeedNoRegex[1].replace(/(deed|document)\s?no\.?\s?/i, "") : "1204/1998";
-
-  // Return a customized report based on the parsed values
-  const customDiscrepancies = [];
-  if (foundAge !== 51) {
-    customDiscrepancies.push({
-      category: "Names mismatch",
-      severity: "WARNING",
-      description: `Draft lists age as ${foundAge} years, but calculated age from Aadhaar DOB is 51 years.`,
-      expected: "51 Years",
-      found: `${foundAge} Years`,
-      recommendation: "Update the seller's age to '51' years to prevent registration blocks."
-    });
-  }
-
-  // Residual-content / completeness heuristic: any un-replaced {{PLACEHOLDER}} token is a
-  // critical error (leftover template content). This runs even without the Gemini API.
-  const placeholderMatches = Array.from(new Set((draftText || "").match(/\{\{[^}]+\}\}/g) || []));
-  placeholderMatches.forEach((ph) => {
-    customDiscrepancies.push({
-      category: "Residual content",
+  // Un-replaced template tokens are leftover template content and must never
+  // reach a registrar. This needs no AI and is always correct.
+  const leftovers = Array.from(new Set(text.match(/\{\{[^}]+\}\}/g) || []));
+  for (const ph of leftovers) {
+    findings.push({
       severity: "CRITICAL",
-      description: `The draft still contains an un-replaced template placeholder ${ph}. This is leftover template content and must not appear in the final deed.`,
-      expected: "A real value for this field",
-      found: ph,
-      recommendation: `Return to Step 1, supply the value that maps to ${ph}, then re-generate the document.`
+      category: "Residual content",
+      description: `The draft still contains an un-replaced template placeholder ${ph}.`,
+      recommendation: `Supply the value for ${ph}, then regenerate the document.`,
     });
-  });
+  }
+
+  // Angle-bracket placeholders from the other template dialect.
+  const angles = Array.from(new Set(text.match(/<[A-Z][A-Za-z .\/]{2,40}>/g) || []));
+  for (const ph of angles.slice(0, 20)) {
+    findings.push({
+      severity: "CRITICAL",
+      category: "Residual content",
+      description: `The draft still contains an un-replaced template placeholder ${ph}.`,
+      recommendation: `Supply the value for ${ph}, then regenerate the document.`,
+    });
+  }
+
+  if (!text.trim()) {
+    findings.push({
+      severity: "WARNING",
+      category: "Empty draft",
+      description: "The draft text was empty, so even offline checks could not inspect it.",
+      recommendation: "Generate the document before running verification.",
+    });
+  }
 
   return {
-    demoMode: true,
-    summary: {
-      status: customDiscrepancies.length > 0 ? "WARNING" : "APPROVED",
-      sellersCount: 1,
-      discrepancyCount: customDiscrepancies.length,
-      message: "DEMO MODE (Simulation): Dynamically processed your uploaded custom registration document using our local regex heuristics!"
-    },
-    sellers: [
-      {
-        id: "Seller 1",
-        aadhaarName: foundName,
-        draftName: foundName,
-        linkName: foundName,
-        aadhaarNo: foundAadhaar,
-        draftAadhaarNo: foundAadhaar,
-        dob: "12/06/1975",
-        calculatedAge: 51,
-        draftAge: foundAge,
-        linkAge: null,
-        status: foundAge === 51 ? "MATCH" : "WARNING",
-        discrepancies: foundAge === 51 ? [] : [`Age mismatch: Draft says ${foundAge}, Aadhaar DOB implies 51.`]
-      }
-    ],
-    property: {
-      linkSurveyNumbers: [foundSurvey],
-      draftSurveyNumbers: [foundSurvey],
-      linkVillage: "Nakrekal",
-      draftVillage: "Nakrekal",
-      linkHNo: foundHNo,
-      draftHNo: foundHNo,
-      linkPlotNo: foundPlot,
-      draftPlotNo: foundPlot,
-      linkPTINo: foundPTI,
-      draftPTINo: foundPTI,
-      linkSqYards: "240 Sq Yards",
-      draftSqYards: "240 Sq Yards",
-      linkPlinthArea: "1500 Sq Ft",
-      draftPlinthArea: "1500 Sq Ft",
-      linkBoundaries: {
-        east: "Canal",
-        west: "Ramulu's Land",
-        north: "Main Road",
-        south: "Venkataiah's Land"
-      },
-      draftBoundaries: {
-        east: "Canal",
-        west: "Ramulu's Land",
-        north: "Main Road",
-        south: "Venkataiah's Land"
-      },
-      status: "MATCH",
-      discrepancies: []
-    },
-    linkDocumentVerification: {
-      linkDeedNumber: foundDeedNo,
-      draftMentionedLinkDeedNumber: foundDeedNo,
-      status: "MATCH",
-      discrepancies: []
-    },
-    allDiscrepancies: customDiscrepancies,
-    linkDocumentDetails: {
-      language: "English",
-      docNumber: foundDeedNo,
-      village: "Nakrekal",
-      surveyNumbers: [foundSurvey],
-      sellersExtracted: [foundName]
-    }
-  };
-}
-
-function getHeuristicExtraction(documents: any[]): any {
-  let isWarangal = false;
-  let isTelugu = false;
-  
-  if (documents && Array.isArray(documents)) {
-    const names = documents.map(d => (d.name || "").toLowerCase()).join(" ");
-    if (names.includes("srinivas") || names.includes("ankem")) {
-      isTelugu = false;
-    } else if (names.includes("warangal") || names.includes("rao")) {
-      isWarangal = true;
-    } else if (names.includes("ramulu") || names.includes("kethavath") || names.includes("telugu")) {
-      isTelugu = true;
-    }
-  }
-  
-  if (isWarangal) {
-    return {
-      executants: [
-        {
-          name: "Ankem Srinivas",
-          relation: "S/o Ankem Ramulu",
-          age: 51,
-          aadhaar: "4521 8902 3412",
-          pan: "ABCDE1234F",
-          dob: "12/06/1975",
-          address: "H.No 4-12, Near Hanuman Temple, Nakrekal Village, Nakrekal Mandal, Nalgonda District, Telangana - 508211"
-        }
-      ],
-      claimants: [
-        {
-          name: "Ganta Venkat Reddy",
-          relation: "S/o Ganta Malla Reddy",
-          age: 45,
-          aadhaar: "9876 5432 1098",
-          pan: "XYZWP9876Z",
-          dob: "15/08/1981",
-          address: "Plot No 22, Jubilee Hills, Hyderabad, Telangana - 500033"
-        }
-      ],
-      property: {
-        surveyNo: "412/A",
-        village: "Nakrekal",
-        mandal: "Nakrekal",
-        district: "Nalgonda",
-        state: "Telangana",
-        hNo: "4-12/A",
-        plotNo: "18",
-        ptiNo: "1092003415",
-        extentSqYards: "300 Sq Yards",
-        plinthArea: "1800 Sq Ft",
-        boundaries: {
-          east: "Canal",
-          west: "Ramulu's Land",
-          north: "Main Road",
-          south: "Venkataiah's Land"
-        }
-      },
-      linkDeed: {
-        deedNumber: "2304/1998",
-        executionDate: "14th August 1998",
-        village: "Nakrekal"
-      }
-    };
-  }
-  
-  if (isTelugu) {
-    return {
-      executants: [
-        {
-          name: "Kethavath Ramulu",
-          relation: "S/o Kethavath Laxma",
-          age: 58,
-          aadhaar: "9874 5612 3045",
-          pan: "PLKJH9081A",
-          dob: "01/01/1968",
-          address: "H.No 2-104, Haveli Ghanpur, Medak District, Telangana"
-        }
-      ],
-      claimants: [
-        {
-          name: "Vangala Sudhakar",
-          relation: "S/o Vangala Narsaiah",
-          age: 42,
-          aadhaar: "1234 5678 9012",
-          pan: "CVBNM4561E",
-          dob: "10/05/1984",
-          address: "Plot No 44, NGO Colony, Medak, Telangana"
-        }
-      ],
-      property: {
-        surveyNo: "102/AA",
-        village: "Haveli Ghanpur",
-        mandal: "Haveli Ghanpur",
-        district: "Medak",
-        state: "Telangana",
-        hNo: "2-104",
-        plotNo: "55",
-        ptiNo: "1088009944",
-        extentSqYards: "2.50 Acres",
-        plinthArea: "N/A",
-        boundaries: {
-          east: "Ramu's Land (రాము భూమి)",
-          west: "Sekhar's Land (శేఖర్ భూమి)",
-          north: "Canal (కాలువ)",
-          south: "Pond (చెరువు)"
-        }
-      },
-      linkDeed: {
-        deedNumber: "PP-5049/2010",
-        executionDate: "12th May 2010",
-        village: "Haveli Ghanpur"
-      }
-    };
-  }
-  
-  return {
-    executants: [
-      {
-        name: "Ankem Srinivas",
-        relation: "S/o Ankem Ramulu",
-        age: 51,
-        aadhaar: "4521 8902 3412",
-        pan: "ABCDE1234F",
-        dob: "12/06/1975",
-        address: "H.No 4-12, Near Hanuman Temple, Nakrekal Village, Nakrekal Mandal, Nalgonda District, Telangana - 508211"
-      }
-    ],
-    claimants: [
-      {
-        name: "Ganta Venkat Reddy",
-        relation: "S/o Ganta Malla Reddy",
-        age: 45,
-        aadhaar: "9876 5432 1098",
-        pan: "XYZWP9876Z",
-        dob: "15/08/1981",
-        address: "Plot No 22, Jubilee Hills, Hyderabad, Telangana - 500033"
-      }
-    ],
-    property: {
-      surveyNo: "412/A",
-      village: "Nakrekal",
-      mandal: "Nakrekal",
-      district: "Nalgonda",
-      state: "Telangana",
-      hNo: "4-12",
-      plotNo: "12",
-      ptiNo: "1092003412",
-      extentSqYards: "240 Sq Yards",
-      plinthArea: "1500 Sq Ft",
-      boundaries: {
-        east: "Canal",
-        west: "Ramulu's Land",
-        north: "Main Road",
-        south: "Venkataiah's Land"
-      }
-    },
-    linkDeed: {
-      deedNumber: "1204/1998",
-      executionDate: "14th August 1998",
-      village: "Nakrekal"
-    }
+    ran: ["Leftover template placeholder scan"],
+    findings,
   };
 }
 
@@ -1122,17 +504,28 @@ ${JSON.stringify(details, null, 2)}
 TEMPLATE (reproduce verbatim; preserve exact layout and formatting style; replace ONLY the transaction-specific facts listed above):
 ${templateText}`;
 
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: prompt,
-    config: {
-      systemInstruction:
-        "You are a senior Telangana registration deed drafter. Your mandatory duties are: 1. Preserve the supplied template's exact formatting style, setup layout, margins, paper size, fonts, font sizes, text alignment, headers, footers, padding, bullet/list formats, tables, and page breaks verbatim. 2. NEVER include any placeholder dashes, underscores (____), dashes (---), bracketed slots, or empty underlines anywhere in the final text. If any field or detail is not supplied in DATA, smoothly omit that unsupplied field or phrase so the document text is registered cleanly without placeholders. Return ONLY the final deed text with no markdown fences or commentary.",
-      temperature: 0,
-      maxOutputTokens: 16384,
-    },
-  });
+  // Time-boxed here rather than at each call site: both callers
+  // (/api/generate-document and /api/fill-template) classify a thrown error, but
+  // neither could bound a call that never returns at all.
+  // Explicit type arg: `ai` is `any` here, so inference would widen T to unknown.
+  const response = await withAiTimeout<{ text?: string }>(
+    ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: prompt,
+      config: {
+        systemInstruction:
+          "You are a senior Telangana registration deed drafter. Your mandatory duties are: 1. Preserve the supplied template's exact formatting style, setup layout, margins, paper size, fonts, font sizes, text alignment, headers, footers, padding, bullet/list formats, tables, and page breaks verbatim. 2. NEVER include any placeholder dashes, underscores (____), dashes (---), bracketed slots, or empty underlines anywhere in the final text. If any field or detail is not supplied in DATA, smoothly omit that unsupplied field or phrase so the document text is registered cleanly without placeholders. Return ONLY the final deed text with no markdown fences or commentary.",
+        temperature: 0,
+        maxOutputTokens: 16384,
+      },
+    }),
+    AI_TIMEOUT_MS,
+    "AI template fill",
+  );
   const resultText = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+  // An empty result must not masquerade as a successfully filled deed: returning
+  // "" here would hand the caller a blank document to merge placeholders into.
+  if (!resultText) throw new Error("Empty response from the template-fill model.");
   return regexCleanDraft(resultText);
 }
 
@@ -1201,6 +594,9 @@ app.post("/api/clean-draft", async (req, res) => {
 
     const ai = getGeminiClient();
     let cleanedText = draftText;
+    // Non-null once the AI leg could not run, so the response can declare which
+    // engine actually produced the text.
+    let degradation: ReturnType<typeof classifyAiError> | null = null;
 
     if (ai) {
       try {
@@ -1221,31 +617,47 @@ YOUR MANDATE:
 DRAFT TEXT TO AUTO-ADJUST & CLEAN:
 ${draftText}`;
 
-        const response = await ai.models.generateContent({
-          model: GEMINI_MODEL,
-          contents: prompt,
-          config: {
-            systemInstruction: "You are a professional legal deed editor. Remove leftover empty placeholders and auto-adjust preceding sentence phrases smoothly so the legal document flows naturally. Do not invent fake data.",
-            temperature: 0,
-            maxOutputTokens: 16384,
-          },
-        });
+        const response = await withAiTimeout(
+          ai.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: prompt,
+            config: {
+              systemInstruction: "You are a professional legal deed editor. Remove leftover empty placeholders and auto-adjust preceding sentence phrases smoothly so the legal document flows naturally. Do not invent fake data.",
+              temperature: 0,
+              maxOutputTokens: 16384,
+            },
+          }),
+          AI_TIMEOUT_MS,
+          "Draft cleanup",
+        );
         cleanedText = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+        if (!cleanedText) throw new Error("Draft cleanup returned an empty response");
       } catch (e) {
-        console.warn("AI clean draft failed, using regex fallback:", e);
+        // regexCleanDraft only DELETES leftover placeholder text — it never
+        // invents content — so falling back is safe. But it is measurably
+        // cruder, so the response must admit which engine ran.
+        degradation = classifyAiError(e, { label: "cleaning the draft" });
+        logAiFailure("POST /api/clean-draft", degradation);
         cleanedText = regexCleanDraft(draftText);
       }
     } else {
+      degradation = notConfiguredFailure("AI draft cleanup");
       cleanedText = regexCleanDraft(draftText);
     }
 
     // Guarantee no leftover {{...}} or [_____] with regex post-pass
     cleanedText = regexCleanDraft(cleanedText);
 
-    res.json({ cleanedText });
+    res.json({
+      cleanedText,
+      ...(degradation
+        ? { ...degradedMeta(degradation), fallbackUsed: "regex-cleanup" }
+        : OK_META),
+    });
   } catch (err: any) {
-    console.error("Clean draft endpoint error:", err);
-    res.status(500).json({ error: "Failed to clean draft." });
+    const f = classifyAiError(err, { label: "cleaning the draft" });
+    logAiFailure("POST /api/clean-draft (fatal)", f);
+    res.status(f.status).json(aiErrorBody(f));
   }
 });
 
@@ -1322,6 +734,9 @@ app.post("/api/generate-document", async (req, res) => {
     const replacements = buildPlaceholderMap(details);
     let mergedText: string;
     let mergeMode: "deterministic" | "ai" = "deterministic";
+    // Set when a custom upload wanted the AI merge but could not have it. The
+    // document is still valid (deterministic merge), so this is informational.
+    let aiMergeFailure: ReturnType<typeof classifyAiError> | null = null;
 
     if (custom) {
       const ai = getGeminiClient();
@@ -1331,11 +746,17 @@ app.post("/api/generate-document", async (req, res) => {
           mergedText = mergePlaceholders(mergedText, replacements);
           mergeMode = "ai";
         } catch (e) {
-          console.warn("AI fill of custom template failed; using deterministic merge:", e);
+          // The deterministic merge invents nothing, so this fallback is safe —
+          // but `mergeMode` alone does not say WHY the AI leg was skipped.
+          // Record the reason so the UI can distinguish "no key configured"
+          // from "credits exhausted".
+          aiMergeFailure = classifyAiError(e, { label: "AI-filling the custom template" });
+          logAiFailure("POST /api/generate-document (ai fill)", aiMergeFailure);
           mergedText = mergePlaceholders(templateText!, replacements);
         }
       } else {
         // No API key -> deterministic {{PLACEHOLDER}} merge only.
+        aiMergeFailure = notConfiguredFailure("AI template fill");
         mergedText = mergePlaceholders(templateText!, replacements);
       }
     } else {
@@ -1351,6 +772,15 @@ app.post("/api/generate-document", async (req, res) => {
       templateId: custom ? "custom-upload" : templateId,
       templateName: resolvedName,
       mergeMode,
+      // Only a custom upload ever asks for the AI merge, so only it can be
+      // AI-degraded. A library template's merge is deterministic BY DESIGN, not
+      // by failure, and must not be flagged as degraded.
+      // NB: no `error` key here — the document itself is complete and valid.
+      ...(custom
+        ? aiMergeFailure
+          ? { ...degradedMeta(aiMergeFailure), fallbackUsed: "deterministic-merge" }
+          : OK_META
+        : {}),
       mergedText,
       unresolvedPlaceholders: unresolved,
       docxBase64: docxBuffer.toString("base64"),
@@ -1533,7 +963,10 @@ app.post("/api/extract-template-text", async (req, res) => {
     if (!ai) {
       // No key → cannot OCR/transcribe a PDF here. Tell the client to use a
       // text-based template instead of failing silently.
-      return res.status(503).json({
+      const f = notConfiguredFailure("PDF/image template transcription");
+      logAiFailure("POST /api/extract-template-text (no key)", f);
+      return res.status(f.status).json({
+        ...aiErrorBody(f),
         error:
           "PDF/image templates need the Gemini API (not configured). Please upload a .docx, .doc, or .txt template, or paste the template text.",
       });
@@ -1555,24 +988,39 @@ Transcribe the ENTIRE document to plain text, VERBATIM:
 
 Return ONLY the transcribed document text.`;
 
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: [inlineData, { text: transcriptionPrompt }],
-      config: {
-        systemInstruction:
-          "You are a precise document transcriber. Output the full document text verbatim, preserving structure. Never summarize, never add commentary, never use markdown fences.",
-        temperature: 0,
-      },
-    });
+    const response = await withAiTimeout(
+      ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [inlineData, { text: transcriptionPrompt }],
+        config: {
+          systemInstruction:
+            "You are a precise document transcriber. Output the full document text verbatim, preserving structure. Never summarize, never add commentary, never use markdown fences.",
+          temperature: 0,
+        },
+      }),
+      AI_TIMEOUT_MS,
+      "Template transcription",
+    );
 
     const text = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
     if (!text) {
-      return res.status(502).json({ error: "The template could not be read from that file. Please try a different file." });
+      return res.status(502).json({
+        error: "The template could not be read from that file. Please try a different file.",
+        errorCode: "BAD_RESPONSE",
+        retryable: true,
+        aiAvailable: true,
+      });
     }
-    return res.json({ text });
+    return res.json({ text, ...OK_META });
   } catch (err: any) {
-    console.error("Error extracting template text:", err?.message || err);
-    return res.status(500).json({ error: "Failed to read the template file. Please try again or upload a .docx/.txt template." });
+    // Was a flat 500 for every cause, so a depleted-credits 429 read as "your
+    // file is broken" and sent the user hunting for a different template.
+    const f = classifyAiError(err, { label: "reading the template file" });
+    logAiFailure("POST /api/extract-template-text", f);
+    return res.status(f.status).json({
+      ...aiErrorBody(f),
+      error: `${f.message} Alternatively, upload a .docx, .doc, or .txt template, which needs no AI.`,
+    });
   }
 });
 
@@ -1581,9 +1029,16 @@ app.post("/api/extract", async (req, res) => {
   try {
     const { documents } = req.body;
     const ai = getGeminiClient();
+    // Fail closed. This used to fall back to a getHeuristicExtraction() helper
+    // that returned a complete, plausible, entirely FABRICATED party set (names,
+    // Aadhaar numbers, PAN, survey numbers) chosen by filename substring, with
+    // no flag marking it synthetic. Those values flow straight into a generated
+    // deed, so silently inventing them was the most dangerous failure mode in
+    // this app; the helper has been deleted rather than left one call away.
     if (!ai) {
-      console.log("GEMINI_API_KEY is missing. Running extract in heuristic simulation.");
-      return res.json(getHeuristicExtraction(documents));
+      const f = notConfiguredFailure("document extraction");
+      logAiFailure("POST /api/extract (no key)", f);
+      return res.status(f.status).json(aiErrorBody(f));
     }
     
     const contentsParts: any[] = [];
@@ -1689,77 +1144,36 @@ app.post("/api/extract", async (req, res) => {
       required: ["executants", "claimants", "property", "linkDeed"]
     };
     
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: contentsParts,
-      config: {
-        systemInstruction: "You are an expert Indian land registrar document extractor. Translate any Telugu names/properties to English text character-by-character.",
-        responseMimeType: "application/json",
-        responseSchema: extractSchema,
-        temperature: 0.1
-      }
-    });
-    
+    const response = await withAiTimeout(
+      ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: contentsParts,
+        config: {
+          systemInstruction: "You are an expert Indian land registrar document extractor. Translate any Telugu names/properties to English text character-by-character.",
+          responseMimeType: "application/json",
+          responseSchema: extractSchema,
+          temperature: 0.1
+        }
+      }),
+      AI_TIMEOUT_MS,
+      "Document extraction",
+    );
+
     const resultText = response.text;
     if (!resultText) throw new Error("Empty response from extraction model.");
-    return res.json(JSON.parse(resultText.trim()));
+    const parsed = parseModelJson(resultText);
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Extraction model returned unparseable JSON");
+    }
+    return res.json({ ...parsed, ...OK_META });
   } catch (err) {
-    console.warn("Extraction failed or key missing, falling back to heuristics:", err);
-    return res.json(getHeuristicExtraction(req.body.documents));
+    // Report the failure instead of fabricating a party set. The user can type
+    // the details in; they cannot detect an invented Aadhaar number.
+    const f = classifyAiError(err, { label: "extracting document details" });
+    logAiFailure("POST /api/extract", f);
+    return res.status(f.status).json(aiErrorBody(f));
   }
 });
-
-function getHeuristicAadhaarExtraction(fileName: string): any {
-  const norm = (fileName || "").toLowerCase();
-  
-  if (norm.includes("srinivas") || norm.includes("seller") || norm.includes("execut") || norm.includes("preset2")) {
-    return {
-      name: "Ankem Srinivas",
-      relation: "S/o Ankem Ramulu",
-      dob: "1975-06-12",
-      age: 51,
-      address: "H.No 4-12, Near Hanuman Temple, Nakrekal Village, Nakrekal Mandal, Nalgonda District, Telangana - 508211",
-      aadhaarNo: "4521 8902 3412"
-    };
-  } else if (norm.includes("venkat") || norm.includes("buyer") || norm.includes("claim")) {
-    return {
-      name: "Ganta Venkat Reddy",
-      relation: "S/o Ganta Malla Reddy",
-      dob: "1981-08-15",
-      age: 45,
-      address: "Plot No 22, Jubilee Hills, Hyderabad, Telangana - 500033",
-      aadhaarNo: "9876 5432 1098"
-    };
-  } else if (norm.includes("ramulu") || norm.includes("kethavath") || norm.includes("preset3")) {
-    return {
-      name: "Kethavath Ramulu",
-      relation: "S/o Kethavath Laxma",
-      dob: "1968-01-01",
-      age: 58,
-      address: "H.No 2-104, Haveli Ghanpur, Medak District, Telangana",
-      aadhaarNo: "9874 5612 3045"
-    };
-  } else if (norm.includes("sudhakar") || norm.includes("vangala")) {
-    return {
-      name: "Vangala Sudhakar",
-      relation: "S/o Vangala Narsaiah",
-      dob: "1984-05-10",
-      age: 42,
-      address: "Plot No 44, NGO Colony, Medak, Telangana",
-      aadhaarNo: "1234 5678 9012"
-    };
-  }
-
-  // Default fallback
-  return {
-    name: "Ankem Srinivas",
-    relation: "S/o Ankem Ramulu",
-    dob: "1975-06-12",
-    age: 51,
-    address: "H.No 4-12, Near Hanuman Temple, Nakrekal Village, Nakrekal Mandal, Nalgonda District, Telangana - 508211",
-    aadhaarNo: "4521 8902 3412"
-  };
-}
 
 // Endpoint to extract details from a single Aadhaar card upload
 app.post("/api/extract-aadhaar", async (req, res) => {
@@ -1772,9 +1186,13 @@ app.post("/api/extract-aadhaar", async (req, res) => {
     // Gemini is the sole extraction provider.
     const ai = getGeminiClient();
 
+    // Fail closed. The deleted getHeuristicAadhaarExtraction() fallback returned
+    // a hardcoded Aadhaar number and name chosen by filename substring —
+    // plausible enough to be typed into a deed unnoticed.
     if (!ai) {
-      console.log("Gemini API not configured. Running in simulation mode.");
-      return res.json(getHeuristicAadhaarExtraction(document.name));
+      const f = notConfiguredFailure("Aadhaar extraction");
+      logAiFailure("POST /api/extract-aadhaar (no key)", f);
+      return res.status(f.status).json(aiErrorBody(f));
     }
 
     const base64Data = document.base64.split(",")[1] || document.base64;
@@ -1855,19 +1273,17 @@ Notes:
     if (resultText) {
       extractedData = normalizeAadhaar(safeParseAadhaarJson(resultText));
       console.log("✅ Gemini extraction successful!");
-      return res.json(extractedData);
+      return res.json({ ...extractedData, ...OK_META });
     }
 
     throw new Error("Gemini returned an empty response");
 
   } catch (err: any) {
-    console.warn("Aadhaar extraction failed:", err.message);
-    const rateLimited = /RESOURCE_EXHAUSTED|quota|rate.?limit|\b429\b/i.test(String(err?.message || ""));
-    return res.status(rateLimited ? 429 : 500).json({
-      error: rateLimited
-        ? "The AI service hit its usage limit for now. Please wait a minute and try again, or enter the Aadhaar details manually."
-        : "Extraction failed. Please try again or enter details manually.",
-    });
+    // Was the only endpoint with quota detection, via a local regex that missed
+    // the "credits are depleted" wording. The shared classifier covers both.
+    const f = classifyAiError(err, { label: "reading the Aadhaar card" });
+    logAiFailure("POST /api/extract-aadhaar", f);
+    return res.status(f.status).json(aiErrorBody(f));
   }
 });
 
@@ -1882,45 +1298,13 @@ app.post("/api/extract-link-document", async (req, res) => {
     // Gemini is the sole extraction provider.
     const ai = getGeminiClient();
 
+    // Fail closed. The former simulation branch returned a hardcoded deed
+    // (doc no, passbook, survey no, boundaries) that looked like a real
+    // extraction of the user's uploaded link document.
     if (!ai) {
-      console.log("Gemini API not configured. Running link document extraction in simulation mode.");
-      return res.json({
-        jurisdiction: {
-          district: "Nalgonda",
-          districtRegistrar: "Nalgonda",
-          mandal: "Nakrekal",
-          subRegistrar: "Nakrekal",
-          village: "Nakrekal",
-          pincode: "508211"
-        },
-        linkDocument: {
-          docNo: "1204/1998",
-          docDate: "14/08/1998",
-          subRegistrar: "Nakrekal",
-          subRegistrarCode: "SR-NKL-44",
-          pattadarPassbook: "T1209004812",
-          passbookKhataNo: "4812",
-          nalaOrderNo: "N/A",
-          layoutFileNo: "LP.No. 45/1997",
-          houseTaxReceipt: "HTR-2024-001"
-        },
-        property: {
-          surveyNo: "412/A",
-          plotNo: "12",
-          nearHNo: "4-12",
-          extentSqYards: "240 Sq Yards",
-          extentSqMeters: "200.67 Sq Meters",
-          locality: "Hanuman Nagar",
-          marketValuePerSqYard: "10000",
-          marketValueTotal: "2400000"
-        },
-        boundaries: {
-          east: "Canal",
-          west: "Ramulu's Land",
-          north: "Main Road",
-          south: "Venkataiah's Land"
-        }
-      });
+      const f = notConfiguredFailure("link document extraction");
+      logAiFailure("POST /api/extract-link-document (no key)", f);
+      return res.status(f.status).json(aiErrorBody(f));
     }
 
     const inlineData = {
@@ -2197,10 +1581,17 @@ OTHER CRITICAL INSTRUCTIONS:
 
     const resultText = response.text;
     if (!resultText) throw new Error("Empty response from extraction model.");
-    return res.json(JSON.parse(resultText.trim()));
+    const parsed = parseModelJson(resultText);
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Link document extraction returned unparseable JSON");
+    }
+    return res.json({ ...parsed, ...OK_META });
   } catch (err: any) {
-    console.warn("Link document extraction failed:", err);
-    return res.status(500).json({ error: "Extraction failed. Please try again or fill manually." });
+    // Previously a flat 500 with no quota distinction, so a depleted-credits
+    // failure was indistinguishable from a genuine server fault.
+    const f = classifyAiError(err, { label: "reading the link document" });
+    logAiFailure("POST /api/extract-link-document", f);
+    return res.status(f.status).json(aiErrorBody(f));
   }
 });
 
@@ -2212,9 +1603,18 @@ app.post("/api/fill-template", async (req, res) => {
       return res.status(400).json({ error: "Template text is required." });
     }
     const ai = getGeminiClient();
+    // Unlike the extraction endpoints, the fallback here is a REAL substitution
+    // engine working from the user's own data — it invents nothing. So degrade
+    // rather than fail, but say so: the client must be able to tell a
+    // crudely-merged draft from an AI-drafted one before sending it to register.
     if (!ai) {
-      console.log("GEMINI_API_KEY is missing. Running template fill in local mode.");
-      return res.json({ filledText: regexCleanDraft(localFillTemplate(templateText, extractedDetails)) });
+      const f = notConfiguredFailure("AI template fill");
+      logAiFailure("POST /api/fill-template (no key)", f);
+      return res.json({
+        filledText: regexCleanDraft(localFillTemplate(templateText, extractedDetails)),
+        ...degradedMeta(f),
+        fallbackUsed: "local-substitution",
+      });
     }
     
     const prompt = `You are an expert legal document drafter in Telangana, India. Update the supplied Model Sale Deed template with the extracted registration details.
@@ -2234,21 +1634,33 @@ ${JSON.stringify(extractedDetails, null, 2)}
 TEMPLATE:
 ${templateText}`;
     
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction: "You are a senior registration deed drafter. Return ONLY the final filled legal draft text. Preserve template layout, fonts, margins, alignment, bullets, and formatting style. NEVER output placeholder dashes, underscores (____), or blank lines for missing fields — write the registered text cleanly without placeholders. Never include markdown code blocks or conversational text.",
-        temperature: 0.1
-      }
-    });
-    
+    const response = await withAiTimeout(
+      ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: prompt,
+        config: {
+          systemInstruction: "You are a senior registration deed drafter. Return ONLY the final filled legal draft text. Preserve template layout, fonts, margins, alignment, bullets, and formatting style. NEVER output placeholder dashes, underscores (____), or blank lines for missing fields — write the registered text cleanly without placeholders. Never include markdown code blocks or conversational text.",
+          temperature: 0.1
+        }
+      }),
+      AI_TIMEOUT_MS,
+      "Template fill",
+    );
+
     let filledText = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+    if (!filledText) throw new Error("Template fill returned an empty response");
     filledText = regexCleanDraft(filledText);
-    return res.json({ filledText });
+    return res.json({ filledText, ...OK_META });
   } catch (err) {
-    console.warn("Template filling failed, falling back to local replacement engine:", err);
-    return res.json({ filledText: regexCleanDraft(localFillTemplate(req.body.templateText, req.body.extractedDetails)) });
+    // Same reasoning as the no-key path: keep the honest local fallback, but
+    // label it so the UI can warn instead of implying an AI-quality draft.
+    const f = classifyAiError(err, { label: "filling the template" });
+    logAiFailure("POST /api/fill-template", f);
+    return res.json({
+      filledText: regexCleanDraft(localFillTemplate(req.body?.templateText, req.body?.extractedDetails)),
+      ...degradedMeta(f),
+      fallbackUsed: "local-substitution",
+    });
   }
 });
 
@@ -2271,10 +1683,15 @@ app.post("/api/verify", async (req, res) => {
 
     const ai = getGeminiClient();
 
-    // If Gemini API Key is missing, run our high-fidelity Heuristic & Preset Simulation Engine
+    // No key means the cross-document audit CANNOT run. This endpoint must fail
+    // closed: its entire purpose is catching Aadhaar/draft/link-document
+    // mismatches before registration, and any 200 response here renders a
+    // verification verdict in the UI. Returning a locally-simulated report used
+    // to render a green "ALL CLEAR / 0 Issues" banner for a deed nobody checked.
     if (!ai) {
-      console.log("GEMINI_API_KEY is missing. Running in local Heuristic Fallback & Preset Simulation Mode.");
-      return res.json(generateHeuristicReport(draftText));
+      const f = notConfiguredFailure("document verification");
+      logAiFailure("POST /api/verify (no key)", f);
+      return res.status(f.status).json(aiErrorBody(f));
     }
 
     // Prepare contents list for Gemini
@@ -2537,20 +1954,30 @@ app.post("/api/verify", async (req, res) => {
       throw new Error("Empty response received from Gemini API");
     }
 
-    const report = JSON.parse(resultText.trim());
-    return res.json(report);
+    // Use the escape-repairing parser, not a bare JSON.parse. A single invalid
+    // \' escape from the model used to throw straight into the catch below and
+    // surface as a fabricated "verification report".
+    const report = parseModelJson(resultText);
+    if (!report || typeof report !== "object" || !report.summary) {
+      throw new Error("Gemini returned an unparseable verification report");
+    }
+    return res.json({ ...report, ...OK_META });
 
   } catch (error: any) {
-    console.warn("Gemini verification failed, falling back to local heuristics simulation:", error);
-    try {
-      const { draftText } = req.body;
-      return res.json(generateHeuristicReport(draftText));
-    } catch (fallbackError: any) {
-      console.error("Heuristic fallback failed as well:", fallbackError);
-      return res.status(500).json({
-        error: error.message || "An internal error occurred during document verification.",
-      });
-    }
+    // FAIL CLOSED. Never substitute a simulated report here: the client renders
+    // whatever it receives as a verification verdict, so a fallback body means a
+    // deed that was never audited can display "Verification: ALL CLEAR".
+    // The offline checks that ARE trustworthy (leftover {{PLACEHOLDER}}
+    // detection) are returned as `partialChecks` for information only — they are
+    // explicitly NOT a verdict, and carry no status/discrepancyCount fields the
+    // UI could mistake for one.
+    const f = classifyAiError(error, { label: "verifying the deed" });
+    logAiFailure("POST /api/verify", f);
+    return res.status(f.status).json({
+      ...aiErrorBody(f),
+      verificationRan: false,
+      partialChecks: buildOfflinePlaceholderChecks(req.body?.draftText),
+    });
   }
 });
 
@@ -2650,6 +2077,11 @@ app.post("/api/generate-plan", async (req, res) => {
     let verificationReport: any = null;
     // Why the cross-check did not run, in words the user can act on.
     let auditFailure: string | null = null;
+    // The classified failure behind auditFailure/imageError, so the response can
+    // carry a machine-readable errorCode instead of only prose. Whichever leg
+    // failed, the plan image itself is still rendered from the user's own form
+    // data, so this endpoint degrades-with-a-flag rather than failing closed.
+    let planFailure: ReturnType<typeof classifyAiError> | null = null;
 
     // ---- STEP 1: read the hand-drawn sketch into STRUCTURED JSON (vision) ----
     // The sketch image IS sent to the model here. (Previously the sketch was
@@ -2755,8 +2187,13 @@ JSON Output Schema strictly format as:
         extractedPlan = parseModelJson((exRes.value as any).text);
         if (!extractedPlan) imageError = "Sketch extraction returned unparseable data.";
       } else if (exRes.status === "rejected") {
-        imageError = exRes.reason?.message || "Sketch extraction unavailable.";
-        console.warn("Plan sketch extraction failed; rendering from form details:", imageError);
+        // Was leaking the raw SDK message (a JSON blob, and potentially a
+        // ?key=... URL) straight to the client. Classify it instead: the user
+        // gets an actionable sentence, the log gets the redacted detail.
+        const f = classifyAiError(exRes.reason, { label: "reading the sketch" });
+        logAiFailure("POST /api/generate-plan (sketch extraction)", f);
+        planFailure = f;
+        imageError = f.message;
       }
 
       if (auRes.status === "fulfilled" && (auRes.value as any)?.text) {
@@ -2766,21 +2203,28 @@ JSON Output Schema strictly format as:
           auditFailure = "The boundary cross-check returned data that could not be read.";
         }
       } else if (auRes.status === "rejected") {
-        const raw = auRes.reason?.message || String(auRes.reason || "");
-        console.error("Verification audit failed:", raw);
         // Tell the user WHICH failure this is: an exhausted API quota needs
         // billing attention, a timeout just needs a retry. A generic message
         // sends them looking at the sketch, which is not the problem.
-        if (/RESOURCE_EXHAUSTED|quota|credits are depleted|\b429\b/i.test(raw)) {
-          auditFailure =
-            "The AI service quota has been exhausted, so the boundaries were not cross-checked. Check the API billing/credits, then generate the plan again.";
-        } else if (/timed out/i.test(raw)) {
-          auditFailure =
-            "The boundary cross-check timed out. Generate the plan again to retry.";
-        } else {
-          auditFailure = "The boundary cross-check could not be completed.";
-        }
+        //
+        // This block used to own a local quota regex that matched
+        // "credits are depleted" but NOT "rate limit"; the classifier covers
+        // both wordings and every other call site at once.
+        const f = classifyAiError(auRes.reason, { label: "cross-checking the boundaries" });
+        logAiFailure("POST /api/generate-plan (boundary audit)", f);
+        planFailure ??= f;
+        auditFailure =
+          f.code === "QUOTA_EXHAUSTED"
+            ? "The AI service has run out of credits or hit its usage limit, so the boundaries were NOT cross-checked. Top up the Gemini API billing, then generate the plan again."
+            : `${f.message} The boundaries were NOT cross-checked.`;
       }
+    } else {
+      // No API key: neither the sketch read nor the boundary audit happened.
+      // Previously this fell through silently and the fallback report said only
+      // "verify manually", giving no clue that AI was never configured.
+      planFailure = notConfiguredFailure("sketch reading and boundary cross-check");
+      auditFailure = planFailure.message;
+      imageError = planFailure.message;
     }
 
     // ---- STEP 2: render the full one-pager deterministically from the JSON ----
@@ -2797,10 +2241,17 @@ JSON Output Schema strictly format as:
       verificationReport,
       // What the sketch reader pulled out — handy for debugging/preview.
       extractedPlan,
+      // Same degradation envelope as every other endpoint, so the UI needs one
+      // code path. The plan image is real either way (it is drawn from the
+      // user's own form data), which is why this degrades instead of 4xx-ing.
+      ...(planFailure
+        ? { ...degradedMeta(planFailure), fallbackUsed: "deterministic-render" }
+        : OK_META),
       masterPromptUsed: PLAN_EXTRACTION_PROMPT + (userPromptText ? `\n\nUSER NOTES:\n${userPromptText}` : ""),
     });
   } catch (err: any) {
-    console.error("Error in /api/generate-plan:", err);
+    const f = classifyAiError(err, { label: "generating the plan" });
+    logAiFailure("POST /api/generate-plan (outer)", f);
     // Even in catch block, render a clean plan from whatever details we have so
     // the frontend never gets a 500 error.
     try {
@@ -2809,12 +2260,26 @@ JSON Output Schema strictly format as:
         details && typeof details === "object" ? details : { property: propertyDetails || {} };
       return res.json({
         generatedImageBase64: renderPlanDataUrl({ plan: null, details: rd }),
-        imageError: null,
-        verificationReport: buildFallbackVerificationReport(propertyDetails || details?.property),
+        // Was `imageError: null` with the reason argument dropped — so a total
+        // failure here rendered as a plan with NO warning at all, the exact
+        // silent-success this whole change set exists to remove.
+        imageError: f.message,
+        verificationReport: buildFallbackVerificationReport(
+          propertyDetails || details?.property,
+          f.message
+        ),
+        ...degradedMeta(f),
+        fallbackUsed: "deterministic-render",
         masterPromptUsed: PLAN_EXTRACTION_PROMPT,
       });
     } catch {
-      return res.status(500).json({ error: err.message || "Failed to generate plan." });
+      // The deterministic renderer itself failed — nothing truthful left to send.
+      return res.status(500).json({
+        error: "Could not generate the plan. Please try again.",
+        errorCode: "RENDER_FAILED",
+        retryable: true,
+        detail: redact(String(err?.message || err)).slice(0, 500),
+      });
     }
   }
 });

@@ -38,6 +38,13 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { PRESETS, MODEL_TEMPLATES, Preset, MockFile, ModelTemplate } from "./presets";
+import AiStatusBanner from "./AiStatusBanner";
+import {
+  ApiFailure,
+  parseApiFailure,
+  toApiFailure,
+  degradedFailure,
+} from "./aiError";
 
 const calculateAgeFromDOB = (dobString: string): string => {
   if (!dobString) return "";
@@ -690,10 +697,57 @@ export default function App() {
   // General App states
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The STRUCTURED failure behind `error`. `error` is a bare string with no code
+  // and no retryability, so it cannot drive per-cause guidance (a 429 needs
+  // billing, a 504 needs a retry) — and it was rendered nowhere at all. Keep
+  // both in step: setFailure for anything the user must see.
+  const [failure, setFailure] = useState<ApiFailure | null>(null);
+  // A step that SUCCEEDED but without AI. Separate from `failure` because it is
+  // informational, not blocking, and must not read as an error.
+  const [degraded, setDegraded] = useState<ApiFailure | null>(null);
+  // Set alongside setFailure so a banner can offer a working Retry button.
+  const [retryAction, setRetryAction] = useState<(() => void) | null>(null);
   const [copied, setCopied] = useState(false);
   const [isPresetsExpanded, setIsPresetsExpanded] = useState(false);
   const [savedDrafts, setSavedDrafts] = useState<any[]>([]);
   const [activeAuditTab, setActiveAuditTab] = useState<"all" | "critical" | "warnings">("all");
+
+  // ---- AI failure reporting helpers -------------------------------------
+  // Single funnel so `error` (legacy string, used by a few inline messages) and
+  // `failure` (structured, drives the banner) can never disagree.
+
+  /** Report a blocking failure: the step did not happen. */
+  const reportFailure = (err: unknown, label: string, retry?: () => void) => {
+    const f = toApiFailure(err, label);
+    console.error(`[${label}]`, err);
+    setFailure(f);
+    setError(f.message);
+    setRetryAction(retry ?? null);
+    return f;
+  };
+
+  /** Clear all AI status before starting a fresh attempt. */
+  const clearAiStatus = () => {
+    setFailure(null);
+    setDegraded(null);
+    setError(null);
+    setRetryAction(null);
+  };
+
+  /**
+   * Inspect a 200 response for the server's degradation flags. Returns true when
+   * the result came from a fallback, so callers can also adjust their own UI.
+   */
+  const noteDegradation = (body: any, label: string): boolean => {
+    const d = degradedFailure(body, label);
+    setDegraded(d);
+    return !!d;
+  };
+
+  /** Throw a structured ApiFailure for a non-2xx response. */
+  const failOn = async (response: Response, label: string): Promise<never> => {
+    throw await parseApiFailure(response, label);
+  };
 
   const workflowSteps = [
     { number: 1, title: "Registration Form", telugu: "రిజిస్ట్రేషన్ ఫారమ్", desc: "Official details, values & uploads" },
@@ -982,7 +1036,7 @@ export default function App() {
     if (!file) return;
 
     setUploadingAadhaarExecutant(true);
-    setError(null);
+    clearAiStatus();
 
     try {
       const base64 = await convertFileToBase64(file);
@@ -1000,9 +1054,7 @@ export default function App() {
         })
       });
 
-      if (!response.ok) {
-        throw new Error("Aadhaar extraction failed");
-      }
+      if (!response.ok) await failOn(response, "Aadhaar extraction");
 
       const data = await response.json();
       if (data?.error) throw new Error(data.error);
@@ -1042,8 +1094,10 @@ export default function App() {
       // Reset input
       e.target.value = "";
     } catch (err: any) {
-      console.error("Error extracting Aadhaar for executant:", err);
-      alert(`Failed to extract Aadhaar details${err?.message ? `: ${err.message}` : ""}. Please check the file and try again, or enter details manually.`);
+      // Was a blocking alert() carrying the raw thrown message. The banner shows
+      // the server's classified reason instead, stays on screen while the user
+      // types the details in by hand, and does not interrupt the upload flow.
+      reportFailure(err, "Aadhaar extraction (executant)");
     } finally {
       setUploadingAadhaarExecutant(false);
     }
@@ -1055,7 +1109,7 @@ export default function App() {
     if (!file) return;
 
     setUploadingAadhaarClaimant(true);
-    setError(null);
+    clearAiStatus();
 
     try {
       const base64 = await convertFileToBase64(file);
@@ -1073,9 +1127,7 @@ export default function App() {
         })
       });
 
-      if (!response.ok) {
-        throw new Error("Aadhaar extraction failed");
-      }
+      if (!response.ok) await failOn(response, "Aadhaar extraction");
 
       const data = await response.json();
       if (data?.error) throw new Error(data.error);
@@ -1115,8 +1167,7 @@ export default function App() {
       // Reset input
       e.target.value = "";
     } catch (err: any) {
-      console.error("Error extracting Aadhaar for claimant:", err);
-      alert(`Failed to extract Aadhaar details${err?.message ? `: ${err.message}` : ""}. Please check the file and try again, or enter details manually.`);
+      reportFailure(err, "Aadhaar extraction (claimant)");
     } finally {
       setUploadingAadhaarClaimant(false);
     }
@@ -1128,7 +1179,7 @@ export default function App() {
     if (!file) return;
 
     setUploadingLinkDocument(true);
-    setError(null);
+    clearAiStatus();
 
     try {
       const base64 = await convertFileToBase64(file);
@@ -1147,9 +1198,7 @@ export default function App() {
         })
       });
 
-      if (!response.ok) {
-        throw new Error("Link document extraction failed");
-      }
+      if (!response.ok) await failOn(response, "Link document extraction");
 
       const data = await response.json();
 
@@ -1382,8 +1431,10 @@ export default function App() {
       // Reset input
       e.target.value = "";
     } catch (err) {
-      console.error("Error extracting link document:", err);
-      alert("Failed to extract link document details. Please check the file and try again.");
+      // The old alert() said "check the file and try again", which sent the user
+      // hunting for a bad scan when the real cause was usually server-side
+      // (exhausted credits). The banner now names the actual cause.
+      reportFailure(err, "Link document extraction");
     } finally {
       setUploadingLinkDocument(false);
     }
@@ -1606,7 +1657,7 @@ export default function App() {
   // Trigger Step 4: AI Extraction (Sellers, Buyers, Property, Link Deeds)
   const triggerAIExtraction = async () => {
     setExtracting(true);
-    setError(null);
+    clearAiStatus();
     try {
       const docsToExtract = [
         ...aadhaarCards.map(c => ({ name: c.name, mimeType: c.mimeType, base64: c.base64 || "" })),
@@ -1619,9 +1670,7 @@ export default function App() {
         body: JSON.stringify({ documents: docsToExtract })
       });
 
-      if (!response.ok) {
-        throw new Error("Extraction API failed");
-      }
+      if (!response.ok) await failOn(response, "Document extraction");
 
       const data = await response.json();
       setExtractedDetails(data);
@@ -1681,60 +1730,21 @@ export default function App() {
       }, 1500);
 
     } catch (err: any) {
-      setError("AI Extraction failed. We have populated the step fields with preset mock data to allow you to continue the 10-step wizard.");
-      console.error(err);
-      // Mock some extracted details so they can still proceed
-      setExtractedDetails(getMockExtractedDetails());
+      // Do NOT advance to Step 4 and do NOT invent data. The old message claimed
+      // "preset mock data" had been loaded, which was only half true: the mock
+      // echoed the user's own typed fields but ALSO invented a link-deed number
+      // and execution date ("1204/1998", "14th August 1998") that would flow
+      // into a registrable deed. The user stays on this step, sees why, and can
+      // either retry or fill the fields in by hand.
+      reportFailure(err, "Document extraction", () => triggerAIExtraction());
     } finally {
       setExtracting(false);
     }
   };
 
-  const getMockExtractedDetails = () => {
-    return {
-      executants: [{
-        name: executantName,
-        relation: executantRelation,
-        age: executantAge,
-        aadhaar: executantAadhaar,
-        pan: executantPan,
-        dob: executantDOB,
-        address: executantAddress
-      }],
-      claimants: [{
-        name: claimantName,
-        relation: claimantRelation,
-        age: claimantAge,
-        aadhaar: claimantAadhaar,
-        pan: claimantPan,
-        dob: claimantDOB,
-        address: claimantAddress
-      }],
-      property: {
-        surveyNo: propertySurvey,
-        village: propertyVillage,
-        mandal: propertyMandal,
-        district: propertyDistrict,
-        state: "Telangana",
-        hNo: propertyHNo,
-        plotNo: propertyPlotNo,
-        ptiNo: propertyPTINo,
-        extentSqYards: propertyExtent,
-        plinthArea: propertyPlinth,
-        boundaries: {
-          east: boundaryEast,
-          west: boundaryWest,
-          north: boundaryNorth,
-          south: boundarySouth
-        }
-      },
-      linkDeed: {
-        deedNumber: linkDocuments[0]?.name?.includes("1998") ? "1204/1998" : "PP-5049/2010",
-        executionDate: "14th August 1998",
-        village: propertyVillage
-      }
-    };
-  };
+  // NOTE: getMockExtractedDetails() was DELETED here (44 lines). It mostly
+  // echoed the user's own typed fields, but also invented a link-deed number
+  // and execution date, and was presented as though extraction had succeeded.
 
   // Build the single consolidated "details" object used by document generation and
   // verification. Sourced from the Step-1 list rows (source of truth), falling back to
@@ -1894,6 +1904,10 @@ export default function App() {
     setTemplatesLoading(true);
     try {
       const res = await fetch("/api/templates");
+      // res.ok was never checked: the endpoint returns `{error, templates: []}`
+      // with HTTP 500 on failure, so an outage silently produced an EMPTY
+      // template list and a Step-3 picker with nothing in it and no explanation.
+      if (!res.ok) await failOn(res, "Loading the template library");
       const data = await res.json();
       const templates: ServerTemplate[] = data.templates || [];
       setServerTemplates(templates);
@@ -1905,8 +1919,7 @@ export default function App() {
         setSelectedTemplateId(match ? match.id : templates[0].id);
       }
     } catch (err) {
-      console.error("Failed to load templates:", err);
-      setError("Could not load the template library from the server.");
+      reportFailure(err, "Loading the template library", () => loadTemplates());
     } finally {
       setTemplatesLoading(false);
     }
@@ -1989,7 +2002,7 @@ export default function App() {
       return;
     }
     setFilling(true);
-    setError(null);
+    clearAiStatus();
     try {
       const details = buildConsolidatedDetails();
       const isCustom = selectedTemplateId === CUSTOM_TEMPLATE_ID;
@@ -2002,19 +2015,22 @@ export default function App() {
             : { templateId: selectedTemplateId, details }
         ),
       });
-      if (!res.ok) throw new Error(`Server responded ${res.status}`);
+      if (!res.ok) await failOn(res, "Document generation");
       const data = await res.json();
       setFilledDeedText(data.mergedText || "");
       setGeneratedDocxBase64(data.docxBase64 || "");
       setUnresolvedPlaceholders(data.unresolvedPlaceholders || []);
       setMergeMode(data.mergeMode || "");
+      // A CUSTOM upload asks for an AI merge; a library template is deterministic
+      // by design and the server sends no degradation flags for it. So this only
+      // reports when the AI leg was genuinely wanted and unavailable.
+      noteDegradation(data, "Document generation");
       // The generated document is now shown on Step 4 for review. When invoked
       // from the primary "Generate & Fill Document" action, continue straight to
       // the Re-Verify step so the button always moves the flow forward.
       if (advanceAfter) setCurrentStep(5);
     } catch (err: any) {
-      console.error("Document generation failed:", err);
-      setError("Failed to generate the document from the template. Please try again.");
+      reportFailure(err, "Document generation", () => generateDocument(advanceAfter));
     } finally {
       setFilling(false);
     }
@@ -2113,7 +2129,7 @@ export default function App() {
 
   const exportDocument = async (format: "docx" | "pdf") => {
     setExporting(format);
-    setError(null);
+    clearAiStatus();
     try {
       const nameForFile = (executantsList[0]?.name || executantName || "Deed").replace(/\s+/g, "_");
       // If a registration plan was generated, rasterise it so the server appends it
@@ -2154,7 +2170,7 @@ export default function App() {
           ...planFields,
         }),
       });
-      if (!res.ok) throw new Error(`Server responded ${res.status}`);
+      if (!res.ok) await failOn(res, `${format.toUpperCase()} export`);
       const data = await res.json();
 
       if (format === "pdf" && data.pdfUnavailable) {
@@ -2167,8 +2183,7 @@ export default function App() {
         downloadBase64(data.fileBase64, data.mimeType, `Sale_Deed_${nameForFile}.docx`);
       }
     } catch (err: any) {
-      console.error("Export failed:", err);
-      setError(`Failed to export ${format.toUpperCase()}. Please try again.`);
+      reportFailure(err, `${format.toUpperCase()} export`, () => exportDocument(format));
     } finally {
       setExporting("");
     }
@@ -2199,7 +2214,7 @@ export default function App() {
   // Trigger Step 7: Fill Extracted facts into Model Template Draft
   const autoFillTemplate = async () => {
     setFilling(true);
-    setError(null);
+    clearAiStatus();
     try {
       const template = MODEL_TEMPLATES.find(t => t.id === selectedModelId);
       const templateText = template ? template.templateText : customModelText;
@@ -2213,19 +2228,25 @@ export default function App() {
         body: JSON.stringify({ templateText, extractedDetails: details })
       });
 
-      if (!response.ok) {
-        throw new Error("Template fill failed");
-      }
+      if (!response.ok) await failOn(response, "Template auto-fill");
 
       const data = await response.json();
       setFilledDeedText(data.filledText);
-      
+      // The server may have filled this with its own local substitution engine
+      // rather than AI. The text is real either way (it is the user's template
+      // merged with the user's data), but the user must know AI phrasing/cleanup
+      // did not run so they review the wording before registering.
+      noteDegradation(data, "Template auto-fill");
+
       // Move to Step 6 (Re-Verify Deed)
       setCurrentStep(6);
     } catch (err: any) {
-      setError("Failed to auto-fill details via server API. Loaded a heuristic-filled template.");
-      console.error(err);
-      // Fallback
+      // Unlike extraction, this fallback INVENTS NOTHING — it merges the user's
+      // own details into the user's own selected template with local
+      // substitution. So we still proceed, but the banner says AI did not run.
+      const f = reportFailure(err, "Template auto-fill", () => autoFillTemplate());
+      setFailure(null);            // not blocking: a usable draft was produced
+      setDegraded(f);
       setFilledDeedText(localFillDeedHeuristics());
       setCurrentStep(6);
     } finally {
@@ -2335,6 +2356,7 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
 
     setPlanGenerating(true);
     setPlanError(null);
+    setDegraded(null);
 
     const consolidated = buildConsolidatedDetails();
     const currentProp: any = consolidated.property || {};
@@ -2374,9 +2396,7 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
         })
       });
 
-      if (!response.ok) {
-        throw new Error(`Plan generation failed (${response.status})`);
-      }
+      if (!response.ok) await failOn(response, "Plan generation");
 
       const data = await response.json();
       if (data.generatedImageBase64) {
@@ -2388,6 +2408,11 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       if (data.verificationReport) {
         setPlanVerificationReport(data.verificationReport);
       }
+      // The plan image is always rendered from the user's own form data, so a
+      // failed AI leg degrades rather than blocks. But it must be VISIBLE: this
+      // used to go to console.warn only, so the user saw a plan with no hint
+      // that the sketch was never read or the boundaries never cross-checked.
+      noteDegradation(data, "Plan generation");
       if (data.imageError) {
         console.warn("Plan generation notice:", data.imageError);
       }
@@ -2398,7 +2423,10 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
           "Plan generation timed out. Please try again, or upload a smaller/clearer photo of the sketch."
         );
       } else {
-        setPlanError(err.message || "Failed to generate computerized plot image.");
+        // Use the server's classified message rather than err.message, which for
+        // a non-2xx used to be the bare string "Plan generation failed (429)".
+        const f = toApiFailure(err, "Plan generation");
+        setPlanError(f.hint ? `${f.message} ${f.hint}` : f.message);
       }
     } finally {
       clearTimeout(timeoutId);
@@ -2428,7 +2456,7 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
   const triggerDeedVerificationAudit = async () => {
     setAuditing(true);
     setReport(null);
-    setError(null);
+    clearAiStatus();
     try {
       const response = await fetch("/api/verify", {
         method: "POST",
@@ -2446,18 +2474,22 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
         })
       });
 
-      if (!response.ok) {
-        throw new Error("Verification API failed");
-      }
+      // The server now hard-fails (429/503/504) instead of returning a verdict it
+      // did not compute, so this is the ONLY path that may set a report.
+      if (!response.ok) await failOn(response, "Deed verification");
 
       const data = await response.json();
       setReport(data);
       // Stay on Step 5 to present the verification report; the user advances to the
       // A4 preview via the "Proceed to Stamp Preview" button.
     } catch (err: any) {
-      setError("Deed auditing failed. Generating a heuristic audit card to review.");
-      console.error(err);
-      setReport(getHeuristicReportFallback());
+      // Show NO report at all. The previous fallback rendered a fabricated audit
+      // card — hardcoded names, ages and three invented "CRITICAL" discrepancies
+      // pattern-matched off the draft text — which is indistinguishable from a
+      // real audit on screen. On a document that gets registered, a plausible
+      // fake verdict is worse than no verdict.
+      setReport(null);
+      reportFailure(err, "Deed verification", () => triggerDeedVerificationAudit());
     } finally {
       setAuditing(false);
     }
@@ -2530,87 +2562,12 @@ const getTeluguRecommendation = (rec: string) => {
   return "";
 };
 
-  const getHeuristicReportFallback = (): any => {
-    const hasSrinivasaRao = filledDeedText.toLowerCase().includes("srinivasa rao");
-    const hasPlot15 = filledDeedText.toLowerCase().includes("plot no 15");
-    
-    if (hasSrinivasaRao || hasPlot15) {
-      return {
-        summary: {
-          status: "DISCREPANCY_FOUND",
-          sellersCount: 1,
-          discrepancyCount: 3,
-          message: "Offline Audit: Found spelling and property discrepancies!"
-        },
-        allDiscrepancies: [
-          {
-            category: "Names mismatch",
-            severity: "CRITICAL",
-            description: "Spelling variation: Draft has 'Ankem Srinivasa Rao' but Aadhaar has 'Ankem Srinivas'.",
-            descriptionTe: "పేరు అక్షరక్రమం తేడా: డ్రాఫ్ట్‌లో 'అంకెo శ్రీనివాసరావు' అని ఉంది, కానీ ఆధార్‌లో 'అంకెo శ్రీనివాస్' అని ఉంది.",
-            expected: "Ankem Srinivas",
-            found: "Ankem Srinivasa Rao",
-            recommendation: "Update name in draft to 'Ankem Srinivas' to match Aadhaar.",
-            recommendationTe: "ఆధార్ కార్డు ప్రకారం డ్రాఫ్ట్‌లోని పేరును 'అంకెo శ్రీనివాస్' గా సవరించండి."
-          },
-          {
-            category: "Property details mismatch",
-            severity: "CRITICAL",
-            description: "Plot Number Mismatch: Draft mentions Plot No 15 but original Link Deed mentions Plot No 12.",
-            descriptionTe: "ప్లాట్ నంబర్ తేడా: డ్రాఫ్ట్‌లో ప్లాట్ నంబర్ 15 అని ఉంది, కానీ ఒరిజినల్ లింక్ దస్తావేజులో ప్లాట్ నంబర్ 12 ఉంది.",
-            expected: "Plot No 12",
-            found: "Plot No 15",
-            recommendation: "Correct Plot No to '12'.",
-            recommendationTe: "డ్రాఫ్ట్‌లో ప్లాట్ నంబర్‌ను అసలు లింక్ దస్తావేజు ప్రకారం '12' గా సవరించండి."
-          },
-          {
-            category: "Link document numbers mismatch",
-            severity: "CRITICAL",
-            description: "Deed reference typo: Draft cites 2340/1998 but original deed is 2304/1998.",
-            descriptionTe: "లింక్ దస్తావేజు నంబర్ పొరపాటు: డ్రాఫ్ట్‌లో 2340/1998 అని ప్రస్తావించారు, కానీ ఒరిజినల్ దస్తావేజు నంబర్ 2304/1998.",
-            expected: "2304/1998",
-            found: "2340/1998",
-            recommendation: "Correct deed citation in the preamble to '2304/1998'.",
-            recommendationTe: "డ్రాఫ్ట్‌లో ప్రస్తావించిన లింక్ దస్తావేజు నంబర్‌ను '2304/1998' గా సరిచేయండి."
-          }
-        ],
-        sellers: [{
-          aadhaarName: "Ankem Srinivas",
-          draftName: "Ankem Srinivasa Rao",
-          status: "MISMATCH"
-        }],
-        property: {
-          status: "MISMATCH",
-          discrepancies: ["Plot number mismatch"]
-        },
-        linkDocumentVerification: {
-          status: "MISMATCH",
-          discrepancies: ["Deed number typo"]
-        }
-      };
-    }
-
-    return {
-      summary: {
-        status: "APPROVED",
-        sellersCount: 1,
-        discrepancyCount: 0,
-        message: "Offline Audit: Perfect match! All identity and survey details are verified."
-      },
-      allDiscrepancies: [],
-      sellers: [{
-        aadhaarName: executantName,
-        draftName: executantName,
-        status: "MATCH"
-      }],
-      property: {
-        status: "MATCH"
-      },
-      linkDocumentVerification: {
-        status: "MATCH"
-      }
-    };
-  };
+  // NOTE: getHeuristicReportFallback() was DELETED here (81 lines).
+  // It returned a hardcoded audit verdict — invented party names, ages,
+  // Aadhaar numbers and three fake CRITICAL discrepancies — selected by
+  // substring-matching the draft text ("srinivasa rao", "plot no 15").
+  // Rendered in the report card it was indistinguishable from a real audit.
+  // Verification now fails visibly instead of fabricating a verdict.
 
   // Step 10: Save Draft to localStorage Registry History
   const saveDraftToRegistry = () => {
@@ -2836,6 +2793,31 @@ const getTeluguRecommendation = (rec: string) => {
                   {currentStep === 7 && "Download the deed as an editable Microsoft Word (.docx) or PDF, or print it directly from this page."}
                 </p>
               </div>
+
+              {/* AI STATUS — the app previously called setError() from 23 places
+                  and rendered it NOWHERE, so any failure outside the plan step
+                  was completely silent: the spinner stopped, nothing appeared,
+                  and the user had no idea whether the step had worked. Both
+                  banners live here, directly under the step header, so the
+                  message shows up on whichever step raised it. */}
+              {failure && (
+                <AiStatusBanner
+                  failure={failure}
+                  severity="error"
+                  onRetry={retryAction ?? undefined}
+                  onDismiss={() => { setFailure(null); setError(null); }}
+                  className="mb-5"
+                />
+              )}
+              {degraded && (
+                <AiStatusBanner
+                  failure={degraded}
+                  severity="warning"
+                  title="Completed without AI — please review"
+                  onDismiss={() => setDegraded(null)}
+                  className="mb-5"
+                />
+              )}
 
               {/* STEP CONTENTS */}
               <AnimatePresence mode="wait">
@@ -4863,6 +4845,38 @@ const getTeluguRecommendation = (rec: string) => {
                           official Telangana stamp-paper layout.
                         </p>
                       </div>
+
+                      {/* TEMPLATE-LIBRARY STATUS.
+                          There is no manual library picker on this step — loadTemplates()
+                          auto-selects a template matching the property type. So when the
+                          load FAILS, selectedTemplateId stays "" and the Proceed button
+                          reads "Select a template first" with nothing on screen to select,
+                          which is an unexplained dead end. `templatesLoading` was tracked
+                          but never rendered, so the loading, failed and empty cases all
+                          looked identical. These two lines make each one distinguishable
+                          and point the user at the upload card below as a way forward. */}
+                      {templatesLoading ? (
+                        <div className="flex items-center gap-2 text-[11px] font-semibold text-slate-500 px-1">
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#0a4d4a]" />
+                          Loading the certified template library…
+                        </div>
+                      ) : serverTemplates.length === 0 ? (
+                        <div className="flex items-start gap-2 text-[11px] font-semibold text-amber-800 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2">
+                          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                          <span>
+                            The certified template library could not be loaded, so no template is pre-selected.
+                            You can still continue by uploading your own .docx template below.
+                            {failure?.retryable && retryAction && (
+                              <button
+                                onClick={retryAction}
+                                className="ml-1.5 underline font-extrabold text-[#0a4d4a] hover:text-[#0d5f5b] cursor-pointer"
+                              >
+                                Retry loading
+                              </button>
+                            )}
+                          </span>
+                        </div>
+                      ) : null}
 
                       {/* Bring-your-own: upload a custom .docx/.doc/.txt template */}
                       <div className={`p-4 rounded-xl border-2 transition-all ${selectedTemplateId === CUSTOM_TEMPLATE_ID ? "border-[#0a4d4a] bg-[#eef6f5] shadow-sm" : "border-dashed border-slate-300 bg-white"}`}>
