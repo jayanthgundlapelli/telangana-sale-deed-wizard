@@ -137,6 +137,105 @@ function paragraphHasContent(p: string): boolean {
   return /<w:(drawing|pict|object)\b/.test(p);
 }
 
+// ---------------------------------------------------------------------------
+// Remove COSMETIC manual line breaks from JUSTIFIED paragraphs.
+//
+// The templates were typed with <w:br/> at the wrap points of the ORIGINAL text
+// ("...,Aged <Executant | Age> years", "occu: <...>, R/o | <Address>"). Those are
+// not semantic breaks — they were only there to make the BLANK template look
+// tidy. Once real names and addresses of a different length are substituted, the
+// break lands mid-line, and because the paragraph is justified (w:jc="both")
+// Word stretches that now-short line to the full measure. The result is the
+// blown-apart word spacing seen in the rendered deed:
+//     occu:            Household,                 R/o
+//     5748        9790        9052,              Cell
+// Deleting the break lets the line reflow naturally and the gaps vanish.
+//
+// Strictly limited so nothing else moves:
+//   • ONLY paragraphs explicitly justified (w:jc="both"). Centered blocks such as
+//     the "SALE DEED / Market Value / Stamp of Rs." heading use breaks as real
+//     line separators and never stretch — touching them would collapse three
+//     centered lines into one.
+//   • A break that starts a new numbered clause, an ALL-CAPS heading, or a
+//     schedule/witness marker is STRUCTURAL and kept ("... except the Vendor/s.
+//     | 8. The Vendor/s hereby covenants ...").
+//   • A break at the very end of a paragraph is left alone.
+//   • Only <w:br/> elements are dropped; no <w:rPr>, <w:pPr> or run text is
+//     touched, so fonts, bold, size, colour, indents and margins are unchanged.
+// ---------------------------------------------------------------------------
+
+// Text following a break that means "a new block starts here", not "the line
+// happened to end here".
+const SEMANTIC_AFTER_BREAK =
+  /^(\d+[.)]\s|[IVX]+[.)]\s|[A-Z][A-Z][A-Z ,.'’\-]{4,}|SCHEDULE|WITNESS|IN FAVOUR|AND WHEREAS|WHEREAS|THIS DEED|WE DECLARE|DECLARATION|SIGN\b)/;
+
+export function unwrapJustifiedBreaks(filledXml: string): { xml: string; removed: number } {
+  let removed = 0;
+  const out = filledXml.replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, (para) => {
+    // Only justified paragraphs stretch. Anything else is left exactly as-is.
+    const pPr = /<w:pPr>[\s\S]*?<\/w:pPr>/.exec(para)?.[0] || "";
+    if (!/<w:jc w:val="both"\s*\/>/.test(pPr)) return para;
+    if (!/<w:br\b[^>]*\/>/.test(para)) return para;
+
+    // Walk the paragraph's <w:t> / <w:br/> sequence so we can see the text that
+    // FOLLOWS each break and judge whether the break carries structure.
+    const tokRe = /<w:t\b[^>]*>[\s\S]*?<\/w:t>|<w:t\s*\/>|<w:br\b[^>]*\/>/g;
+    const toks: { kind: "t" | "br"; raw: string; text: string; at: number }[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = tokRe.exec(para))) {
+      const raw = m[0];
+      if (raw.startsWith("<w:br")) {
+        toks.push({ kind: "br", raw, text: "", at: m.index });
+      } else {
+        const open = raw.match(/^<w:t\b[^>]*>/)![0];
+        const inner = raw.endsWith("/>") ? "" : raw.slice(open.length, raw.length - "</w:t>".length);
+        toks.push({ kind: "t", raw, text: decodeXml(inner), at: m.index });
+      }
+    }
+
+    // Decide each break, and whether dropping it would weld two words together.
+    // A manual break stood in for a space, so if neither side already carries
+    // whitespace we must substitute one ("R/o" + "H.No.1" -> "R/o H.No.1").
+    const drops = new Map<number, { raw: string; needsSpace: boolean }>();
+    for (let i = 0; i < toks.length; i++) {
+      if (toks[i].kind !== "br") continue;
+      let after = "";
+      for (let j = i + 1; j < toks.length && toks[j].kind === "t"; j++) after += toks[j].text;
+      const trimmed = after.replace(/^\s+/, "");
+      if (!trimmed) continue;                           // trailing break: leave it
+      if (SEMANTIC_AFTER_BREAK.test(trimmed)) continue;  // structural: keep it
+
+      let before = "";
+      for (let j = i - 1; j >= 0 && toks[j].kind === "t"; j--) before = toks[j].text + before;
+      const needsSpace = before !== "" && after !== "" && !/\s$/.test(before) && !/^\s/.test(after);
+      drops.set(toks[i].at, { raw: toks[i].raw, needsSpace });
+    }
+    if (!drops.size) return para;
+
+    // Single left-to-right splice: replace each chosen <w:br/> with either
+    // nothing or a space. Nothing else in the paragraph is rewritten.
+    //
+    // A <w:br/> sits INSIDE a <w:r>, alongside that run's <w:t> children, e.g.
+    //   <w:r><w:rPr>...</w:rPr><w:br/><w:t>years (DOB: ...</w:t></w:r>
+    // so the replacement must be a run-level CHILD, not a <w:r>. Emitting a
+    // <w:r> here would nest runs — invalid OOXML that Word and docx-preview
+    // silently drop, which welds the words together ("Aged 50years").
+    let result = "";
+    let cursor = 0;
+    for (const [at, { raw, needsSpace }] of drops) {
+      result += para.slice(cursor, at);
+      // A bare <w:t> is a legal sibling of <w:br/> and inherits the enclosing
+      // run's <w:rPr>, so the space matches the surrounding text exactly.
+      if (needsSpace) result += '<w:t xml:space="preserve"> </w:t>';
+      removed++;
+      cursor = at + raw.length;
+    }
+    result += para.slice(cursor);
+    return result;
+  });
+  return { xml: out, removed };
+}
+
 // Remove body paragraphs that our marker-removal EMPTIED, so the deed shows no
 // blank line where a value was missing. Paragraphs map 1:1 between the original
 // and filled XML (filling only edits <w:t> text and drops <w:br/>; it never adds
@@ -479,7 +578,12 @@ export function fillDocumentXml(
   // Remove any body paragraph our marker-removal left completely empty (a blank
   // line where a value was missing) — but never touch table cells, section
   // properties, or paragraphs that were already blank in the template.
-  const filledXml = collapseEmptiedParagraphs(xml, parts.join(""));
+  const collapsed = collapseEmptiedParagraphs(xml, parts.join(""));
+
+  // Now that real values are in place, drop the template's cosmetic line breaks
+  // so justified paragraphs reflow instead of stretching short lines.
+  const unwrapped = unwrapJustifiedBreaks(collapsed);
+  const filledXml = unwrapped.xml;
 
   // Plain-text preview: join t-node text; <w:br/> => newline; paragraph => blank line.
   const text = xmlToPlainText(filledXml);
