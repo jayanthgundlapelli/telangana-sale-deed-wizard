@@ -88,7 +88,7 @@ export const PLAN_EXTRACTION_SCHEMA: any = {
               description:
                 "Degrees CLOCKWISE from image-up that the north arrow points: 0 = up, 90 = right, 180 = down, 270 = left. Use 0 if the arrow points up or none is drawn.",
             },
-            found: { type: T.STRING, description: "'yes' if a north arrow/compass is actually drawn on the sketch, else 'no'." },
+            found: { type: T.STRING, description: "'yes' if north was determined (from a drawn arrow/compass OR an explicit N/side label), else 'no'. When 'no', the plan assumes the sketch is already north-up." },
           },
         },
         plot: {
@@ -250,18 +250,22 @@ Read the sketch and extract its content as STRUCTURED MEASUREMENTS — do NOT tr
 
 CRITICAL RULES:
 - IGNORE anything struck-off, crossed-out, scribbled, or signature squiggles. Do NOT transcribe them.
-- FIND THE NORTH ARROW / compass. Report which way it points as degrees clockwise from image-up in drawing.northDirection.imageClockDeg (0=up, 90=right, 180=down, 270=left), and set found to 'yes' or 'no'. If none is drawn, use 0 / 'no'.
+- ORIENT TO TRUE NORTH. The final plan is ALWAYS drawn with North pointing UP, so every direction you report must be TRUE compass, not "top of the page":
+    1. FIND THE NORTH ARROW / compass rose. Report which way its head points as degrees clockwise from image-up in drawing.northDirection.imageClockDeg (0=up, 90=right, 180=down, 270=left) and set found='yes'.
+    2. If there is NO arrow but a side is explicitly labelled "N"/"North"/"ఉత్తరం" (or a road/abutter names a compass side), infer north from that label and still set found='yes' with your best imageClockDeg.
+    3. Only if north truly cannot be determined, set imageClockDeg=0 and found='no' — then we assume the sketch is already north-up.
+  Decide each side's compass direction USING this north, so NORTH is genuinely the northern edge even if it was drawn sideways or upside-down.
 - For EACH boundary side of the plot, add an entry to drawing.plot.sides with:
-    • direction  = the COMPASS side it lies on (NORTH / SOUTH / EAST / WEST), decided using the north arrow above;
+    • direction  = the TRUE COMPASS side it lies on (NORTH / SOUTH / EAST / WEST), decided using the north arrow above;
     • lengthLabel = the dimension written on that edge, verbatim, keeping feet/inch marks (e.g. 48'-3", 66', 19'-9");
     • lengthFeet  = that dimension in decimal feet (48'-3" -> 48.25, 66' -> 66, 19'-9" -> 19.75);
     • neighbour   = the abutter named outside that side (e.g. "HOUSE OF CHAKALI CHANDRAVVA"), else empty.
-  Most plots have exactly 4 sides (NORTH, SOUTH, EAST, WEST). If a bearing/angle is written on an edge, put it in bearingDeg (clockwise from North), else 0.
+  Most plots have exactly 4 sides (NORTH, SOUTH, EAST, WEST). ALWAYS provide these sides with their directions (and lengths where written) — this measured, direction-tagged form is what lets us redraw the plot north-up; the polygon fallback below cannot be oriented reliably. If a bearing/angle is written on an edge, put it in bearingDeg (clockwise from North), else 0.
 - Set drawing.plot.shape to 'square' if all sides are about equal, 'rectangle' if opposite sides are equal, else 'trapezoid' or 'irregular'.
 - For EVERY road bordering the plot, add drawing.roads with its side (NORTH/SOUTH/EAST/WEST), its label verbatim ("40' ROAD"), and widthFeet in decimal feet so we can draw it to scale (a 40' road must read wider than a 12' road).
 - Put inner structures (TINSHED / R.C.C. / OPEN PLACE) in drawing.interiorStructures with real widthFeet/depthFeet if written (else 0) and a position keyword.
 - Copy the title, the property-description sentence, and each party block (DONOR/S, DONEE/S, VENDOR/S, VENDEE/S) verbatim into parties[]. Fill the AREA/PLINTH/SCALE table values if written, else leave empty strings.
-- Only if you truly cannot identify the sides, fall back to giving drawing.polygon (ordered corners, 0..1000 space) and drawing.labels.
+- Only if you truly cannot identify the sides, fall back to giving drawing.polygon (ordered corners, 0..1000 space) and drawing.labels — but note this traced shape is only used when a north arrow was found (found='yes'), because otherwise it cannot be oriented north-up. Prefer the direction-tagged sides above.
 
 Return ONLY the JSON matching the provided schema.`;
 
@@ -426,9 +430,61 @@ function closeTraverse(legs: { lengthFeet: number; bearingDeg: number }[]): Pt[]
   return pts.length >= 3 ? pts : null;
 }
 
+export interface PlanEdits {
+  title?: string;
+  /** Boundary neighbour text overrides, per cardinal direction. */
+  boundaries?: { N?: string; S?: string; E?: string; W?: string };
+  /** Hex colour for the property cross-hatch (e.g. from "shade the plot blue"). */
+  propertyColor?: string;
+  /** Any remaining instruction, drawn as a visible note so the prompt always takes effect. */
+  note?: string;
+}
+
 export interface RenderInput {
   plan?: any | null; // extracted sketch JSON (may be null)
   details?: any | null; // consolidated registration form details
+  /** Structured, deterministic edits parsed from the user's custom prompt. */
+  edits?: PlanEdits | null;
+}
+
+// Common colour words → hex, so a prompt like "shade the plot green" maps to a
+// concrete stroke colour for the deterministic renderer.
+const COLOR_WORDS: Record<string, string> = {
+  red: "#c0392b", blue: "#2563eb", green: "#1e8449", yellow: "#c9a227",
+  orange: "#d35400", brown: "#8b5a2b", black: "#000000", grey: "#6b7280",
+  gray: "#6b7280", purple: "#7e3ff2", pink: "#d81b8c", teal: "#0a4d4a",
+};
+
+// Turn a free-text plan prompt into deterministic edits the SVG renderer can
+// apply. Recognises: an explicit title, per-direction boundary neighbours, and a
+// property fill colour. Anything not matched is kept as a visible NOTE so the
+// user always sees their instruction reflected on the plan.
+export function parsePlanPrompt(prompt: string): PlanEdits {
+  const p = (prompt || "").trim();
+  if (!p) return {};
+  const edits: PlanEdits = {};
+
+  const titleM = p.match(/\btitle\s*[:=]\s*([^\n.;]+)/i);
+  if (titleM) edits.title = titleM[1].trim();
+
+  const boundaries: { N?: string; S?: string; E?: string; W?: string } = {};
+  const dirRe = /\b(north|south|east|west)\b\s*(?:side|boundary|bounded by|:|is|=|-)\s*([^,.;\n]+)/gi;
+  let bm: RegExpExecArray | null;
+  while ((bm = dirRe.exec(p))) {
+    const key = bm[1][0].toUpperCase() as "N" | "S" | "E" | "W";
+    const val = bm[2].trim();
+    if (val) (boundaries as any)[key] = val;
+  }
+  if (Object.keys(boundaries).length) edits.boundaries = boundaries;
+
+  const colorM = p.match(/\b(?:plot|land|property|schedule)\b[^.\n]*?\b(red|blue|green|yellow|orange|brown|black|grey|gray|purple|pink|teal)\b/i)
+    || p.match(/\b(red|blue|green|yellow|orange|brown|black|grey|gray|purple|pink|teal)\b[^.\n]*?\b(?:plot|land|property|hatch|shade)\b/i);
+  if (colorM) edits.propertyColor = COLOR_WORDS[colorM[1].toLowerCase()];
+
+  // Whatever the user wrote is retained as a note so ANY instruction visibly
+  // affects the output, even one the structured rules above did not capture.
+  edits.note = p.replace(/\s+/g, " ").slice(0, 220);
+  return edits;
 }
 
 // ---- main renderer ----------------------------------------------------------
@@ -437,6 +493,21 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   const d = input.details || {};
   const prop = d.property || {};
   const drawing = plan.drawing || {};
+  const edits = input.edits || {};
+
+  // Merge prompt-driven boundary overrides into the form boundaries BEFORE any
+  // downstream boundary/description/drawing logic reads them, so a "north side is
+  // 30 feet road" instruction flows through to the side labels and description.
+  if (edits.boundaries && Object.keys(edits.boundaries).length) {
+    const b = { ...(prop.boundaries || {}) };
+    if (edits.boundaries.N) b.north = edits.boundaries.N;
+    if (edits.boundaries.S) b.south = edits.boundaries.S;
+    if (edits.boundaries.E) b.east = edits.boundaries.E;
+    if (edits.boundaries.W) b.west = edits.boundaries.W;
+    prop.boundaries = b;
+  }
+  // Colour for the property cross-hatch (default matches the original teal-grey).
+  const hatchColor = edits.propertyColor || "#6b8b87";
 
   const W = 800;
   const H = 1131; // A4 portrait ratio
@@ -455,8 +526,8 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     `<defs>` +
       `<pattern id="propHatch" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
       `<rect width="10" height="10" fill="#ffffff"/>` +
-      `<line x1="0" y1="0" x2="0" y2="10" stroke="#6b8b87" stroke-width="0.6"/>` +
-      `<line x1="0" y1="0" x2="10" y2="0" stroke="#6b8b87" stroke-width="0.6"/>` +
+      `<line x1="0" y1="0" x2="0" y2="10" stroke="${hatchColor}" stroke-width="0.6"/>` +
+      `<line x1="0" y1="0" x2="10" y2="0" stroke="${hatchColor}" stroke-width="0.6"/>` +
       `</pattern>` +
       `</defs>`
   );
@@ -468,7 +539,7 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   let y = M + 46;
 
   // ---- Title ----
-  const title = (plan.title || "PLAN FOR REGISTRATION").toUpperCase();
+  const title = (edits.title || plan.title || "PLAN FOR REGISTRATION").toUpperCase();
   S.push(`<text x="${W / 2}" y="${y}" text-anchor="middle" font-size="27" font-weight="bold">${esc(title)}</text>`);
   const titleW = title.length * 27 * 0.6;
   S.push(`<line x1="${W / 2 - titleW / 2}" y1="${y + 5}" x2="${W / 2 + titleW / 2}" y2="${y + 5}" stroke="#000" stroke-width="1.2"/>`);
@@ -493,39 +564,58 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   }
   y += 10;
 
+  // ---- Instruction note ----
+  // Draw the user's custom instruction so the prompt ALWAYS visibly affects the
+  // plan, even when the structured rules above did not fully capture it.
+  if (edits.note) {
+    for (const ln of wrap("As per instruction: " + edits.note, contentW, 12)) {
+      S.push(`<text x="${contentX}" y="${y}" font-size="12" font-style="italic" fill="#334155">${esc(ln)}</text>`);
+      y += 16;
+    }
+    y += 8;
+  }
+
   // ---- Party paragraphs (role adapts to transaction type) ----
   const roles = partyRoleLabels(d.natureOfTransaction || d.propertyType);
   const sellers: any[] = Array.isArray(d.executants) ? d.executants : [];
   const buyers: any[] = Array.isArray(d.claimants) ? d.claimants : [];
 
-  const firstDetail =
-    sellers.map(personLine).filter(Boolean).join(" AND ") ||
-    (plan.parties || []).find((p: any) => /vendor|donor|mortgagor|lessor|first|releasor|settlor/i.test(p.role))?.detail ||
-    "";
-  const secondDetail =
-    buyers.map(personLine).filter(Boolean).join(" AND ") ||
-    (plan.parties || []).find((p: any) => /vendee|donee|mortgagee|lessee|second|releasee|settlee/i.test(p.role))?.detail ||
-    "";
+  const firstList =
+    sellers.map(personLine).filter(Boolean);
+  if (!firstList.length) {
+    const fb = (plan.parties || []).find((p: any) => /vendor|donor|mortgagor|lessor|first|releasor|settlor/i.test(p.role))?.detail;
+    if (fb) firstList.push(fb);
+  }
+  const secondList =
+    buyers.map(personLine).filter(Boolean);
+  if (!secondList.length) {
+    const fb = (plan.parties || []).find((p: any) => /vendee|donee|mortgagee|lessee|second|releasee|settlee/i.test(p.role))?.detail;
+    if (fb) secondList.push(fb);
+  }
 
-  const emitParty = (label: string, detail: string) => {
-    if (!detail) return;
+  // Render a party block: the role label prefixes the FIRST line, and when there
+  // is more than one executant/claimant each person starts on its OWN line.
+  const emitParty = (label: string, people: string[]) => {
+    const list = people.filter(Boolean);
+    if (!list.length) return;
     const labelTxt = `${label}: `;
     const labelW = labelTxt.length * 16 * 0.62;
-    const firstLineWidth = contentW - labelW;
-    const firstLine = wrap(detail, firstLineWidth, 16)[0] || "";
-    const rest = detail.slice(firstLine.length).trim();
     S.push(`<text x="${contentX}" y="${y}" font-size="16" font-weight="bold" text-decoration="underline">${esc(labelTxt)}</text>`);
-    S.push(`<text x="${contentX + labelW}" y="${y}" font-size="16">${esc(firstLine)}</text>`);
-    y += 21;
-    for (const ln of wrap(rest, contentW, 16)) {
-      if (!ln) continue;
-      S.push(`<text x="${contentX}" y="${y}" font-size="16">${esc(ln)}</text>`);
-      y += 21;
+    let firstPerson = true;
+    for (const person of list) {
+      const lines = wrap(person, firstPerson ? contentW - labelW : contentW, 16);
+      lines.forEach((ln, i) => {
+        if (!ln) return;
+        const x = firstPerson && i === 0 ? contentX + labelW : contentX;
+        S.push(`<text x="${x}" y="${y}" font-size="16">${esc(ln)}</text>`);
+        y += 21;
+      });
+      firstPerson = false;
     }
     y += 8;
   };
-  emitParty(roles.first, firstDetail);
-  emitParty(roles.second, secondDetail);
+  emitParty(roles.first, firstList);
+  emitParty(roles.second, secondList);
 
   // ================= DRAWING + TABLE ROW =================
   const rowTop = Math.max(y + 18, 300);
@@ -809,6 +899,13 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     const polyRaw: any[] = Array.isArray(drawing?.polygon) ? drawing.polygon.filter((p: any) => p && isFinite(p.x) && isFinite(p.y)) : [];
     const labels: any[] = Array.isArray(drawing?.labels) ? drawing.labels : [];
     const northClock = Number(drawing?.northDirection?.imageClockDeg) || 0;
+    // A traced polygon can only be trusted to sit north-up if we KNOW where north
+    // is (a north arrow was actually found). Without that reference, drawing the
+    // raw traced shape reproduces whatever rotation the sketch was drawn at — the
+    // "plan is not north-up" bug. So we only use the traced polygon when a north
+    // arrow was found (and rotate it upright by that arrow); otherwise we fall
+    // through to the boundary rectangle, which is north-up by construction.
+    const northFound = String(drawing?.northDirection?.found || "").toLowerCase() === "yes";
     // Rotate points so the sketch's north (northClock° cw from image-up) points up.
     const rot = (-northClock * Math.PI) / 180;
     const cxp = 500, cyp = 500;
@@ -818,7 +915,7 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     };
     const poly = polyRaw.map((p) => rotPt(p.x, p.y));
 
-    if (poly.length >= 3) {
+    if (poly.length >= 3 && northFound) {
       const xs = poly.map((p) => p.x), ys = poly.map((p) => p.y);
       const mnx = Math.min(...xs), mxx = Math.max(...xs), mny = Math.min(...ys), mxy = Math.max(...ys);
       const spanX = Math.max(1, mxx - mnx), spanY = Math.max(1, mxy - mny);
@@ -872,7 +969,7 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   const areaMtrsRaw = stripUnit(tbl.totalAreaSqMtrs || "");
   const areaMtrs =
     areaMtrsRaw ||
-    (areaYds && isFinite(parseFloat(areaYds)) ? (parseFloat(areaYds) * 0.836127).toFixed(2) : "");
+    (areaYds && isFinite(parseFloat(areaYds)) ? (parseFloat(areaYds) * 0.83612736).toFixed(4).replace(/\.?(0+)$/, "") : "");
   const plinthLabel = tbl.plinthLabel || plan.structureType || "";
   const plinthFts = stripUnit(tbl.plinthAreaSqFts || prop.plinthArea || "");
   const scale = tbl.scale || '1":20\'';

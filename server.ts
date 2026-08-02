@@ -6,10 +6,11 @@ import { execFile } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
-import { buildDeedDocx, mergePlaceholders, appendPlanPageToDocx } from "./documentBuilder";
+import { buildDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx } from "./documentBuilder";
 import { fillDocxTemplate, buildAngleFieldResolver } from "./templateFiller";
 import {
   renderPlanDataUrl,
+  parsePlanPrompt,
   PLAN_EXTRACTION_SCHEMA,
   PLAN_EXTRACTION_PROMPT,
   BOUNDARY_AUDIT_SCHEMA,
@@ -45,13 +46,62 @@ const Type = {
 dotenv.config({ path: '.env.local' });
 dotenv.config();
 
-// The Gemini model used for all extraction/verification calls. Overridable via env
-// so production can pick a cheaper tier (e.g. "gemini-2.5-flash" or
-// "gemini-2.5-flash-lite") without code changes. Defaults to gemini-3.5-flash.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+// The Gemini model used for all extraction/verification calls. Overridable via env.
+// Default is gemini-3.1-flash-lite: it is healthy (the previous default
+// gemini-3.5-flash is currently returning 503 "high demand"), it is a low-cost
+// "lite" tier, and — uniquely among the available lite models — it accepts
+// thinkingConfig:{thinkingBudget:0}, so we can turn OFF billed "thinking" tokens
+// for the mechanical OCR/extraction calls. For maximum extraction accuracy at
+// higher cost, set GEMINI_MODEL=gemini-3.6-flash (a full, healthy flash model).
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+
+// Ordered fallback models tried when the primary returns a transient overload
+// (HTTP 503 "high demand"). These are the models confirmed healthy for this key;
+// override with GEMINI_FALLBACK_MODELS (comma-separated) if yours differ. The
+// primary is always retried with backoff first.
+const GEMINI_FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS ||
+  "gemini-3.6-flash,gemini-3.5-flash-lite")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// Is this a transient model-overload / capacity error worth retrying or failing
+// over to another model? Matches Gemini's 503 UNAVAILABLE "high demand" shape.
+function isOverloadError(err: unknown): boolean {
+  const e = err as any;
+  const text = [
+    typeof e?.message === "string" ? e.message : "",
+    typeof e?.status === "string" ? e.status : "",
+    (() => { try { return JSON.stringify(e); } catch { return ""; } })(),
+  ].join(" ");
+  return /\b503\b|unavailable|overloaded|experiencing high demand|try again later/i.test(text);
+}
+
+// Is this a "that model doesn't exist / isn't available to this key" error (404)?
+function isModelUnavailableError(err: unknown): boolean {
+  const e = err as any;
+  const text = [typeof e?.message === "string" ? e.message : "",
+    (() => { try { return JSON.stringify(e); } catch { return ""; } })()].join(" ");
+  return /\b404\b|not_found|not found|no longer available|is not found|unsupported model/i.test(text);
+}
+
+// A 400 INVALID_ARGUMENT — most commonly (for this app) a model that does not
+// accept thinkingConfig. We use this to retry once with thinkingConfig stripped
+// so the SAME code works across models with and without thinking control.
+function isInvalidArgument(err: unknown): boolean {
+  const e = err as any;
+  const text = [typeof e?.message === "string" ? e.message : "",
+    (() => { try { return JSON.stringify(e); } catch { return ""; } })()].join(" ");
+  return /\b400\b|invalid_argument|invalid argument/i.test(text);
+}
 
 // Lazy initialization of the Gemini client to avoid crashes if the API key is missing.
 let aiClient: GoogleGenAI | null = null;
+// Models observed to reject thinkingConfig — so we stop sending it to them and
+// avoid a wasted 400 round-trip on every subsequent call.
+const noThinkingModels = new Set<string>();
 
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY;
@@ -67,6 +117,64 @@ function getGeminiClient(): GoogleGenAI | null {
         },
       },
     });
+
+    // Wrap generateContent ONCE so every endpoint is resilient:
+    //   • transient 503 "high demand" → retry the primary with exponential
+    //     backoff, then try each configured fallback model (skipping any that is
+    //     itself 404-unavailable, without letting its error mask the real 503);
+    //   • 400 caused by an unsupported thinkingConfig → strip it and retry the
+    //     same model once, remembering the model so we don't repeat the mistake.
+    // Any other error (auth, quota, genuine bad request) throws immediately.
+    const models: any = aiClient.models;
+    const orig = models.generateContent.bind(models);
+    const callOnce = async (params: any, model: string) => {
+      let p = { ...params, model };
+      if (noThinkingModels.has(model) && p.config?.thinkingConfig) {
+        p = { ...p, config: { ...p.config } };
+        delete p.config.thinkingConfig;
+      }
+      try {
+        return await orig(p);
+      } catch (e) {
+        // Unsupported thinkingConfig → strip and retry this model once.
+        if (isInvalidArgument(e) && p.config?.thinkingConfig) {
+          noThinkingModels.add(model);
+          const p2 = { ...p, config: { ...p.config } };
+          delete p2.config.thinkingConfig;
+          return await orig(p2);
+        }
+        throw e;
+      }
+    };
+    models.generateContent = async (params: any) => {
+      const chain = [params?.model || GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS]
+        .filter((m, i, a) => m && a.indexOf(m) === i);
+      let overloadErr: unknown = null;
+      let lastErr: unknown = null;
+      for (let ci = 0; ci < chain.length; ci++) {
+        const model = chain[ci];
+        const attempts = ci === 0 ? 4 : 1; // retry primary hard; try each fallback once
+        for (let a = 0; a < attempts; a++) {
+          try {
+            return await callOnce(params, model);
+          } catch (e) {
+            lastErr = e;
+            if (isOverloadError(e)) {
+              if (!overloadErr) overloadErr = e;
+              if (a < attempts - 1) await sleep(Math.min(8000, 800 * 2 ** a));
+            } else if (isModelUnavailableError(e) && ci > 0) {
+              break; // dead fallback model — skip, keep the overload error
+            } else {
+              throw e;
+            }
+          }
+        }
+        if (ci < chain.length - 1) {
+          console.warn(`[ai] model "${model}" overloaded (503); trying fallback "${chain[ci + 1]}"`);
+        }
+      }
+      throw overloadErr || lastErr;
+    };
   }
   return aiClient;
 }
@@ -302,7 +410,26 @@ function localFillTemplate(templateText: string, details: any): string {
     "{{PROPERTY_PLOT}}": prop.plotNo || "",
     "{{PROPERTY_PTI}}": prop.ptiNo || "",
     "{{PROPERTY_EXTENT}}": prop.extentSqYards || "",
+    "{{PROPERTY_EXTENT_SQ_METERS}}": prop.extentSqMeters || "",
     "{{PROPERTY_PLINTH}}": prop.plinthArea || "",
+    "{{PROPERTY_LOCALITY}}": prop.locality || prop.demoLocality || prop.partLocality || prop.flatLocality || "",
+    "{{PROPERTY_ADJACENT_HNO}}": prop.adjacentHNo || "",
+    "{{PROPERTY_MARKET_VALUE_PER_SQ_YARD}}": prop.marketValuePerSqYard || "",
+    "{{HOUSE_NATURE}}": prop.houseNature || "",
+    "{{HOUSE_FLOORS}}": prop.houseFloors || "",
+    "{{HOUSE_AGE}}": prop.houseAge || "",
+    "{{HOUSE_TAP_CONNECTION}}": prop.houseTapConnection || prop.demoTapConnection || prop.flatTapConnection || "",
+    "{{HOUSE_METERS_NO}}": prop.houseMetersNo || prop.demoMetersNo || prop.flatMetersNo || "",
+    "{{HOUSE_TAXES}}": prop.houseTaxes || prop.flatTaxes || "",
+    "{{HOUSE_RENTAL_VALUE}}": prop.houseRentalValue || prop.flatRentalValue || "",
+    "{{FLAT_NO}}": prop.flatNo || "",
+    "{{FLAT_BUILDING_NAME}}": prop.flatBuildingName || "",
+    "{{FLAT_FLOOR}}": prop.flatFloorS || "",
+    "{{FLAT_UDS_SQ_YARDS}}": prop.flatUndividedSqYards || "",
+    "{{FLAT_UDS_SQ_METERS}}": prop.flatUndividedSqMeters || "",
+    "{{FLAT_VALUE_PER_SQ_FEET}}": prop.flatValuePerSqFeet || "",
+    "{{FLAT_MARKET_VALUE_TOTAL}}": prop.flatMarketValueTotal || "",
+    "{{FLAT_TOTAL_LAND}}": prop.flatTotalLand || "",
     "{{BOUNDARY_EAST}}": bounds.east || "",
     "{{BOUNDARY_WEST}}": bounds.west || "",
     "{{BOUNDARY_NORTH}}": bounds.north || "",
@@ -328,7 +455,11 @@ function generateRule3MarketValueTable(details: any): string {
   
   const ptiVal = prop.vltPtiNo || prop.ptiNo || "";
   const ratePerYd = prop.marketValuePerSqYard ? `Rs. ${prop.marketValuePerSqYard}/- per Sq.Yard` : (prop.flatValuePerSqFeet ? `Rs. ${prop.flatValuePerSqFeet}/- per Sq.Ft` : "As per Basic Valuation Register");
-  const extentStr = prop.extentSqYards ? `${prop.extentSqYards} Sq.Yards (${prop.extentSqMeters || (Number(prop.extentSqYards)*0.836127).toFixed(2)} Sq.Mtrs)` : (prop.plinthArea ? `Plinth: ${prop.plinthArea}` : "As specified");
+  const yardsMatch = String(prop.extentSqYards || "").replace(/,/g, "").match(/\d+(?:\.\d+)?/);
+  const calculatedSqMetres = yardsMatch
+    ? (Number(yardsMatch[0]) * 0.83612736).toFixed(4).replace(/\.?(0+)$/, "")
+    : "";
+  const extentStr = prop.extentSqYards ? `${prop.extentSqYards} Sq.Yards (${prop.extentSqMeters || calculatedSqMetres} Sq.Mtrs)` : (prop.plinthArea ? `Plinth: ${prop.plinthArea}` : "As specified");
   
   const descParts = [
     prop.surveyNo ? `Survey No: ${prop.surveyNo}` : "",
@@ -378,11 +509,19 @@ function regexCleanDraft(text: string): string {
   cleaned = cleaned.replace(/_{2,}/g, "");
 
   // 3. Clean dangling labels when empty
-  // e.g. "and PAN ,", "PAN : ,", "PTI No: ,", "Door No: ,", "S/o ,"
-  cleaned = cleaned.replace(/(?:,\s*|\sand\s*)(?:PAN|Aadhaar|Aadhaar\s*No|Cell|Cell\s*No|Phone|PTI|PTI\s*No|VLT|VLT\/PTI\s*No|Door\s*No|H\.No|Pincode|Plinth|Plinth\s*Area)\s*[\:\-]?\s*(?=[,\.\;\n]|$)/gi, "");
+  // e.g. "and PAN ,", "PAN : ,", "PTI No: ,", "Door No: ,", "Plot No ,", "Survey No ,"
+  // Covers the property-schedule labels too, so an unsupplied Plot/Survey/Layout
+  // number does not leave "Plot No ," stranded in the deed.
+  cleaned = cleaned.replace(/(?:,\s*|\sand\s*)(?:PAN|Aadhaar|Aadhaar\s*No|Cell|Cell\s*No|Phone|PTI|PTI\s*No|VLT|VLT\/PTI\s*No|Door\s*No|H\.No|Pincode|Plinth|Plinth\s*Area|Plot\s*No|Survey\s*No|Layout(?:\s*File)?\s*No|Sub[\s-]*Registrar(?:\s*Code)?|Nala(?:\s*Order)?(?:\s*No)?|Locality|House\s*Tax(?:\s*Receipt)?)\s*[\:\-]?\s*(?=[,\.\;\n]|$)/gi, "");
 
   // 4. Clean orphan relations like "S/o ," or "W/o ,"
   cleaned = cleaned.replace(/\b(S\/o|W\/o|D\/o|C\/o|R\/o)\s*[\,\.\;]/gi, "");
+
+  // 4b. Clean dangling prepositional phrases whose value was empty, e.g.
+  // "with a plinth area of ,", "with plinth area of .", "with a plinth area of and".
+  // These come from template phrasings like "admeasuring X with a plinth area of {{PLINTH}}".
+  cleaned = cleaned.replace(/\bwith\s+(?:a\s+)?plinth\s+area\s+of\s*(?=[,\.\;\n]|and\b|$)/gi, "");
+  cleaned = cleaned.replace(/\bwith\s+(?:a\s+)?plinth\s+area\s*(?=[,\.\;\n]|$)/gi, "");
 
   // 5. Clean punctuation anomalies: duplicate commas, comma before period, dangling commas before newlines
   cleaned = cleaned.replace(/\,\s*\,/g, ",");
@@ -404,15 +543,20 @@ function buildPlaceholderMap(details: any): Record<string, string> {
   const bounds = prop.boundaries || {};
   const link = d.linkDeed || {};
 
-  const joinNames = (arr: any[]) => arr.map((x) => x?.name).filter(Boolean).join(", ");
+  // Party NAMES are rendered in CAPITALS (a registration convention) and, when
+  // there is more than one executant/claimant, each goes on its OWN line so the
+  // deed lists them stacked rather than comma-run-on. Single-party deeds are
+  // unaffected (a one-element join produces no newline).
+  const joinNames = (arr: any[]) =>
+    arr.map((x) => (x?.name || "").toUpperCase().trim()).filter(Boolean).join("\n");
   const joinAadhaar = (arr: any[]) => arr.map((x) => x?.aadhaar).filter(Boolean).join(", ");
   const joinAges = (arr: any[]) =>
     arr.map((x) => (x?.age ? `${x.age} Years` : "")).filter(Boolean).join(", ");
-  const joinAddr = (arr: any[]) => arr.map((x) => x?.address).filter(Boolean).join("; ");
+  const joinAddr = (arr: any[]) => arr.map((x) => x?.address).filter(Boolean).join("\n");
   const joinRel = (arr: any[]) => arr.map((x) => x?.relation).filter(Boolean).join(", ");
   const joinPan = (arr: any[]) => arr.map((x) => x?.pan).filter(Boolean).join(", ");
 
-  const vltPti = prop.vltPtiNo || prop.ptiNo || "";
+  const vltPti = prop.ptiNo || prop.vltPtiNo || "";
 
   return {
     "{{REGISTRATION_DATE}}": d.registrationDate || "",
@@ -441,6 +585,7 @@ function buildPlaceholderMap(details: any): Record<string, string> {
     "{{PROPERTY_PLOT}}": prop.plotNo || "",
     "{{PROPERTY_PTI}}": vltPti,
     "{{PROPERTY_VLT_PTI}}": vltPti,
+    "{{PROPERTY_BLT_NO}}": prop.bltNo || "",
     "{{PROPERTY_EXTENT}}": prop.extentSqYards || "",
     "{{PROPERTY_PLINTH}}": prop.plinthArea || "",
     "{{BOUNDARY_EAST}}": bounds.east || "",
@@ -449,10 +594,111 @@ function buildPlaceholderMap(details: any): Record<string, string> {
     "{{BOUNDARY_SOUTH}}": bounds.south || "",
     "{{LINK_DEED_NO}}": link.deedNumber || "",
     "{{LINK_DEED_DATE}}": link.executionDate || "",
+    "{{LINK_DEED_TYPE}}": link.docType || link.type || "",
+    "{{SUB_REGISTRAR}}": link.subRegistrar || link.village || "",
+    "{{SUB_REGISTRAR_CODE}}": link.subRegistrarCode || "",
     "{{PATTADAR_PASSBOOK_NO}}": link.pattadarPassbookNo || "",
     "{{PASSBOOK_KHATA_NO}}": link.passbookKhataNo || "",
+    "{{LAYOUT_FILE_NO}}": link.layoutFileNo || "",
+    "{{NALA_ORDER_NO}}": link.nalaOrderNo || "",
+    "{{HOUSE_TAX_RECEIPT}}": link.houseTaxReceipt || "",
     "{{STATEMENT_OF_MARKET_VALUE_TABLE}}": generateRule3MarketValueTable(details),
   };
+}
+
+// Existing library .docx files may predate the SRO-code placeholder. Keep the
+// entered registration reference in the generated deed even when its source
+// template has not yet been updated with {{SUB_REGISTRAR_CODE}}.
+function addMissingLinkRegistrationReference(templateText: string, details: any): string {
+  const link = details?.linkDeed || {};
+  if (!String(link.subRegistrarCode || "").trim()) return templateText;
+  if (/sub[\s-]*registrar[\s-]*code|sro[\s-]*code/i.test(templateText)) {
+    return templateText;
+  }
+
+  const reference =
+    "LINK DOCUMENT REGISTRATION REFERENCE:\n" +
+    "Sub-Registrar Office: {{SUB_REGISTRAR}}\n" +
+    "SRO Code: {{SUB_REGISTRAR_CODE}}\n\n";
+  const insertion = templateText.search(/^(?:NOW THIS DEED|SCHEDULE OF)/im);
+  return insertion === -1
+    ? `${templateText.trim()}\n\n${reference}`
+    : `${templateText.slice(0, insertion)}${reference}${templateText.slice(insertion)}`;
+}
+
+// The certified library templates contain only the common deed fields. Append a
+// factual schedule for any additional Step-1 values so type-specific property,
+// jurisdiction and secondary-row data always survive into the final document.
+// Uploaded templates remain untouched because their author controls the layout.
+function addMissingFormDetailsSchedule(templateText: string, details: any): string {
+  const d = details || {};
+  const properties = Array.isArray(d.properties) && d.properties.length ? d.properties : [d.property || {}];
+  const jurisdictions = Array.isArray(d.jurisdictions) ? d.jurisdictions : [];
+  const linkDocuments = Array.isArray(d.linkDocuments) && d.linkDocuments.length ? d.linkDocuments : [d.linkDeed || {}];
+  const fieldLabel: Record<string, string> = {
+    propertyType: "Property Type", extentSqMeters: "Extent in Sq. Metres", adjacentHNo: "Adjacent H. No.", bltNo: "BLT No.", ptiNo: "PTI No.",
+    locality: "Locality", marketValuePerSqYard: "Market Value per Sq. Yard", houseBearingHNo: "House Bearing H. No.",
+    houseNature: "Nature of House", houseFloors: "Floors", housePlinthArea: "House Plinth Area", houseAge: "Age of House",
+    houseTapConnection: "Tap Connection No.", houseMetersNo: "Meter No.", houseTaxes: "Taxes Per Annum", houseRentalValue: "Annual Rental Value",
+    demoBearingHNo: "Demolished House Bearing H. No.", demoLocality: "Demolished House Locality", demoTapConnection: "Demolished House Tap Connection", demoMetersNo: "Demolished House Meter No.",
+    partBearingHNo: "Part-Open-Place Bearing H. No.", partLocality: "Part-Open-Place Locality", flatNo: "Flat No.",
+    flatUndividedSqYards: "Undivided Share in Sq. Yards", flatUndividedSqMeters: "Undivided Share in Sq. Metres", flatBearingHNo: "Flat Bearing H. No.",
+    flatNature: "Nature of Flat", flatLocality: "Flat Locality", flatValuePerSqFeet: "Flat Value per Sq. Ft.", flatMarketValueTotal: "Flat Market Value Total",
+    flatAge: "Age of Flat", flatTapConnection: "Flat Tap Connection", flatMetersNo: "Flat Meter No.", flatTaxes: "Flat Taxes Per Annum",
+    flatRentalValue: "Flat Annual Rental Value", flatBuildingName: "Building Name", flatNearHNo: "Flat Near H. No.", flatFloorS: "Floor", flatPlinthArea: "Flat Plinth Area", flatTotalLand: "Total Land",
+  };
+  const propertyLines = properties.flatMap((property: any, index: number) => {
+    const rows = Object.entries(fieldLabel)
+      .filter(([key]) => String(property?.[key] || "").trim())
+      .map(([key, label]) => `${label}: ${property[key]}`);
+    return rows.length ? [`PROPERTY ${index + 1} ADDITIONAL DETAILS:`, ...rows, ""] : [];
+  });
+  const jurisdictionLines = jurisdictions.flatMap((jurisdiction: any, index: number) => {
+    const rows = [
+      ["District Registrar", jurisdiction.districtRegistrar], ["Sub-Registrar", jurisdiction.subRegistrar],
+      ["District", jurisdiction.district], ["Mandal", jurisdiction.mandal], ["Village", jurisdiction.village], ["Pincode", jurisdiction.pincode],
+    ].filter(([, value]) => String(value || "").trim()).map(([label, value]) => `${label}: ${value}`);
+    return rows.length ? [`JURISDICTION ${index + 1}:`, ...rows, ""] : [];
+  });
+  const linkLines = linkDocuments.slice(1).flatMap((link: any, index: number) => {
+    const rows = [
+      ["Layout File No.", link.layoutFileNo], ["Link Document Type", link.linkDocType || link.docType || link.type], ["Link Document No.", link.linkDocNo || link.deedNumber],
+      ["Link Document Date", link.linkDocDate || link.executionDate], ["Sub-Registrar", link.subRegistrar || link.village],
+      ["SRO Code", link.subRegistrarCode], ["Pattadar Passbook No.", link.pattadarPassbookNo],
+      ["Passbook Khata No.", link.passbookKhataNo], ["NALA Order No.", link.nalaOrderNo], ["House Tax Receipt", link.houseTaxReceipt],
+    ].filter(([, value]) => String(value || "").trim()).map(([label, value]) => `${label}: ${value}`);
+    return rows.length ? [`LINK DOCUMENT ${index + 2}:`, ...rows, ""] : [];
+  });
+  const schedule = [...propertyLines, ...jurisdictionLines, ...linkLines];
+  return schedule.length ? `${templateText.trim()}\n\nADDITIONAL REGISTRATION FORM DETAILS:\n${schedule.join("\n")}` : templateText;
+}
+
+function registrationDetailsLines(details: any): string[] {
+  const d = details || {};
+  const properties = Array.isArray(d.properties) && d.properties.length ? d.properties : [d.property || {}];
+  const jurisdictions = Array.isArray(d.jurisdictions) ? d.jurisdictions : [];
+  const links = Array.isArray(d.linkDocuments) && d.linkDocuments.length ? d.linkDocuments : [d.linkDeed || {}];
+  const lines: string[] = [];
+  const append = (heading: string, source: any, labels: Record<string, string>) => {
+    const values = Object.entries(labels)
+      .map(([key, label]) => [label, source?.[key]] as const)
+      .filter(([, value]) => String(value || "").trim());
+    if (values.length) lines.push(heading, ...values.map(([label, value]) => `${label}: ${value}`), "");
+  };
+  properties.forEach((property: any, index: number) => append(`PROPERTY ${index + 1}:`, property, {
+    propertyType: "Property Type", plotNo: "Plot No.", surveyNo: "Survey No.", nearHNo: "Near H. No.", adjacentHNo: "Adjacent H. No.", locality: "Locality", pincode: "Pincode", vltPtiNo: "VLT/PTI No.", ptiNo: "PTI No.", bltNo: "BLT No.",
+    extentSqYards: "Extent in Sq. Yards", extentSqMeters: "Extent in Sq. Metres", marketValuePerSqYard: "Market Value per Sq. Yard", marketValueTotal: "Market Value Total",
+    houseBearingHNo: "House Bearing H. No.", houseNature: "Nature of House", houseFloors: "Floors", housePlinthArea: "House Plinth Area", houseAge: "Age of House", houseTapConnection: "Tap Connection", houseMetersNo: "Meter No.", houseTaxes: "Taxes Per Annum", houseRentalValue: "Annual Rental Value",
+    demoBearingHNo: "Demolished House Bearing H. No.", demoLocality: "Demolished House Locality", demoTapConnection: "Demolished House Tap Connection", demoMetersNo: "Demolished House Meter No.",
+    partBearingHNo: "Part-Open-Place Bearing H. No.", partLocality: "Part-Open-Place Locality", flatNo: "Flat No.", flatUndividedSqYards: "Undivided Share in Sq. Yards", flatUndividedSqMeters: "Undivided Share in Sq. Metres", flatBearingHNo: "Flat Bearing H. No.", flatNature: "Nature of Flat", flatLocality: "Flat Locality", flatValuePerSqFeet: "Flat Value per Sq. Ft.", flatMarketValueTotal: "Flat Market Value Total", flatAge: "Age of Flat", flatTapConnection: "Flat Tap Connection", flatMetersNo: "Flat Meter No.", flatTaxes: "Flat Taxes Per Annum", flatRentalValue: "Flat Annual Rental Value", flatBuildingName: "Building Name", flatNearHNo: "Flat Near H. No.", flatFloorS: "Floor", flatPlinthArea: "Flat Plinth Area", flatTotalLand: "Total Land",
+  }));
+  jurisdictions.forEach((jurisdiction: any, index: number) => append(`JURISDICTION ${index + 1}:`, jurisdiction, {
+    districtRegistrar: "District Registrar", subRegistrar: "Sub-Registrar", district: "District", mandal: "Mandal", village: "Village", pincode: "Pincode",
+  }));
+  links.forEach((link: any, index: number) => append(`LINK DOCUMENT ${index + 1}:`, link, {
+    layoutFileNo: "Layout File No.", linkDocType: "Link Document Type", docType: "Link Document Type", type: "Link Document Type", linkDocNo: "Link Document No.", linkDocDate: "Link Document Date", deedNumber: "Link Document No.", executionDate: "Link Document Date", subRegistrar: "Sub-Registrar", subRegistrarCode: "SRO Code", pattadarPassbookNo: "Pattadar Passbook No.", passbookKhataNo: "Passbook Khata No.", nalaOrderNo: "NALA Order No.", houseTaxReceipt: "House Tax Receipt",
+  }));
+  return lines;
 }
 
 // AI-assisted fill for USER-SUPPLIED templates. A custom template the user uploads
@@ -517,6 +763,7 @@ ${templateText}`;
           "You are a senior Telangana registration deed drafter. Your mandatory duties are: 1. Preserve the supplied template's exact formatting style, setup layout, margins, paper size, fonts, font sizes, text alignment, headers, footers, padding, bullet/list formats, tables, and page breaks verbatim. 2. NEVER include any placeholder dashes, underscores (____), dashes (---), bracketed slots, or empty underlines anywhere in the final text. If any field or detail is not supplied in DATA, smoothly omit that unsupplied field or phrase so the document text is registered cleanly without placeholders. Return ONLY the final deed text with no markdown fences or commentary.",
         temperature: 0,
         maxOutputTokens: 16384,
+        thinkingConfig: { thinkingBudget: 0 },
       },
     }),
     AI_TIMEOUT_MS,
@@ -625,6 +872,7 @@ ${draftText}`;
               systemInstruction: "You are a professional legal deed editor. Remove leftover empty placeholders and auto-adjust preceding sentence phrases smoothly so the legal document flows naturally. Do not invent fake data.",
               temperature: 0,
               maxOutputTokens: 16384,
+              thinkingConfig: { thinkingBudget: 0 },
             },
           }),
           AI_TIMEOUT_MS,
@@ -695,6 +943,11 @@ app.post("/api/generate-document", async (req, res) => {
       try {
         const { resolve } = buildAngleFieldResolver(details);
         const filled = await fillDocxTemplate(customTemplateDocxBase64, resolve, { open: "<", close: ">" });
+        const filledBuffer = await appendRegistrationDetailsPageToDocx(
+          filled.buffer,
+          "ADDITIONAL REGISTRATION FORM DETAILS",
+          registrationDetailsLines(details)
+        );
         return res.json({
           templateId: "custom-upload",
           templateName: customTemplateName || "Custom Uploaded Template",
@@ -702,7 +955,7 @@ app.post("/api/generate-document", async (req, res) => {
           mergedText: filled.text,
           unresolvedPlaceholders: filled.unresolved,
           replacedCount: filled.replaced,
-          docxBase64: filled.buffer.toString("base64"),
+          docxBase64: filledBuffer.toString("base64"),
           format: { preserved: true, source: "uploaded-template" },
         });
       } catch (e: any) {
@@ -724,6 +977,14 @@ app.post("/api/generate-document", async (req, res) => {
         return res.status(404).json({ error: `Template '${templateId}' not found.` });
       }
       resolvedName = getTemplateMeta(templateId)?.name || templateId;
+    }
+
+    // The committed library templates were created before SRO-code support.
+    // Add a marker-based reference only for those older templates so the value
+    // is carried forward without changing any user-uploaded document.
+    if (!custom) {
+      templateText = addMissingLinkRegistrationReference(templateText, details);
+      templateText = addMissingFormDetailsSchedule(templateText, details);
     }
 
     // Merge the consolidated facts into the template.
@@ -765,6 +1026,12 @@ app.post("/api/generate-document", async (req, res) => {
 
     // Detect any placeholders that were left unresolved (surfaced to the user/verify step).
     const unresolved = Array.from(new Set((mergedText.match(/{{[^}]+}}/g) || [])));
+
+    // Remove any leftover empty placeholders and the now-dangling static labels
+    // they leave behind (e.g. an unsupplied Plot No leaving "Plot No ,"), and
+    // re-join the surrounding punctuation so the schedule reads grammatically.
+    // Done AFTER unresolved-detection so the UI can still warn about missing data.
+    mergedText = regexCleanDraft(mergedText);
 
     const docxBuffer = await buildDeedDocx(mergedText);
 
@@ -823,6 +1090,8 @@ app.post("/api/export-document", async (req, res) => {
       planImagePngBase64,
       planImageWidthPx,
       planImageHeightPx,
+      // Uploaded Aadhaar/PAN card images, appended as ONE page after the plan.
+      aadhaarImages,
     } = req.body || {};
 
     // Plan image (already rasterised on the client). Appended as the LAST page of
@@ -880,21 +1149,39 @@ app.post("/api/export-document", async (req, res) => {
     } else {
       // ── FALLBACK PATH: rebuild from text (library templates / no upload) ──────
       let mergedText: string = typeof finalText === "string" ? finalText : "";
+      let builtFromTemplate = false;
       if (!mergedText && templateId) {
         const templateText = await getTemplateText(templateId);
         if (templateText == null) {
           return res.status(404).json({ error: `Template '${templateId}' not found.` });
         }
         mergedText = mergePlaceholders(templateText, buildPlaceholderMap(details));
+        builtFromTemplate = true;
       }
       if (!mergedText) {
         return res.status(400).json({ error: "finalText, templateDocxBase64, or templateId is required." });
       }
+      // Strip leftover empty placeholders/labels (e.g. a stranded "Plot No ,") only
+      // when WE built the text from a template. A user's hand-edited finalText is
+      // left exactly as typed so their edits are never silently rewritten.
+      if (builtFromTemplate) mergedText = regexCleanDraft(mergedText);
       docxBuffer = await buildDeedDocx(mergedText, {
         planImagePngBase64: planImg,
         planImageWidthPx: planW,
         planImageHeightPx: planH,
       });
+    }
+
+    // Append the uploaded Aadhaar/PAN card images as ONE final page, AFTER the
+    // deed and the plan page. Best-effort: any failure leaves the deed intact.
+    if (Array.isArray(aadhaarImages) && aadhaarImages.length > 0) {
+      try {
+        docxBuffer = await appendImagesPageToDocx(docxBuffer, aadhaarImages, {
+          pageTitle: "UPLOADED IDENTITY DOCUMENTS (AADHAAR / PAN)",
+        });
+      } catch (e: any) {
+        console.warn("Failed to append Aadhaar images page:", e?.message || e);
+      }
     }
 
     if (format === "pdf") {
@@ -1152,7 +1439,11 @@ app.post("/api/extract", async (req, res) => {
           systemInstruction: "You are an expert Indian land registrar document extractor. Translate any Telugu names/properties to English text character-by-character.",
           responseMimeType: "application/json",
           responseSchema: extractSchema,
-          temperature: 0.1
+          temperature: 0.1,
+          maxOutputTokens: 4096,
+          // Mechanical extraction — no reasoning needed. Turning thinking off cuts
+          // billed thought tokens (stripped automatically for models that reject it).
+          thinkingConfig: { thinkingBudget: 0 }
         }
       }),
       AI_TIMEOUT_MS,
@@ -1210,7 +1501,7 @@ Fields:
 - mobile: mobile number if printed, else ""
 - dob: date of birth exactly as the digits are printed (keep the same day, month, year)
 - aadhaarNo: the 12-digit number, formatted "XXXX XXXX XXXX"
-- address: the residential address block if printed (CRITICAL: exclude any S/O, W/O, D/O, or C/O prefix or relation/father/husband name from address, return ONLY the door/house no, street, village, mandal, district, pincode), else ""
+- address: the residential address block if printed (CRITICAL: exclude any S/O, W/O, D/O, or C/O prefix or relation/father/husband name from address, return ONLY the place-of-residence — include the door/house no, street, LOCALITY/AREA/COLONY/NAGAR, village, mandal, district, pincode exactly as printed; do NOT drop the locality/area line), else ""
 - district, state, pincode: only if clearly present in the printed address, else ""
 - leave occupation and age as "" (computed elsewhere)
 
@@ -1354,6 +1645,7 @@ app.post("/api/extract-link-document", async (req, res) => {
             extentSqMeters: { type: Type.STRING, description: "Property extent in square meters" },
             locality: { type: Type.STRING },
             pincode: { type: Type.STRING, description: "Pincode of property location e.g. 508211" },
+            ptiNo: { type: Type.STRING, description: "PTI/property-tax identification number. Extract when the link document identifies a house property; otherwise return an empty string." },
             marketValuePerSqYard: { type: Type.STRING },
             marketValueTotal: { type: Type.STRING },
             house: {
@@ -1477,7 +1769,7 @@ EXTRACT THESE FIELDS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Look for sections mentioning previous ownership:
-• Sub-Registrar Code: "SR-XXX", "Sub Registrar Code"
+• Sub-Registrar Code: "SR-XXX", "Sub Registrar Code", "SRO Code". CRITICAL: this code is OFTEN HANDWRITTEN — look in the margins, top corners, near the registration stamp/seal, and alongside the document number, not only in printed text. Transcribe the handwritten digits/letters exactly (e.g. "1620", "SR-1620"). If a number is written by hand next to "Sub Registrar"/"SRO", capture it here even if it is not printed.
 • Pattadar Passbook: "PP No: XXX", "పట్టాదారు పాస్‌బుక్ నెంబరు"
 • Nala Order No: "Nala Order", "నాలా ఆర్డర్"
 • Layout File No: "Layout No", "LP.No", "లేఅవుట్ ఫైల్"
@@ -1575,7 +1867,9 @@ OTHER CRITICAL INSTRUCTIONS:
 7. Return ONLY the JSON output - no explanations`,
         responseMimeType: "application/json",
         responseSchema: extractLinkDocSchema,
-        temperature: 0.05
+        temperature: 0.05,
+        maxOutputTokens: 4096,
+        thinkingConfig: { thinkingBudget: 0 }
       }
     });
 
@@ -1640,7 +1934,9 @@ ${templateText}`;
         contents: prompt,
         config: {
           systemInstruction: "You are a senior registration deed drafter. Return ONLY the final filled legal draft text. Preserve template layout, fonts, margins, alignment, bullets, and formatting style. NEVER output placeholder dashes, underscores (____), or blank lines for missing fields — write the registered text cleanly without placeholders. Never include markdown code blocks or conversational text.",
-          temperature: 0.1
+          temperature: 0.1,
+          maxOutputTokens: 16384,
+          thinkingConfig: { thinkingBudget: 0 }
         }
       }),
       AI_TIMEOUT_MS,
@@ -2161,6 +2457,8 @@ JSON Output Schema strictly format as:
             responseMimeType: "application/json",
             responseSchema: PLAN_EXTRACTION_SCHEMA,
             temperature: 0.1,
+            maxOutputTokens: 4096,
+            thinkingConfig: { thinkingBudget: 0 },
           },
         }),
         PLAN_AI_TIMEOUT_MS,
@@ -2175,6 +2473,8 @@ JSON Output Schema strictly format as:
             responseMimeType: "application/json",
             responseSchema: BOUNDARY_AUDIT_SCHEMA,
             temperature: 0.1,
+            maxOutputTokens: 4096,
+            thinkingConfig: { thinkingBudget: 0 },
           },
         }),
         PLAN_AI_TIMEOUT_MS,
@@ -2228,8 +2528,12 @@ JSON Output Schema strictly format as:
     }
 
     // ---- STEP 2: render the full one-pager deterministically from the JSON ----
-    // Always succeeds: with no sketch JSON it draws from the form details.
-    const generatedImageBase64 = renderPlanDataUrl({ plan: extractedPlan, details: renderDetails });
+    // Always succeeds: with no sketch JSON it draws from the form details. The
+    // user's custom prompt is parsed into structured edits (title, boundary text,
+    // property colour, and a visible note) and applied here, so the prompt
+    // actually changes the rendered plan — previously it was dropped at this call.
+    const planEdits = userPromptText ? parsePlanPrompt(userPromptText) : null;
+    const generatedImageBase64 = renderPlanDataUrl({ plan: extractedPlan, details: renderDetails, edits: planEdits });
 
     if (!verificationReport) {
       verificationReport = buildFallbackVerificationReport(pd, auditFailure);
@@ -2255,11 +2559,12 @@ JSON Output Schema strictly format as:
     // Even in catch block, render a clean plan from whatever details we have so
     // the frontend never gets a 500 error.
     try {
-      const { propertyDetails, details } = req.body || {};
+      const { propertyDetails, details, customPrompt } = req.body || {};
       const rd =
         details && typeof details === "object" ? details : { property: propertyDetails || {} };
+      const editsFb = customPrompt && String(customPrompt).trim() ? parsePlanPrompt(String(customPrompt)) : null;
       return res.json({
-        generatedImageBase64: renderPlanDataUrl({ plan: null, details: rd }),
+        generatedImageBase64: renderPlanDataUrl({ plan: null, details: rd, edits: editsFb }),
         // Was `imageError: null` with the reason argument dropped — so a total
         // failure here rendered as a plan with NO warning at all, the exact
         // silent-success this whole change set exists to remove.

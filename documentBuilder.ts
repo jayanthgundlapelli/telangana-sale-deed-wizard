@@ -379,6 +379,192 @@ export async function appendPlanPageToDocx(
   });
 }
 
+export interface AppendImage {
+  /** Base64 (data-URL or raw) of the image. */
+  base64: string;
+  /** MIME type, e.g. image/jpeg or image/png. Non-image types are skipped. */
+  mimeType?: string;
+  /** Optional caption drawn under the image. */
+  caption?: string;
+}
+
+// Append ALL supplied images onto ONE final page of an existing .docx (used for
+// the uploaded Aadhaar/PAN card scans, placed after the deed and the plan page).
+// Images are stacked and each fitted so the whole set fits within a single page's
+// usable area. Non-image MIME types (e.g. PDF) are skipped — they cannot be
+// embedded as a picture without rasterisation.
+export async function appendImagesPageToDocx(
+  docxBuffer: Buffer,
+  images: AppendImage[],
+  opts: { pageTitle?: string } = {}
+): Promise<Buffer> {
+  const usable = (images || []).filter(
+    (im) => im && typeof im.base64 === "string" && im.base64.trim() && /^image\//i.test(im.mimeType || "image/jpeg")
+  );
+  if (usable.length === 0) return docxBuffer;
+
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(docxBuffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) return docxBuffer;
+  let xml = await docFile.async("string");
+
+  const { availW, availH } = usablePageEmu(xml);
+  // Reserve room for a page title + per-image gaps; split the remaining height
+  // evenly so every card fits on the single page.
+  const titleH = opts.pageTitle ? 360000 : 0; // ~0.4"
+  const gap = 120000; // ~0.13" between images
+  const perBox = Math.max(1, Math.floor((availH - titleH - gap * usable.length) / usable.length));
+
+  // Ensure content types for jpg + png.
+  const ctFile = zip.file("[Content_Types].xml");
+  if (ctFile) {
+    let ct = await ctFile.async("string");
+    if (!/<Default\b[^>]*Extension="jpe?g"/i.test(ct)) {
+      ct = ct.replace(/<\/Types>/, '<Default Extension="jpg" ContentType="image/jpeg"/></Types>');
+    }
+    if (!/<Default\b[^>]*Extension="png"/i.test(ct)) {
+      ct = ct.replace(/<\/Types>/, '<Default Extension="png" ContentType="image/png"/></Types>');
+    }
+    zip.file("[Content_Types].xml", ct);
+  }
+
+  // Ensure drawing namespaces.
+  xml = xml.replace(/<w:document\b([^>]*)>/, (_m, attrs) => {
+    let a = attrs as string;
+    if (!/xmlns:r=/.test(a)) a += ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    if (!/xmlns:wp=/.test(a)) a += ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"';
+    return `<w:document${a}>`;
+  });
+
+  const relsPath = "word/_rels/document.xml.rels";
+  const relsFile = zip.file(relsPath);
+  let rels = relsFile ? await relsFile.async("string") : "";
+  let nextRel = (() => {
+    const ids = [...rels.matchAll(/Id="rId(\d+)"/g)].map((m) => parseInt(m[1], 10));
+    return (ids.length ? Math.max(...ids) : 0) + 1;
+  })();
+
+  let body = `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
+  if (opts.pageTitle) {
+    body += `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr><w:t xml:space="preserve">${opts.pageTitle.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</w:t></w:r></w:p>`;
+  }
+
+  let idx = 0;
+  for (const im of usable) {
+    idx++;
+    const raw = im.base64.replace(/^data:[^,]+,/, "");
+    const bytes = Buffer.from(raw, "base64");
+    if (bytes.length === 0) continue;
+    const isPng = /png/i.test(im.mimeType || "") || raw.startsWith("iVBOR");
+    const ext = isPng ? "png" : "jpg";
+    const imgName = `aadhaar-card-${idx}.${ext}`;
+    zip.file(`word/media/${imgName}`, bytes);
+    const rId = "rId" + nextRel++;
+    rels = rels.replace(
+      /<\/Relationships>/,
+      `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${imgName}"/></Relationships>`
+    );
+
+    // Fit within (availW, perBox), preserving aspect ratio. We don't know the
+    // pixel dimensions here, so assume a typical Aadhaar card ratio (~1.58:1)
+    // unless the box constrains width first.
+    const assumedRatio = 1.58; // width / height
+    let cx = availW;
+    let cy = Math.round(cx / assumedRatio);
+    if (cy > perBox) { cy = perBox; cx = Math.round(cy * assumedRatio); }
+    if (cx > availW) { cx = availW; cy = Math.round(cx / assumedRatio); }
+    const drawingId = 525000 + idx;
+    body +=
+      `<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="120" w:after="120"/></w:pPr><w:r><w:drawing>` +
+      `<wp:inline distT="0" distB="0" distL="0" distR="0">` +
+      `<wp:extent cx="${cx}" cy="${cy}"/>` +
+      `<wp:effectExtent l="0" t="0" r="0" b="0"/>` +
+      `<wp:docPr id="${drawingId}" name="${imgName}"/>` +
+      `<wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
+      `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+      `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:nvPicPr><pic:cNvPr id="${drawingId}" name="${imgName}"/><pic:cNvPicPr/></pic:nvPicPr>` +
+      `<pic:blipFill><a:blip r:embed="${rId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+      `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
+      `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
+      `</pic:pic></a:graphicData></a:graphic></wp:inline>` +
+      `</w:drawing></w:r></w:p>`;
+  }
+
+  if (relsFile) zip.file(relsPath, rels);
+
+  const bodyClose = xml.lastIndexOf("</w:body>");
+  const lastSect = xml.lastIndexOf("<w:sectPr");
+  const lastParaClose = xml.lastIndexOf("</w:p>");
+  let insertAt: number;
+  if (lastSect !== -1 && lastSect < bodyClose && lastSect > lastParaClose) {
+    insertAt = lastSect;
+  } else {
+    insertAt = bodyClose === -1 ? xml.length : bodyClose;
+  }
+  xml = xml.slice(0, insertAt) + body + xml.slice(insertAt);
+  zip.file("word/document.xml", xml);
+
+  return zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+}
+
+/**
+ * Append plain registration details to an existing .docx without rebuilding its
+ * original pages. This is used after in-place filling an uploaded template: its
+ * author may not have markers for every Step-1 field, but supplied facts must
+ * still be available in the final deed for review and registration.
+ */
+export async function appendRegistrationDetailsPageToDocx(
+  docxBuffer: Buffer,
+  title: string,
+  lines: string[]
+): Promise<Buffer> {
+  const nonEmptyLines = lines.map((line) => String(line || "").trim()).filter(Boolean);
+  if (nonEmptyLines.length === 0) return docxBuffer;
+
+  const escapeXml = (value: string) =>
+    stripInvalidXmlChars(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(docxBuffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) throw new Error("Not a valid .docx (missing word/document.xml).");
+  let xml = await docFile.async("string");
+
+  const body = [
+    '<w:p><w:r><w:br w:type="page"/></w:r></w:p>',
+    `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr><w:t>${escapeXml(title)}</w:t></w:r></w:p>`,
+    ...nonEmptyLines.map(
+      (line) => `<w:p><w:pPr><w:spacing w:after="100"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r></w:p>`
+    ),
+  ].join("");
+
+  const bodyClose = xml.lastIndexOf("</w:body>");
+  const lastSect = xml.lastIndexOf("<w:sectPr");
+  const lastParaClose = xml.lastIndexOf("</w:p>");
+  const insertAt = lastSect !== -1 && lastSect < bodyClose && lastSect > lastParaClose
+    ? lastSect
+    : bodyClose === -1
+    ? xml.length
+    : bodyClose;
+  xml = xml.slice(0, insertAt) + body + xml.slice(insertAt);
+  zip.file("word/document.xml", xml);
+
+  return zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+}
+
 // Deterministic placeholder merge — exact, no paraphrasing, no hallucination.
 // Unknown placeholders are left intact so the Re-Verify step can flag them.
 export function mergePlaceholders(

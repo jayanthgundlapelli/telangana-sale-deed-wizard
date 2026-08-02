@@ -110,6 +110,21 @@ export function classifyAiError(err: unknown, opts?: { label?: string }): AiFail
     };
   }
 
+  // Transient model overload / capacity (HTTP 503 "high demand" / UNAVAILABLE).
+  // Distinct from quota: no billing action helps — the model is momentarily busy,
+  // so retrying (or letting the server fail over to another model) is the fix.
+  if (/unavailable|overloaded|experiencing high demand|try again later|\b503\b/.test(text)) {
+    return {
+      code: "UPSTREAM_ERROR",
+      status: 503,
+      message:
+        `The AI model is temporarily overloaded${what ? ` (${opts!.label})` : ""} due to high demand. ` +
+        "This is usually brief — please retry in a moment. You can also continue by entering the details manually.",
+      retryable: true,
+      detail,
+    };
+  }
+
   if (
     /api[_ -]?key not valid|invalid api key|api key expired|permission_denied|unauthenticated|unauthorized|\b401\b|\b403\b/.test(text)
   ) {

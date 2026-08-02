@@ -637,7 +637,10 @@ export function buildAngleFieldResolver(details: any): {
   const bounds = prop.boundaries || {};
   const link = d.linkDeed || {};
 
-  const joinNames = (arr: any[]) => arr.map((x) => x?.name).filter(Boolean).join(", ");
+  // Party names in CAPITALS (registration convention). Kept comma-joined here
+  // (not newline-joined) because this value is spliced into a single <w:t> run in
+  // the uploaded .docx, where a raw "\n" would not render as a line break.
+  const joinNames = (arr: any[]) => arr.map((x) => (x?.name || "").toUpperCase().trim()).filter(Boolean).join(", ");
   const joinAadhaar = (arr: any[]) => arr.map((x) => x?.aadhaar).filter(Boolean).join(", ");
   const joinAges = (arr: any[]) =>
     arr.map((x) => (x?.age ? String(x.age) : "")).filter(Boolean).join(", ");
@@ -647,12 +650,13 @@ export function buildAngleFieldResolver(details: any): {
   const joinOcc = (arr: any[]) => arr.map((x) => x?.occupation).filter(Boolean).join(", ");
   const joinCell = (arr: any[]) => arr.map((x) => x?.cellNo).filter(Boolean).join(", ");
 
-  // Compute sq metres from sq yards when only yards were supplied.
-  // 1 sq yard = 0.836127 sq metre.
-  const yards = parseFloat(String(prop.extentSqYards || "").replace(/[^\d.]/g, ""));
+  // Preserve square metres explicitly extracted from the link document. Only
+  // calculate when it was not supplied; 1 sq yard equals 0.83612736 sq metres.
+  const yards = parseFloat(String(prop.extentSqYards || "").replace(/,/g, "").match(/\d+(?:\.\d+)?/)?.[0] || "");
   const sqMtrsComputed =
+    prop.extentSqMeters ||
     prop.extentSqMtrs ||
-    (isFinite(yards) && yards > 0 ? (yards * 0.836127).toFixed(2) : "");
+    (isFinite(yards) && yards > 0 ? (yards * 0.83612736).toFixed(4).replace(/\.?(0+)$/, "") : "");
 
   // Per-yard market value = total / yards, when both known.
   const totalVal = parseFloat(
@@ -688,21 +692,43 @@ export function buildAngleFieldResolver(details: any): {
     "claimant cell.no.": joinCell(buyers),
 
     "link doct.type": String(link.docType || link.type || "Sale Deed"),
+    "link doc type": String(link.docType || link.type || ""),
     "link doct.no.": String(link.deedNumber || ""),
     "link doct.date": String(link.executionDate || ""),
-    "sub registrar": String(link.village || link.subRegistrar || ""),
+    "sub registrar": String(link.subRegistrar || link.village || ""),
     "sub registrar code": String(link.subRegistrarCode || ""),
+    "sro code": String(link.subRegistrarCode || ""),
+    "layout file no.": String(link.layoutFileNo || ""),
+    "nala order no.": String(link.nalaOrderNo || ""),
+    "house tax receipt": String(link.houseTaxReceipt || ""),
 
     "plot no.": String(prop.plotNo || ""),
     "extent in sq.yards": String(prop.extentSqYards || ""),
     "extent in sq.mtrs": String(sqMtrsComputed || ""),
+    "extent in sq.meters": String(sqMtrsComputed || ""),
     "survey no.": String(prop.surveyNo || ""),
     "near h.no.": String(prop.hNo || ""),
+    "pti no.": String(prop.ptiNo || prop.vltPtiNo || ""),
+    "blt no.": String(prop.bltNo || ""),
+    "adjacent h.no.": String(prop.adjacentHNo || ""),
     locality: String(prop.locality || prop.village || ""),
     "village & mandal": [prop.village, prop.mandal].filter(Boolean).join(", "),
     district: String(prop.district || ""),
     "pin code": String(prop.pincode || ""),
     village: String(prop.village || ""),
+    "house nature": String(prop.houseNature || ""),
+    "house floors": String(prop.houseFloors || ""),
+    "house plinth area": String(prop.housePlinthArea || prop.plinthArea || ""),
+    "house age": String(prop.houseAge || ""),
+    "house tap connection": String(prop.houseTapConnection || prop.demoTapConnection || prop.flatTapConnection || ""),
+    "house meters no.": String(prop.houseMetersNo || prop.demoMetersNo || prop.flatMetersNo || ""),
+    "house taxes": String(prop.houseTaxes || prop.flatTaxes || ""),
+    "house rental value": String(prop.houseRentalValue || prop.flatRentalValue || ""),
+    "flat no.": String(prop.flatNo || ""),
+    "flat building name": String(prop.flatBuildingName || ""),
+    "flat floor": String(prop.flatFloorS || ""),
+    "flat plinth area": String(prop.flatPlinthArea || ""),
+    "flat total land": String(prop.flatTotalLand || ""),
 
     "east boundary": String(bounds.east || ""),
     "west boundary": String(bounds.west || ""),

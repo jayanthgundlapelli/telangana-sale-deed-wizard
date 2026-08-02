@@ -46,17 +46,34 @@ import {
   degradedFailure,
 } from "./aiError";
 
+// Compute the COMPLETED (last-birthday) age from a date of birth. Parses the
+// three shapes an Aadhaar/date-input can produce — ISO YYYY-MM-DD, DD/MM/YYYY (or
+// DD-MM-YYYY), and a bare birth YEAR (many Aadhaar cards print only the year) —
+// using explicit numeric parts rather than `new Date(string)`, which is
+// timezone-fragile (an ISO date parses as UTC midnight and can slip to the
+// previous day in a behind-UTC locale, throwing the age off by a year).
 const calculateAgeFromDOB = (dobString: string): string => {
   if (!dobString) return "";
-  const birthDate = new Date(dobString);
-  if (isNaN(birthDate.getTime())) return "";
-  const today = new Date();
-  let age = today.getFullYear() - birthDate.getFullYear();
-  const monthDiff = today.getMonth() - birthDate.getMonth();
-  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
-    age--;
+  const s = String(dobString).trim();
+  let y: number | null = null;
+  let m = 1; // month/day default to Jan 1 for year-only cards (best-effort)
+  let d = 1;
+  let mm: RegExpMatchArray | null;
+  if ((mm = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/))) {
+    y = +mm[1]; m = +mm[2]; d = +mm[3];
+  } else if ((mm = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/))) {
+    d = +mm[1]; m = +mm[2]; y = +mm[3];
+  } else if ((mm = s.match(/(19|20)\d{2}/))) {
+    y = +mm[0]; // year-only DOB
   }
-  return age >= 0 ? String(age) : "0";
+  if (!y) return "";
+  const today = new Date();
+  let age = today.getFullYear() - y;
+  const monthDiff = today.getMonth() + 1 - m; // getMonth() is 0-based
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < d)) {
+    age--; // birthday hasn't occurred yet this year
+  }
+  return age >= 0 && age < 130 ? String(age) : "";
 };
 
 // The Aadhaar extractor returns DOB as DD/MM/YYYY, but <input type="date"> ONLY
@@ -110,9 +127,11 @@ const cleanAddressWithoutRelation = (address: string, relation?: string): string
 const normalizeAadhaarPayload = (data: any): AadhaarRowData => {
   const dob = toDateInputValue(data?.dob || "");
   // Prefer computing age from DOB (month/day-aware) over the model's own figure,
-  // which is year-subtraction only and overshoots by 1 before the birthday. Only
-  // fall back to the model's age when the card has no readable DOB.
-  const age = dob ? calculateAgeFromDOB(dob) : (data?.age ? String(data.age) : "");
+  // which is year-subtraction only and overshoots by 1 before the birthday. Use
+  // the RAW extracted dob (not the ISO input value) so year-only cards — where
+  // toDateInputValue() returns "" — still yield an age. Fall back to the model's
+  // age only when the card has no readable DOB at all.
+  const age = calculateAgeFromDOB(data?.dob || dob) || (data?.age ? String(data.age) : "");
   const relation = data?.relation || "";
   const rawAddr = data?.address || "";
   const address = cleanAddressWithoutRelation(rawAddr, relation);
@@ -129,6 +148,21 @@ const normalizeAadhaarPayload = (data: any): AadhaarRowData => {
     state: data?.state || "",
     pincode: data?.pincode || "",
   };
+};
+
+const SQUARE_METRES_PER_SQUARE_YARD = 0.83612736;
+
+// Link documents can state the area in square metres, which must remain exactly
+// as extracted. When the user types an area in square yards, convert that input
+// deterministically rather than retaining a stale extracted/manual metres value.
+const squareYardsToSquareMetres = (value: string): string => {
+  const numeric = String(value || "").replace(/,/g, "").match(/\d+(?:\.\d+)?/);
+  if (!numeric) return "";
+  const squareYards = Number(numeric[0]);
+  if (!Number.isFinite(squareYards)) return "";
+  return (squareYards * SQUARE_METRES_PER_SQUARE_YARD)
+    .toFixed(4)
+    .replace(/\.?(0+)$/, "");
 };
 
 // An Aadhaar card's FRONT (name, DOB, photo, number) and BACK (relation, address)
@@ -353,6 +387,7 @@ export default function App() {
   interface LinkDocumentRow {
     id: string;
     layoutFileNo: string;
+    linkDocType: string;
     linkDocNo: string;
     linkDocDate: string;
     subRegistrar: string;
@@ -375,6 +410,8 @@ export default function App() {
     locality: string;
     pincode: string;
     vltPtiNo: string;
+    bltNo: string;
+    ptiNo: string;
     marketValuePerSqYard: string;
     marketValueTotal: string;
     // House specific
@@ -1238,6 +1275,7 @@ export default function App() {
             return [{
               id: `linkdoc-${Date.now()}`,
               layoutFileNo: data.linkDocument.layoutFileNo || "",
+              linkDocType: data.linkDocument.docType || "",
               linkDocNo: data.linkDocument.docNo || "",
               linkDocDate: data.linkDocument.docDate || data.linkDocument.linkDocDate || "",
               subRegistrar: data.linkDocument.subRegistrar || "",
@@ -1254,6 +1292,7 @@ export default function App() {
               updated[0] = {
                 ...first,
                 layoutFileNo: data.linkDocument.layoutFileNo || first.layoutFileNo,
+                linkDocType: data.linkDocument.docType || first.linkDocType,
                 linkDocNo: data.linkDocument.docNo || first.linkDocNo,
                 linkDocDate: data.linkDocument.docDate || data.linkDocument.linkDocDate || first.linkDocDate,
                 subRegistrar: data.linkDocument.subRegistrar || first.subRegistrar,
@@ -1268,6 +1307,7 @@ export default function App() {
               return [...prev, {
                 id: `linkdoc-${Date.now()}`,
                 layoutFileNo: data.linkDocument.layoutFileNo || "",
+                linkDocType: data.linkDocument.docType || "",
                 linkDocNo: data.linkDocument.docNo || "",
                 linkDocDate: data.linkDocument.docDate || data.linkDocument.linkDocDate || "",
                 subRegistrar: data.linkDocument.subRegistrar || "",
@@ -1293,12 +1333,14 @@ export default function App() {
               plotNo: data.property.plotNo || "",
               surveyNo: data.property.surveyNo || "",
               extentSqYards: data.property.extentSqYards || "",
-              extentSqMeters: data.property.extentSqMeters || (data.property.extentSqYards ? (Number(data.property.extentSqYards) * 0.836127).toFixed(2) : ""),
+               extentSqMeters: data.property.extentSqMeters || squareYardsToSquareMetres(data.property.extentSqYards || ""),
               nearHNo: data.property.nearHNo || "",
               locality: data.property.locality || "",
-              pincode: data.property.pincode || data.jurisdiction?.pincode || "",
-              vltPtiNo: data.property.vltPtiNo || data.property.ptiNo || "",
-              marketValueTotal: data.property.marketValueTotal || "",
+               pincode: data.property.pincode || data.jurisdiction?.pincode || "",
+               vltPtiNo: data.property.vltPtiNo || data.property.ptiNo || "",
+               bltNo: "",
+               ptiNo: data.property.ptiNo || data.property.vltPtiNo || "",
+               marketValueTotal: data.property.marketValueTotal || "",
               marketValuePerSqYard: data.property.marketValuePerSqYard || "",
               houseBearingHNo: data.property.nearHNo || data.property.house?.bearingHNo || "",
               houseNature: data.property.house?.nature || "",
@@ -1333,8 +1375,8 @@ export default function App() {
             if (data.property.surveyNo) target.surveyNo = data.property.surveyNo;
             if (data.property.extentSqYards) {
               target.extentSqYards = data.property.extentSqYards;
-              if (!target.extentSqMeters) {
-                target.extentSqMeters = (Number(data.property.extentSqYards) * 0.836127).toFixed(2);
+              if (!data.property.extentSqMeters && !target.extentSqMeters) {
+                target.extentSqMeters = squareYardsToSquareMetres(data.property.extentSqYards);
               }
             }
             if (data.property.extentSqMeters) target.extentSqMeters = data.property.extentSqMeters;
@@ -1356,6 +1398,7 @@ export default function App() {
             }
             if (data.property.vltPtiNo || data.property.ptiNo) {
               target.vltPtiNo = data.property.vltPtiNo || data.property.ptiNo;
+              target.ptiNo = data.property.ptiNo || data.property.vltPtiNo;
             }
             if (data.property.marketValueTotal) {
               target.marketValueTotal = data.property.marketValueTotal;
@@ -1515,6 +1558,7 @@ export default function App() {
     const newLinkDoc: LinkDocumentRow = {
       id: `linkdoc-${Date.now()}`,
       layoutFileNo: "",
+      linkDocType: "",
       linkDocNo: "",
       linkDocDate: "",
       subRegistrar: "",
@@ -1553,6 +1597,8 @@ export default function App() {
       locality: "",
       pincode: "",
       vltPtiNo: "",
+      bltNo: "",
+      ptiNo: "",
       marketValuePerSqYard: "",
       marketValueTotal: "",
       houseBearingHNo: "",
@@ -1750,6 +1796,21 @@ export default function App() {
   // verification. Sourced from the Step-1 list rows (source of truth), falling back to
   // single-field state so nothing is silently dropped.
   const buildConsolidatedDetails = () => {
+    // Append district/state/pincode to a party's residential address ONLY when
+    // that token is not already present in it. The Aadhaar extractor is asked to
+    // return an address that already includes village/mandal/district/pincode, so
+    // blindly appending the separate district/state/pincode fields produced a
+    // duplicated tail (e.g. "…, Warangal, 506002, Warangal, Telangana, 506002").
+    const composeAddress = (base: string, extras: (string | undefined)[]): string => {
+      let acc = (base || "").trim().replace(/[\s,]+$/, "");
+      for (const t of extras) {
+        const v = (t || "").trim();
+        if (v && !acc.toLowerCase().includes(v.toLowerCase())) {
+          acc = acc ? `${acc}, ${v}` : v;
+        }
+      }
+      return acc;
+    };
     const sellers = (executantsList.length
       ? executantsList
       : executantName
@@ -1764,7 +1825,7 @@ export default function App() {
       dob: e.dob,
       occupation: e.occupation || "",
       cellNo: e.cellNo || "",
-      address: [cleanAddressWithoutRelation(e.address, e.relation), e.district, e.state, e.pincode].filter(Boolean).join(", "),
+      address: composeAddress(cleanAddressWithoutRelation(e.address, e.relation), [e.district, e.state, e.pincode]),
     }));
 
     const buyers = (claimantsList.length
@@ -1781,35 +1842,40 @@ export default function App() {
       dob: c.dob,
       occupation: c.occupation || "",
       cellNo: c.cellNo || "",
-      address: [cleanAddressWithoutRelation(c.address, c.relation), c.district, c.state, c.pincode].filter(Boolean).join(", "),
+      address: composeAddress(cleanAddressWithoutRelation(c.address, c.relation), [c.district, c.state, c.pincode]),
     }));
 
     const firstProp = propertiesList[0] || ({} as any);
     const firstJur = jurisdictionsList[0] || ({} as any);
     const firstBound = boundariesList[0] || ({} as any);
     const firstLink = linkDocumentsList[0] || ({} as any);
+    const properties = propertiesList.map(({ id, ...property }) => property);
+    const jurisdictions = jurisdictionsList.map(({ id, ...jurisdiction }) => jurisdiction);
+    const linkDocuments = linkDocumentsList.map(({ id, ...linkDocument }) => linkDocument);
 
     return {
       registrationDate,
       marketValue: marketValue || firstProp.marketValueTotal || propMarketValueTotal || "",
       stampsAmount,
       natureOfTransaction,
-      propertyType,
+      propertyType: firstProp.propertyType || propertyType,
       executants: sellers,
       claimants: buyers,
       property: {
+        ...firstProp,
+        propertyType: firstProp.propertyType || propertyType,
         surveyNo: firstProp.surveyNo || propSurveyNo || propertySurvey || "",
         village: firstJur.village || jurVillage || propertyVillage || "",
         mandal: firstJur.mandal || jurMandal || propertyMandal || "",
         district: firstJur.district || jurDistrict || propertyDistrict || "",
         pincode: firstProp.pincode || firstJur.pincode || jurPincode || propPincode || "",
         state: "Telangana",
-        hNo: firstProp.nearHNo || propNearHNo || propertyHNo || "",
+        hNo: firstProp.houseBearingHNo || firstProp.demoBearingHNo || firstProp.partBearingHNo || firstProp.flatBearingHNo || firstProp.nearHNo || propNearHNo || propertyHNo || "",
         plotNo: firstProp.plotNo || propPlotNo || propertyPlotNo || "",
-        ptiNo: firstProp.vltPtiNo || propVltPtiNo || firstLink.pattadarPassbookNo || linkPattadarPassbook || propertyPTINo || "",
-        vltPtiNo: firstProp.vltPtiNo || propVltPtiNo || propertyPTINo || "",
+        ptiNo: firstProp.ptiNo || firstProp.vltPtiNo || propVltPtiNo || firstLink.pattadarPassbookNo || linkPattadarPassbook || propertyPTINo || "",
+        vltPtiNo: firstProp.vltPtiNo || firstProp.ptiNo || propVltPtiNo || propertyPTINo || "",
         extentSqYards: firstProp.extentSqYards || propExtentSqYards || propertyExtent || "",
-        plinthArea: firstProp.flatPlinthArea || propertyPlinth || "",
+        plinthArea: firstProp.housePlinthArea || firstProp.flatPlinthArea || propertyPlinth || "",
         boundaries: {
           east: firstBound.east || boundaryEast || "",
           west: firstBound.west || boundaryWest || "",
@@ -1819,11 +1885,21 @@ export default function App() {
       },
       linkDeed: {
         deedNumber: firstLink.linkDocNo || linkDocNo || "",
+        docType: firstLink.linkDocType || "",
+        type: firstLink.linkDocType || "",
         executionDate: firstLink.linkDocDate || linkDocDate || "",
         village: firstLink.subRegistrar || linkSubRegistrar || "",
+        subRegistrar: firstLink.subRegistrar || linkSubRegistrar || "",
+        subRegistrarCode: firstLink.subRegistrarCode || linkSubRegistrarCode || "",
         pattadarPassbookNo: firstLink.pattadarPassbookNo || linkPattadarPassbook || "",
         passbookKhataNo: firstLink.passbookKhataNo || linkPassbookKhataNo || "",
+        layoutFileNo: firstLink.layoutFileNo || linkLayoutFileNo || "",
+        nalaOrderNo: firstLink.nalaOrderNo || linkNalaOrderNo || "",
+        houseTaxReceipt: firstLink.houseTaxReceipt || linkHouseTaxReceipt || "",
       },
+      properties,
+      jurisdictions,
+      linkDocuments,
     };
   };
 
@@ -2127,11 +2203,87 @@ export default function App() {
     if (generatedDocxBase64) setGeneratedDocxBase64("");
   };
 
+  // Rebuild a FORMATTED .docx from the (edited) deed text so the preview shows the
+  // same formatting that downloads — bold/centered headings, justified paragraphs,
+  // A4/Times layout — instead of falling back to a flat plain-text page. Called
+  // when the user leaves Edit mode after changing the text (which drops the
+  // original filled-.docx bytes, since edited text can no longer be spliced back
+  // into that document). Best-effort: on failure the text view remains.
+  const rebuildDocxFromEditedText = async () => {
+    if (!filledDeedText.trim()) return;
+    try {
+      const res = await fetch("/api/export-document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format: "docx", finalText: filledDeedText }),
+      });
+      if (!res.ok) return; // keep the editable text view if the rebuild fails
+      const data = await res.json();
+      const b64 = data?.fileBase64 || data?.docxBase64;
+      if (b64) {
+        setDocxPreviewError(false);
+        setGeneratedDocxBase64(b64);
+      }
+    } catch {
+      /* keep the text fallback */
+    }
+  };
+
+  // Toggle the Step-4/Step-6 preview editor. When LEAVING edit mode after an edit
+  // (the formatted bytes were dropped), rebuild a formatted .docx so the preview
+  // regains its formatting. When no edit happened, the original formatted .docx
+  // (with any template tables) is left intact — no needless rebuild.
+  const togglePreviewEditing = () => {
+    setPreviewEditing((v) => {
+      const leaving = v; // was editing, now turning off
+      if (leaving && !generatedDocxBase64 && filledDeedText.trim()) {
+        void rebuildDocxFromEditedText();
+      }
+      return !v;
+    });
+  };
+
+  // Build the download file name as: "<Deed Type> - <Claimant> - DDMMYYYY - Vn".
+  //  • Deed type comes from the nature of transaction (e.g. "Sale Deed", "Gift
+  //    Settlement Deed"); when nothing is specified it falls back to "Deed".
+  //  • Claimant is the first claimant/buyer name.
+  //  • Date is the registration date as DDMMYYYY.
+  //  • Version auto-increments per unique "<type> - <claimant> - <date>" base:
+  //    the browser saves duplicate downloads as "name (1).docx" rather than "V2",
+  //    so we track the count in localStorage to produce a real V1 → V2 → V3 …
+  const buildDeedFileName = (ext: "docx" | "pdf"): string => {
+    const rawNature = (natureOfTransaction || "").trim();
+    let deedType = rawNature
+      ? /deed/i.test(rawNature)
+        ? rawNature
+        : `${rawNature} Deed`
+      : "Deed";
+    const claimant = (claimantsList[0]?.name || claimantName || "Claimant").trim();
+    // registrationDate is an ISO date input value (YYYY-MM-DD). Format DDMMYYYY.
+    let dmy = "";
+    const iso = (registrationDate || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (iso) dmy = `${iso[3]}${iso[2]}${iso[1]}`;
+    else {
+      const t = new Date();
+      dmy = `${String(t.getDate()).padStart(2, "0")}${String(t.getMonth() + 1).padStart(2, "0")}${t.getFullYear()}`;
+    }
+    const clean = (s: string) => s.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim();
+    const base = `${clean(deedType)} - ${clean(claimant)} - ${dmy}`;
+    // Version counter (per base, this browser). Bump on each export.
+    let version = 1;
+    try {
+      const key = `deed_export_versions`;
+      const store = JSON.parse(localStorage.getItem(key) || "{}");
+      version = (Number(store[base]) || 0) + 1;
+      store[base] = version;
+      localStorage.setItem(key, JSON.stringify(store));
+    } catch { /* localStorage unavailable — keep V1 */ }
+    return `${base} - V${version}.${ext}`;
+  };
   const exportDocument = async (format: "docx" | "pdf") => {
     setExporting(format);
     clearAiStatus();
     try {
-      const nameForFile = (executantsList[0]?.name || executantName || "Deed").replace(/\s+/g, "_");
       // If a registration plan was generated, rasterise it so the server appends it
       // as the LAST page of the exported document. Best-effort: on any failure we
       // still export the deed itself.
@@ -2158,6 +2310,12 @@ export default function App() {
       //     are somehow absent (e.g. the user hand-edited the text).
       //   • finalText → last-resort text rebuild for library templates.
       const details = buildConsolidatedDetails();
+      // Uploaded Aadhaar/PAN card images, appended by the server as a single page
+      // AFTER the plan page. Only real uploads are sent (mock preset files and any
+      // without base64 are skipped).
+      const aadhaarImages = aadhaarCards
+        .filter((c) => c.base64 && !c.isMock)
+        .map((c) => ({ base64: c.base64 as string, mimeType: c.mimeType || "image/jpeg", name: c.name || "aadhaar" }));
       const res = await fetch("/api/export-document", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2168,6 +2326,7 @@ export default function App() {
           templateDocxBase64: customTemplateDocxBase64 || undefined,
           details,
           ...planFields,
+          aadhaarImages,
         }),
       });
       if (!res.ok) await failOn(res, `${format.toUpperCase()} export`);
@@ -2175,12 +2334,32 @@ export default function App() {
 
       if (format === "pdf" && data.pdfUnavailable) {
         // LibreOffice not present: hand back the .docx and tell the user to use Print → Save as PDF.
-        downloadBase64(data.fileBase64, data.mimeType, `Sale_Deed_${nameForFile}.docx`);
+        downloadBase64(data.fileBase64, data.mimeType, buildDeedFileName("docx"));
         alert(data.message || "PDF engine unavailable. Downloaded Word (.docx); use the Print button to save as PDF.");
       } else if (data.format === "pdf") {
-        downloadBase64(data.fileBase64, data.mimeType, `Sale_Deed_${nameForFile}.pdf`);
+        downloadBase64(data.fileBase64, data.mimeType, buildDeedFileName("pdf"));
       } else {
-        downloadBase64(data.fileBase64, data.mimeType, `Sale_Deed_${nameForFile}.docx`);
+        downloadBase64(data.fileBase64, data.mimeType, buildDeedFileName("docx"));
+      }
+
+      // Make the appended extras VISIBLE so it's never a mystery whether the plan
+      // and Aadhaar pages went in. They are added as the LAST pages of the file.
+      const appended: string[] = [];
+      if ((planFields as any).planImagePngBase64) appended.push("registration plan page");
+      if (aadhaarImages.length) appended.push(`${aadhaarImages.length} Aadhaar/PAN image page`);
+      if (appended.length) {
+        console.info("[export] appended to end of document:", appended.join(" + "));
+      }
+      // A plan was generated but could not be rasterised → it silently would not
+      // append. Tell the user instead of leaving them to wonder.
+      if (generatedPlanImage && !(planFields as any).planImagePngBase64) {
+        setDegraded({
+          code: "UNKNOWN",
+          message:
+            "The document downloaded, but the registration plan could not be added as a page. Please re-open Step 7, regenerate the plan, then export again.",
+          retryable: true,
+          status: 200,
+        });
       }
     } catch (err: any) {
       reportFailure(err, `${format.toUpperCase()} export`, () => exportDocument(format));
@@ -3110,14 +3289,14 @@ const getTeluguRecommendation = (rec: string) => {
                               <button
                                 type="button"
                                 onClick={addEmptyLinkDocument}
-                                disabled={linkDocumentsList.some(doc =>
-                                  doc.layoutFileNo === "" && doc.linkDocNo === "" && doc.linkDocDate === "" &&
+                                 disabled={linkDocumentsList.some(doc =>
+                                   doc.layoutFileNo === "" && doc.linkDocType === "" && doc.linkDocNo === "" && doc.linkDocDate === "" &&
                                   doc.subRegistrar === "" && doc.subRegistrarCode === "" && doc.pattadarPassbookNo === "" &&
                                   doc.passbookKhataNo === "" && doc.nalaOrderNo === "" && doc.houseTaxReceipt === ""
                                 )}
                                 className="bg-[#0a4d4a] hover:bg-[#073937] disabled:bg-gray-400 disabled:cursor-not-allowed text-white text-[9px] font-black uppercase px-2 py-1 rounded flex items-center gap-1"
-                                title={linkDocumentsList.some(doc =>
-                                  doc.layoutFileNo === "" && doc.linkDocNo === "" && doc.linkDocDate === "" &&
+                                 title={linkDocumentsList.some(doc =>
+                                   doc.layoutFileNo === "" && doc.linkDocType === "" && doc.linkDocNo === "" && doc.linkDocDate === "" &&
                                   doc.subRegistrar === "" && doc.subRegistrarCode === "" && doc.pattadarPassbookNo === "" &&
                                   doc.passbookKhataNo === "" && doc.nalaOrderNo === "" && doc.houseTaxReceipt === ""
                                 ) ? "Fill the current row before adding a new one" : "Add new link document"}
@@ -3131,9 +3310,10 @@ const getTeluguRecommendation = (rec: string) => {
                             <table className="w-full border-collapse border border-slate-300 text-left">
                               <thead>
                                 <tr className="bg-slate-100 border-b border-slate-300 text-[10px] text-slate-700 font-bold">
-                                  <th className="p-2 border border-slate-300 w-12 text-center">Doc.No.</th>
-                                  <th className="p-2 border border-slate-300 min-w-[120px]">Layout File No.</th>
-                                  <th className="p-2 border border-slate-300 min-w-[130px]">Link Doct.No/s</th>
+                                   <th className="p-2 border border-slate-300 w-12 text-center">Doc.No.</th>
+                                   <th className="p-2 border border-slate-300 min-w-[120px]">Layout File No.</th>
+                                   <th className="p-2 border border-slate-300 min-w-[150px]">Link Doc Type</th>
+                                   <th className="p-2 border border-slate-300 min-w-[130px]">Link Doct.No/s</th>
                                   <th className="p-2 border border-slate-300 min-w-[120px]">Link Doct. Date</th>
                                   <th className="p-2 border border-slate-300 min-w-[120px]">Sub-Registrar</th>
                                   <th className="p-2 border border-slate-300 w-32">Sub Registrar Code</th>
@@ -3147,7 +3327,7 @@ const getTeluguRecommendation = (rec: string) => {
                               <tbody>
                                 {linkDocumentsList.length === 0 ? (
                                   <tr>
-                                    <td colSpan={11} className="p-4 text-center text-slate-500 text-sm">
+                                    <td colSpan={12} className="p-4 text-center text-slate-500 text-sm">
                                       No link documents added yet. Click "+ Add" or "Add by Upload" to add link documents.
                                     </td>
                                   </tr>
@@ -3157,16 +3337,26 @@ const getTeluguRecommendation = (rec: string) => {
                                       <td className="p-2 border border-slate-300 text-xs font-bold text-slate-500 text-center">
                                         {idx + 1}
                                       </td>
-                                      <td className="p-1 border border-slate-300">
-                                        <input
+                                       <td className="p-1 border border-slate-300">
+                                         <input
                                           type="text"
                                           value={doc.layoutFileNo}
                                           onChange={(e) => updateLinkDocument(doc.id, 'layoutFileNo', e.target.value)}
                                           className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
                                           placeholder="Layout File No"
-                                        />
-                                      </td>
-                                      <td className="p-1 border border-slate-300">
+                                         />
+                                       </td>
+                                       <td className="p-1 border border-slate-300">
+                                         <input
+                                           type="text"
+                                           value={doc.linkDocType}
+                                           onChange={(e) => updateLinkDocument(doc.id, 'linkDocType', e.target.value)}
+                                           className="w-full border-0 focus:outline-none focus:ring-1 focus:ring-[#0a4d4a] text-xs font-semibold text-slate-800 p-1"
+                                           placeholder="Sale Deed"
+                                           aria-label={`Link document type for row ${idx + 1}`}
+                                         />
+                                       </td>
+                                       <td className="p-1 border border-slate-300">
                                         <input
                                           type="text"
                                           value={doc.linkDocNo}
@@ -3416,9 +3606,7 @@ const getTeluguRecommendation = (rec: string) => {
                                               onChange={(e) => {
                                                 const val = e.target.value;
                                                 updateProperty(prop.id, 'extentSqYards', val);
-                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
-                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
-                                                }
+                                                updateProperty(prop.id, 'extentSqMeters', squareYardsToSquareMetres(val));
                                               }}
                                               placeholder="Extent in Sq.yards"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
@@ -3484,17 +3672,27 @@ const getTeluguRecommendation = (rec: string) => {
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
                                             />
                                           </div>
-                                          <div>
-                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
-                                            <input
-                                              type="text"
-                                              value={prop.marketValuePerSqYard}
-                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
-                                              placeholder="Market Value per sq.yard"
-                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
-                                            />
-                                          </div>
-                                        </div>
+                                           <div>
+                                             <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
+                                             <input
+                                               type="text"
+                                               value={prop.marketValuePerSqYard}
+                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                               placeholder="Market Value per sq.yard"
+                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                             />
+                                           </div>
+                                           <div>
+                                             <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">BLT No.</label>
+                                             <input
+                                               type="text"
+                                               value={prop.bltNo}
+                                               onChange={(e) => updateProperty(prop.id, 'bltNo', e.target.value)}
+                                               placeholder="Enter BLT No."
+                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                             />
+                                           </div>
+                                         </div>
                                       </div>
                                     ) : prop.propertyType === "House" ? (
                                       <div>
@@ -3520,9 +3718,7 @@ const getTeluguRecommendation = (rec: string) => {
                                               onChange={(e) => {
                                                 const val = e.target.value;
                                                 updateProperty(prop.id, 'extentSqYards', val);
-                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
-                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
-                                                }
+                                                updateProperty(prop.id, 'extentSqMeters', squareYardsToSquareMetres(val));
                                               }}
                                               placeholder="Extent in Sq.yards"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
@@ -3611,17 +3807,27 @@ const getTeluguRecommendation = (rec: string) => {
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
                                             />
                                           </div>
-                                          <div>
-                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
-                                            <input
-                                              type="text"
-                                              value={prop.marketValuePerSqYard}
-                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
-                                              placeholder="Market Value per sq.yard"
-                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
-                                            />
-                                          </div>
-                                          <div>
+                                           <div>
+                                             <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Market Value per sq.yard</label>
+                                             <input
+                                               type="text"
+                                               value={prop.marketValuePerSqYard}
+                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                               placeholder="Market Value per sq.yard"
+                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                             />
+                                           </div>
+                                           <div>
+                                             <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">PTI No.</label>
+                                             <input
+                                               type="text"
+                                               value={prop.ptiNo}
+                                               onChange={(e) => updateProperty(prop.id, 'ptiNo', e.target.value)}
+                                               placeholder="Extracted from link document"
+                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                             />
+                                           </div>
+                                           <div>
                                             <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">Age of House</label>
                                             <input
                                               type="text"
@@ -3697,9 +3903,7 @@ const getTeluguRecommendation = (rec: string) => {
                                               onChange={(e) => {
                                                 const val = e.target.value;
                                                 updateProperty(prop.id, 'extentSqYards', val);
-                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
-                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
-                                                }
+                                                updateProperty(prop.id, 'extentSqMeters', squareYardsToSquareMetres(val));
                                               }}
                                               placeholder="Extent in Sq.yards"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
@@ -3814,9 +4018,7 @@ const getTeluguRecommendation = (rec: string) => {
                                               onChange={(e) => {
                                                 const val = e.target.value;
                                                 updateProperty(prop.id, 'extentSqYards', val);
-                                                if (!prop.extentSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
-                                                  updateProperty(prop.id, 'extentSqMeters', (Number(val) * 0.836127).toFixed(2));
-                                                }
+                                                updateProperty(prop.id, 'extentSqMeters', squareYardsToSquareMetres(val));
                                               }}
                                               placeholder="Extent in Sq.yards"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
@@ -3911,9 +4113,7 @@ const getTeluguRecommendation = (rec: string) => {
                                               onChange={(e) => {
                                                 const val = e.target.value;
                                                 updateProperty(prop.id, 'flatUndividedSqYards', val);
-                                                if (!prop.flatUndividedSqMeters && !isNaN(Number(val)) && val.trim() !== '') {
-                                                  updateProperty(prop.id, 'flatUndividedSqMeters', (Number(val) * 0.836127).toFixed(2));
-                                                }
+                                                updateProperty(prop.id, 'flatUndividedSqMeters', squareYardsToSquareMetres(val));
                                               }}
                                               placeholder="UDS in Sq.yards"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
@@ -4762,10 +4962,12 @@ const getTeluguRecommendation = (rec: string) => {
                                       <Field label="Name" value={e.name} />
                                       <Field label="Relation (S/o, W/o, D/o)" value={e.relation} />
                                       <Field label="Age" value={e.age ? String(e.age) : ""} />
-                                      <Field label="Aadhaar No" value={e.aadhaar} />
-                                      <Field label="PAN" value={e.pan} />
-                                      <Field label="Date of Birth" value={e.dob} />
-                                      <div className="col-span-2 md:col-span-3"><Field label="Address" value={e.address} /></div>
+                                       <Field label="Aadhaar No" value={e.aadhaar} />
+                                       <Field label="PAN" value={e.pan} />
+                                       <Field label="Date of Birth" value={e.dob} />
+                                       <Field label="Occupation" value={e.occupation} />
+                                       <Field label="Mobile No" value={e.cellNo} />
+                                       <div className="col-span-2 md:col-span-3"><Field label="Address" value={e.address} /></div>
                                     </div>
                                   ))}
                                 </div>
@@ -4786,10 +4988,12 @@ const getTeluguRecommendation = (rec: string) => {
                                       <Field label="Name" value={c.name} />
                                       <Field label="Relation (S/o, W/o, D/o)" value={c.relation} />
                                       <Field label="Age" value={c.age ? String(c.age) : ""} />
-                                      <Field label="Aadhaar No" value={c.aadhaar} />
-                                      <Field label="PAN" value={c.pan} />
-                                      <Field label="Date of Birth" value={c.dob} />
-                                      <div className="col-span-2 md:col-span-3"><Field label="Address" value={c.address} /></div>
+                                       <Field label="Aadhaar No" value={c.aadhaar} />
+                                       <Field label="PAN" value={c.pan} />
+                                       <Field label="Date of Birth" value={c.dob} />
+                                       <Field label="Occupation" value={c.occupation} />
+                                       <Field label="Mobile No" value={c.cellNo} />
+                                       <div className="col-span-2 md:col-span-3"><Field label="Address" value={c.address} /></div>
                                     </div>
                                   ))}
                                 </div>
@@ -4802,20 +5006,44 @@ const getTeluguRecommendation = (rec: string) => {
                                 <MapPin className="w-4 h-4" /> Schedule of Property
                               </h3>
                               <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-3">
-                                <Field label="Survey No" value={review.property.surveyNo} />
-                                <Field label="H. No" value={review.property.hNo} />
-                                <Field label="Plot No" value={review.property.plotNo} />
-                                <Field label="PTI / Passbook No" value={review.property.ptiNo} />
-                                <Field label="Extent (Sq. Yards)" value={review.property.extentSqYards} />
-                                <Field label="Plinth Area" value={review.property.plinthArea} />
-                                <Field label="Village" value={review.property.village} />
+                                 <Field label="Survey No" value={review.property.surveyNo} />
+                                 <Field label="Property Type" value={review.property.propertyType} />
+                                 <Field label="H. No" value={review.property.hNo} />
+                                 <Field label="Plot No" value={review.property.plotNo} />
+                                 <Field label="PTI / Passbook No" value={review.property.ptiNo} />
+                                 <Field label="BLT No" value={review.property.bltNo} />
+                                 <Field label="Extent (Sq. Yards)" value={review.property.extentSqYards} />
+                                 <Field label="Extent (Sq. Metres)" value={review.property.extentSqMeters} />
+                                 <Field label="Plinth Area" value={review.property.plinthArea} />
+                                 <Field label="Adjacent H. No" value={review.property.adjacentHNo} />
+                                 <Field label="Locality" value={review.property.locality || review.property.demoLocality || review.property.partLocality || review.property.flatLocality} />
+                                 <Field label="Pincode" value={review.property.pincode} />
+                                 <Field label="Market Value per Sq. Yard" value={review.property.marketValuePerSqYard} />
+                                 <Field label="Village" value={review.property.village} />
                                 <Field label="Mandal" value={review.property.mandal} />
                                 <Field label="District" value={review.property.district} />
                                 <Field label="State" value={review.property.state} />
                                 <Field label="Market Value (Rs.)" value={review.marketValue} />
-                                <Field label="Stamp Duty (Rs.)" value={review.stampsAmount} />
-                              </div>
-                            </section>
+                                 <Field label="Stamp Duty (Rs.)" value={review.stampsAmount} />
+                               </div>
+                               <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-3 mt-4 pt-4 border-t border-slate-100">
+                                 <Field label="House Nature" value={review.property.houseNature} />
+                                 <Field label="House Floors" value={review.property.houseFloors} />
+                                 <Field label="House Age" value={review.property.houseAge} />
+                                 <Field label="Tap Connection" value={review.property.houseTapConnection || review.property.demoTapConnection || review.property.flatTapConnection} />
+                                 <Field label="Meter No" value={review.property.houseMetersNo || review.property.demoMetersNo || review.property.flatMetersNo} />
+                                 <Field label="Annual Taxes" value={review.property.houseTaxes || review.property.flatTaxes} />
+                                 <Field label="Annual Rental Value" value={review.property.houseRentalValue || review.property.flatRentalValue} />
+                                 <Field label="Flat No" value={review.property.flatNo} />
+                                 <Field label="Flat Building Name" value={review.property.flatBuildingName} />
+                                 <Field label="Flat Floor" value={review.property.flatFloorS} />
+                                 <Field label="Flat UDS (Sq. Yards)" value={review.property.flatUndividedSqYards} />
+                                 <Field label="Flat UDS (Sq. Metres)" value={review.property.flatUndividedSqMeters} />
+                                 <Field label="Flat Value per Sq. Ft" value={review.property.flatValuePerSqFeet} />
+                                 <Field label="Flat Total Market Value" value={review.property.flatMarketValueTotal} />
+                                 <Field label="Total Land" value={review.property.flatTotalLand} />
+                               </div>
+                             </section>
 
                             {/* Boundaries */}
                             <section>
@@ -4828,16 +5056,43 @@ const getTeluguRecommendation = (rec: string) => {
                                 <Field label="North by" value={review.property.boundaries.north} />
                                 <Field label="South by" value={review.property.boundaries.south} />
                               </div>
-                            </section>
+                             </section>
+
+                             {/* Jurisdiction */}
+                             <section>
+                               <h3 className="text-xs font-extrabold text-[#0a4d4a] uppercase tracking-widest mb-3 flex items-center gap-2 border-b border-slate-200 pb-1.5">
+                                 <MapPin className="w-4 h-4" /> Registration Jurisdiction
+                               </h3>
+                               {review.jurisdictions.length === 0 ? (
+                                 <p className="text-[12px] text-slate-400 italic">No jurisdiction details captured yet.</p>
+                               ) : review.jurisdictions.map((jurisdiction: any, i: number) => (
+                                 <div key={i} className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-3 p-3 bg-slate-50/70 border border-slate-100 rounded-lg mb-3">
+                                   <Field label="District Registrar" value={jurisdiction.districtRegistrar} />
+                                   <Field label="Sub-Registrar" value={jurisdiction.subRegistrar} />
+                                   <Field label="District" value={jurisdiction.district} />
+                                   <Field label="Mandal" value={jurisdiction.mandal} />
+                                   <Field label="Village" value={jurisdiction.village} />
+                                   <Field label="Pincode" value={jurisdiction.pincode} />
+                                 </div>
+                               ))}
+                             </section>
 
                             {/* Link document */}
                             <section>
                               <h3 className="text-xs font-extrabold text-[#0a4d4a] uppercase tracking-widest mb-3 flex items-center gap-2 border-b border-slate-200 pb-1.5">
                                 <BookOpen className="w-4 h-4" /> Link / Acquisition Document
                               </h3>
-                              <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-3">
-                                <Field label="Link Deed No" value={review.linkDeed.deedNumber} />
+                               <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-3">
+                                 <Field label="Link Doc Type" value={review.linkDeed.docType} />
+                                 <Field label="Link Deed No" value={review.linkDeed.deedNumber} />
+                                <Field label="Link Deed Date" value={review.linkDeed.executionDate} />
                                 <Field label="Sub-Registrar Office" value={review.linkDeed.village} />
+                                <Field label="SRO / Sub-Registrar Code" value={review.linkDeed.subRegistrarCode} />
+                                <Field label="Layout File No" value={review.linkDeed.layoutFileNo} />
+                                <Field label="Pattadar Passbook No" value={review.linkDeed.pattadarPassbookNo} />
+                                <Field label="Passbook Khata No" value={review.linkDeed.passbookKhataNo} />
+                                <Field label="NALA Order No" value={review.linkDeed.nalaOrderNo} />
+                                <Field label="House Tax Receipt" value={review.linkDeed.houseTaxReceipt} />
                                 <Field label="Nature of Transaction" value={review.natureOfTransaction} />
                               </div>
                             </section>
@@ -5027,10 +5282,10 @@ const getTeluguRecommendation = (rec: string) => {
                               <span className="text-[10px] text-slate-400">{filledDeedText.length.toLocaleString()} chars</span>
                             </div>
                             <div className="flex items-center gap-2">
-                              {generatedDocxBase64 && (
+                              {filledDeedText && (
                                 <button
                                   type="button"
-                                  onClick={() => setPreviewEditing((v) => !v)}
+                                  onClick={togglePreviewEditing}
                                   title={previewEditing ? "Finish editing and return to the live document preview" : "Edit the full document text"}
                                   className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold border transition-colors ${
                                     previewEditing
@@ -5293,7 +5548,7 @@ const getTeluguRecommendation = (rec: string) => {
                           )}
                           <button
                             type="button"
-                            onClick={() => setPreviewEditing((v) => !v)}
+                            onClick={togglePreviewEditing}
                             title={previewEditing ? "Finish editing and re-flow pages" : "Edit the full document text"}
                             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-wider border shadow-sm transition-colors ${
                               previewEditing

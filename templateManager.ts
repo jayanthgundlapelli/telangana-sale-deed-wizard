@@ -85,7 +85,7 @@ Sri/Smt {{BUYER_NAME}}, {{BUYER_RELATION}}, aged about {{BUYER_AGE}}, residing a
 
 WHEREAS the Seller is the absolute owner and possessor of the residential property bearing H.No {{PROPERTY_HNO}}, Plot No {{PROPERTY_PLOT}}, Survey No {{PROPERTY_SURVEY}}, PTI No {{PROPERTY_PTI}}, admeasuring {{PROPERTY_EXTENT}} with a plinth area of {{PROPERTY_PLINTH}}, situated at {{PROPERTY_VILLAGE}} Village, {{PROPERTY_MANDAL}} Mandal, {{PROPERTY_DISTRICT}} District, Telangana.
 
-AND WHEREAS the Seller acquired absolute title through registered link document bearing No {{LINK_DEED_NO}} dated {{LINK_DEED_DATE}} at the Sub-Registrar Office, {{PROPERTY_VILLAGE}}.
+AND WHEREAS the Seller acquired absolute title through registered link document bearing No {{LINK_DEED_NO}} dated {{LINK_DEED_DATE}} at the Sub-Registrar Office, {{SUB_REGISTRAR}}, SRO Code {{SUB_REGISTRAR_CODE}}.
 
 NOW THIS DEED OF SALE WITNESSETH AS UNDER:
 1. That the Seller hereby transfers, sells, and conveys all rights, title, and interest in the scheduled property in favour of the Buyer for the consideration of Rs. {{MARKET_VALUE}}.
