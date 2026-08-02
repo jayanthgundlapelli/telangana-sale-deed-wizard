@@ -636,6 +636,18 @@ export function buildAngleFieldResolver(details: any): {
   const prop = d.property || {};
   const bounds = prop.boundaries || {};
   const link = d.linkDeed || {};
+  const formatIndianCurrency = (value: unknown): string => {
+    const raw = String(value || "")
+      .replace(/[₹,\s]/g, "")
+      .replace(/^rs\.?/i, "")
+      .replace(/\/-$/, "")
+      .trim();
+    if (!raw || !/^\d*(?:\.\d{0,2})?$/.test(raw)) return String(value || "");
+    const amount = Number(raw);
+    if (!Number.isFinite(amount)) return String(value || "");
+    const fractionDigits = raw.includes(".") ? Math.min(2, (raw.split(".")[1] || "").length) : 0;
+    return amount.toLocaleString("en-IN", { minimumFractionDigits: fractionDigits, maximumFractionDigits: 2 });
+  };
 
   // Party names in CAPITALS (registration convention). Kept comma-joined here
   // (not newline-joined) because this value is spliced into a single <w:t> run in
@@ -669,8 +681,8 @@ export function buildAngleFieldResolver(details: any): {
       : "");
 
   const raw: Record<string, string> = {
-    "market of value rs./-": String(d.marketValue || prop.marketValueTotal || ""),
-    "stamp of rs/-": String(d.stampsAmount || ""),
+    "market of value rs./-": formatIndianCurrency(d.marketValue || prop.marketValueTotal || ""),
+    "stamp of rs/-": formatIndianCurrency(d.stampsAmount || ""),
     "market value per yard/-": String(perYard || ""),
 
     "executant name": joinNames(sellers),

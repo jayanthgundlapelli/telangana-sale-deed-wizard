@@ -42,6 +42,19 @@ const Type = {
   ARRAY: "ARRAY" as const,
 };
 
+function formatIndianCurrency(value: unknown): string {
+  const raw = String(value || "")
+    .replace(/[₹,\s]/g, "")
+    .replace(/^rs\.?/i, "")
+    .replace(/\/-$/, "")
+    .trim();
+  if (!raw || !/^\d*(?:\.\d{0,2})?$/.test(raw)) return String(value || "");
+  const amount = Number(raw);
+  if (!Number.isFinite(amount)) return String(value || "");
+  const fractionDigits = raw.includes(".") ? Math.min(2, (raw.split(".")[1] || "").length) : 0;
+  return amount.toLocaleString("en-IN", { minimumFractionDigits: fractionDigits, maximumFractionDigits: 2 });
+}
+
 // Load environment variables from .env.local first, then .env as fallback
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -414,7 +427,7 @@ function localFillTemplate(templateText: string, details: any): string {
     "{{PROPERTY_PLINTH}}": prop.plinthArea || "",
     "{{PROPERTY_LOCALITY}}": prop.locality || prop.demoLocality || prop.partLocality || prop.flatLocality || "",
     "{{PROPERTY_ADJACENT_HNO}}": prop.adjacentHNo || "",
-    "{{PROPERTY_MARKET_VALUE_PER_SQ_YARD}}": prop.marketValuePerSqYard || "",
+    "{{PROPERTY_MARKET_VALUE_PER_SQ_YARD}}": formatIndianCurrency(prop.marketValuePerSqYard || ""),
     "{{HOUSE_NATURE}}": prop.houseNature || "",
     "{{HOUSE_FLOORS}}": prop.houseFloors || "",
     "{{HOUSE_AGE}}": prop.houseAge || "",
@@ -427,8 +440,8 @@ function localFillTemplate(templateText: string, details: any): string {
     "{{FLAT_FLOOR}}": prop.flatFloorS || "",
     "{{FLAT_UDS_SQ_YARDS}}": prop.flatUndividedSqYards || "",
     "{{FLAT_UDS_SQ_METERS}}": prop.flatUndividedSqMeters || "",
-    "{{FLAT_VALUE_PER_SQ_FEET}}": prop.flatValuePerSqFeet || "",
-    "{{FLAT_MARKET_VALUE_TOTAL}}": prop.flatMarketValueTotal || "",
+    "{{FLAT_VALUE_PER_SQ_FEET}}": formatIndianCurrency(prop.flatValuePerSqFeet || ""),
+    "{{FLAT_MARKET_VALUE_TOTAL}}": formatIndianCurrency(prop.flatMarketValueTotal || ""),
     "{{FLAT_TOTAL_LAND}}": prop.flatTotalLand || "",
     "{{BOUNDARY_EAST}}": bounds.east || "",
     "{{BOUNDARY_WEST}}": bounds.west || "",
@@ -450,11 +463,19 @@ function localFillTemplate(templateText: string, details: any): string {
 function generateRule3MarketValueTable(details: any): string {
   const d = details || {};
   const prop = d.property || {};
+  const formatIndianCurrency = (value: unknown): string => {
+    const raw = String(value || "").replace(/,/g, "").trim();
+    if (!raw || !/^\d*(?:\.\d{0,2})?$/.test(raw)) return String(value || "");
+    const amount = Number(raw);
+    if (!Number.isFinite(amount)) return String(value || "");
+    const fractionDigits = raw.includes(".") ? Math.min(2, (raw.split(".")[1] || "").length) : 0;
+    return amount.toLocaleString("en-IN", { minimumFractionDigits: fractionDigits, maximumFractionDigits: 2 });
+  };
   const totalValNum = Number((d.marketValue || prop.marketValueTotal || "0").toString().replace(/,/g, "")) || 0;
-  const valStr = totalValNum > 0 ? totalValNum.toLocaleString("en-IN") : (d.marketValue || prop.marketValueTotal || "0");
+  const valStr = totalValNum > 0 ? formatIndianCurrency(totalValNum) : formatIndianCurrency(d.marketValue || prop.marketValueTotal || "0");
   
   const ptiVal = prop.vltPtiNo || prop.ptiNo || "";
-  const ratePerYd = prop.marketValuePerSqYard ? `Rs. ${prop.marketValuePerSqYard}/- per Sq.Yard` : (prop.flatValuePerSqFeet ? `Rs. ${prop.flatValuePerSqFeet}/- per Sq.Ft` : "As per Basic Valuation Register");
+  const ratePerYd = prop.marketValuePerSqYard ? `Rs. ${formatIndianCurrency(prop.marketValuePerSqYard)}/- per Sq.Yard` : (prop.flatValuePerSqFeet ? `Rs. ${formatIndianCurrency(prop.flatValuePerSqFeet)}/- per Sq.Ft` : "As per Basic Valuation Register");
   const yardsMatch = String(prop.extentSqYards || "").replace(/,/g, "").match(/\d+(?:\.\d+)?/);
   const calculatedSqMetres = yardsMatch
     ? (Number(yardsMatch[0]) * 0.83612736).toFixed(4).replace(/\.?(0+)$/, "")
@@ -472,7 +493,7 @@ function generateRule3MarketValueTable(details: any): string {
     ptiVal ? `VLT / PTI No: ${ptiVal}` : "",
   ].filter(Boolean).join(", ");
 
-  const stampDutyVal = d.stampsAmount || (totalValNum > 0 ? Math.round(totalValNum * 0.05).toLocaleString("en-IN") : "");
+  const stampDutyVal = d.stampsAmount ? formatIndianCurrency(d.stampsAmount) : (totalValNum > 0 ? Math.round(totalValNum * 0.05).toLocaleString("en-IN") : "");
   const transferDutyVal = totalValNum > 0 ? Math.round(totalValNum * 0.015).toLocaleString("en-IN") : "";
   const regFeeVal = totalValNum > 0 ? Math.round(totalValNum * 0.005).toLocaleString("en-IN") : "";
   const totalPayableVal = totalValNum > 0 ? Math.round(totalValNum * 0.07).toLocaleString("en-IN") : "";
@@ -560,8 +581,8 @@ function buildPlaceholderMap(details: any): Record<string, string> {
 
   return {
     "{{REGISTRATION_DATE}}": d.registrationDate || "",
-    "{{MARKET_VALUE}}": d.marketValue || prop.marketValueTotal || "",
-    "{{STAMP_DUTY}}": d.stampsAmount || "",
+    "{{MARKET_VALUE}}": formatIndianCurrency(d.marketValue || prop.marketValueTotal || ""),
+    "{{STAMP_DUTY}}": formatIndianCurrency(d.stampsAmount || ""),
     "{{NATURE_OF_TRANSACTION}}": d.natureOfTransaction || "",
     "{{SELLER_NAME}}": joinNames(sellers),
     "{{SELLER_RELATION}}": joinRel(sellers),

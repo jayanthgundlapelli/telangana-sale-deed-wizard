@@ -165,6 +165,27 @@ const squareYardsToSquareMetres = (value: string): string => {
     .replace(/\.?(0+)$/, "");
 };
 
+// Store currency values in the Indian grouping style everywhere they are shown:
+// 5000000 becomes 50,00,000. Supports optional paise without treating an empty
+// field as zero, so the user can still clear and replace a value naturally.
+const formatIndianCurrency = (value: string): string => {
+  const normalized = String(value || "")
+    .replace(/[₹,\s]/g, "")
+    .replace(/^rs\.?/i, "")
+    .replace(/\/-$/, "")
+    .trim();
+  if (!normalized || !/^\d*(?:\.\d{0,2})?$/.test(normalized)) return "";
+  const amount = Number(normalized);
+  if (!Number.isFinite(amount)) return "";
+  const fractionDigits = normalized.includes(".")
+    ? Math.min(2, (normalized.split(".")[1] || "").length)
+    : 0;
+  return amount.toLocaleString("en-IN", {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: 2,
+  });
+};
+
 // An Aadhaar card's FRONT (name, DOB, photo, number) and BACK (relation, address)
 // carry DISJOINT fields but share the SAME 12-digit number. Uploading each side
 // used to create two half-empty rows. This merges a newly extracted side into the
@@ -1340,8 +1361,8 @@ export default function App() {
                vltPtiNo: data.property.vltPtiNo || data.property.ptiNo || "",
                bltNo: "",
                ptiNo: data.property.ptiNo || data.property.vltPtiNo || "",
-               marketValueTotal: data.property.marketValueTotal || "",
-              marketValuePerSqYard: data.property.marketValuePerSqYard || "",
+               marketValueTotal: formatIndianCurrency(data.property.marketValueTotal || ""),
+              marketValuePerSqYard: formatIndianCurrency(data.property.marketValuePerSqYard || ""),
               houseBearingHNo: data.property.nearHNo || data.property.house?.bearingHNo || "",
               houseNature: data.property.house?.nature || "",
               houseFloors: data.property.house?.floors || "",
@@ -1361,7 +1382,7 @@ export default function App() {
               demoTapConnection: data.property.house?.tapConnection || "", demoMetersNo: data.property.house?.metersNo || "",
               partBearingHNo: data.property.nearHNo || "", partLocality: data.property.locality || "",
               flatUndividedSqMeters: "", flatNature: "", flatLocality: data.property.locality || "", flatValuePerSqFeet: "",
-              flatMarketValueTotal: data.property.marketValueTotal || "", flatAge: data.property.house?.age || "",
+               flatMarketValueTotal: formatIndianCurrency(data.property.marketValueTotal || ""), flatAge: data.property.house?.age || "",
               flatTapConnection: data.property.house?.tapConnection || "", flatMetersNo: data.property.house?.metersNo || "",
               flatTaxes: "", flatRentalValue: "", flatNearHNo: data.property.nearHNo || "", flatPlinthArea: data.property.house?.plinthArea || "", flatTotalLand: ""
             }];
@@ -1401,10 +1422,10 @@ export default function App() {
               target.ptiNo = data.property.ptiNo || data.property.vltPtiNo;
             }
             if (data.property.marketValueTotal) {
-              target.marketValueTotal = data.property.marketValueTotal;
-              target.flatMarketValueTotal = target.flatMarketValueTotal || data.property.marketValueTotal;
+              target.marketValueTotal = formatIndianCurrency(data.property.marketValueTotal);
+              target.flatMarketValueTotal = target.flatMarketValueTotal || formatIndianCurrency(data.property.marketValueTotal);
             }
-            if (data.property.marketValuePerSqYard) target.marketValuePerSqYard = data.property.marketValuePerSqYard;
+            if (data.property.marketValuePerSqYard) target.marketValuePerSqYard = formatIndianCurrency(data.property.marketValuePerSqYard);
 
             if (data.property.house) {
               if (data.property.house.nature) target.houseNature = data.property.house.nature;
@@ -3677,7 +3698,7 @@ const getTeluguRecommendation = (rec: string) => {
                                              <input
                                                type="text"
                                                value={prop.marketValuePerSqYard}
-                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', formatIndianCurrency(e.target.value))}
                                                placeholder="Market Value per sq.yard"
                                                className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
                                              />
@@ -3812,7 +3833,7 @@ const getTeluguRecommendation = (rec: string) => {
                                              <input
                                                type="text"
                                                value={prop.marketValuePerSqYard}
-                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', formatIndianCurrency(e.target.value))}
                                                placeholder="Market Value per sq.yard"
                                                className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
                                              />
@@ -3967,7 +3988,7 @@ const getTeluguRecommendation = (rec: string) => {
                                             <input
                                               type="text"
                                               value={prop.marketValuePerSqYard}
-                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', formatIndianCurrency(e.target.value))}
                                               placeholder="Market Value per sq.yard"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
                                             />
@@ -4082,7 +4103,7 @@ const getTeluguRecommendation = (rec: string) => {
                                             <input
                                               type="text"
                                               value={prop.marketValuePerSqYard}
-                                              onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', e.target.value)}
+                                               onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', formatIndianCurrency(e.target.value))}
                                               placeholder="Market Value per sq.yard"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
                                             />
@@ -4184,7 +4205,7 @@ const getTeluguRecommendation = (rec: string) => {
                                             <input
                                               type="text"
                                               value={prop.flatValuePerSqFeet}
-                                              onChange={(e) => updateProperty(prop.id, 'flatValuePerSqFeet', e.target.value)}
+                                               onChange={(e) => updateProperty(prop.id, 'flatValuePerSqFeet', formatIndianCurrency(e.target.value))}
                                               placeholder="Market Value per sq.feet"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
                                             />
@@ -4429,13 +4450,7 @@ const getTeluguRecommendation = (rec: string) => {
                               <input
                                 type="text"
                                 value={marketValue}
-                                onChange={(e) => {
-                                  const val = e.target.value.replace(/,/g, "");
-                                  if (!isNaN(Number(val))) {
-                                    setMarketValue(val);
-                                    // Removed auto-calculation - user should enter stamps amount manually
-                                  }
-                                }}
+                                onChange={(e) => setMarketValue(formatIndianCurrency(e.target.value))}
                                 className="w-full pl-6 pr-2 py-1.5 border border-slate-300 rounded-md text-xs font-mono font-bold text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-[#0a4d4a]"
                                 placeholder="Market value amount"
                               />
@@ -4451,12 +4466,7 @@ const getTeluguRecommendation = (rec: string) => {
                               <input
                                 type="text"
                                 value={stampsAmount}
-                                onChange={(e) => {
-                                  const val = e.target.value.replace(/,/g, "");
-                                  if (!isNaN(Number(val))) {
-                                    setStampsAmount(val);
-                                  }
-                                }}
+                                onChange={(e) => setStampsAmount(formatIndianCurrency(e.target.value))}
                                 className="w-full pl-6 pr-2 py-1.5 border border-slate-300 rounded-md text-xs font-mono font-bold text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-[#0a4d4a]"
                                 placeholder="Stamp duty amount"
                               />
