@@ -740,6 +740,8 @@ export function buildAngleFieldResolver(details: any): {
     "sub registrar code": String(link.subRegistrarCode || ""),
     "sro code": String(link.subRegistrarCode || ""),
     "layout file no.": String(link.layoutFileNo || ""),
+    "pattadar passbook no.": String(link.pattadarPassbookNo || ""),
+    "passbook khata no.": String(link.passbookKhataNo || ""),
     "nala order no.": String(link.nalaOrderNo || ""),
     "house tax receipt": String(link.houseTaxReceipt || ""),
 

@@ -682,14 +682,14 @@ function addMissingFormDetailsSchedule(templateText: string, details: any): stri
     ].filter(([, value]) => String(value || "").trim()).map(([label, value]) => `${label}: ${value}`);
     return rows.length ? [`JURISDICTION ${index + 1}:`, ...rows, ""] : [];
   });
-  const linkLines = linkDocuments.slice(1).flatMap((link: any, index: number) => {
+  const linkLines = linkDocuments.flatMap((link: any, index: number) => {
     const rows = [
       ["Layout File No.", link.layoutFileNo], ["Link Document Type", link.linkDocType || link.docType || link.type], ["Link Document No.", link.linkDocNo || link.deedNumber],
       ["Link Document Date", link.linkDocDate || link.executionDate], ["Sub-Registrar", link.subRegistrar || link.village],
       ["SRO Code", link.subRegistrarCode], ["Pattadar Passbook No.", link.pattadarPassbookNo],
       ["Passbook Khata No.", link.passbookKhataNo], ["NALA Order No.", link.nalaOrderNo], ["House Tax Receipt", link.houseTaxReceipt],
     ].filter(([, value]) => String(value || "").trim()).map(([label, value]) => `${label}: ${value}`);
-    return rows.length ? [`LINK DOCUMENT ${index + 2}:`, ...rows, ""] : [];
+    return rows.length ? [`LINK DOCUMENT ${index + 1}:`, ...rows, ""] : [];
   });
   const schedule = [...propertyLines, ...jurisdictionLines, ...linkLines];
   return schedule.length ? `${templateText.trim()}\n\nADDITIONAL REGISTRATION FORM DETAILS:\n${schedule.join("\n")}` : templateText;
