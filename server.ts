@@ -7,7 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
 import { buildDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx } from "./documentBuilder";
-import { fillDocxTemplate, buildAngleFieldResolver } from "./templateFiller";
+import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs } from "./templateFiller";
 import {
   renderPlanDataUrl,
   parsePlanPrompt,
@@ -315,8 +315,9 @@ function normalizeAadhaar(data: any): any {
   }
   const now = new Date();
   if (year && month && day) {
-    // Normalize to DD/MM/YYYY for display consistency
-    data.dob = `${String(day).padStart(2, "0")}/${String(month).padStart(2, "0")}/${year}`;
+    // Normalize to DD-MM-YYYY — the final document must ALWAYS render dates
+    // in this format, never DD/MM/YYYY or any other separator/order.
+    data.dob = `${String(day).padStart(2, "0")}-${String(month).padStart(2, "0")}-${year}`;
     // Completed age as of TODAY — not a bare year subtraction. A legal deed states the
     // person's current (last-birthday) age, so we must account for whether this year's
     // birthday has already occurred. E.g. DOB 12/12/1979 on 2026-07-26 is 46, not 47.
@@ -448,9 +449,9 @@ function localFillTemplate(templateText: string, details: any): string {
     "{{BOUNDARY_NORTH}}": bounds.north || "",
     "{{BOUNDARY_SOUTH}}": bounds.south || "",
     "{{LINK_DEED_NO}}": link.deedNumber || "",
-    "{{LINK_DEED_DATE}}": link.executionDate || ""
+    "{{LINK_DEED_DATE}}": toDDMMYYYY(link.executionDate)
   };
-  
+
   Object.entries(replacements).forEach(([placeholder, value]) => {
     const regex = new RegExp(placeholder.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g');
     result = result.replace(regex, value);
@@ -580,7 +581,7 @@ function buildPlaceholderMap(details: any): Record<string, string> {
   const vltPti = prop.ptiNo || prop.vltPtiNo || "";
 
   return {
-    "{{REGISTRATION_DATE}}": d.registrationDate || "",
+    "{{REGISTRATION_DATE}}": toDDMMYYYY(d.registrationDate),
     "{{MARKET_VALUE}}": formatIndianCurrency(d.marketValue || prop.marketValueTotal || ""),
     "{{STAMP_DUTY}}": formatIndianCurrency(d.stampsAmount || ""),
     "{{NATURE_OF_TRANSACTION}}": d.natureOfTransaction || "",
@@ -657,7 +658,7 @@ function addMissingFormDetailsSchedule(templateText: string, details: any): stri
   const jurisdictions = Array.isArray(d.jurisdictions) ? d.jurisdictions : [];
   const linkDocuments = Array.isArray(d.linkDocuments) && d.linkDocuments.length ? d.linkDocuments : [d.linkDeed || {}];
   const fieldLabel: Record<string, string> = {
-    propertyType: "Property Type", extentSqMeters: "Extent in Sq. Metres", adjacentHNo: "Adjacent H. No.", bltNo: "BLT No.", ptiNo: "PTI No.",
+    propertyType: "Property Type", extentSqMeters: "Extent in Sq. Metres", adjacentHNo: "Adjacent H. No.", bltNo: "V.L.T. No.", ptiNo: "P.T.I. No.",
     locality: "Locality", marketValuePerSqYard: "Market Value per Sq. Yard", houseBearingHNo: "House Bearing H. No.",
     houseNature: "Nature of House", houseFloors: "Floors", housePlinthArea: "House Plinth Area", houseAge: "Age of House",
     houseTapConnection: "Tap Connection No.", houseMetersNo: "Meter No.", houseTaxes: "Taxes Per Annum", houseRentalValue: "Annual Rental Value",
@@ -700,14 +701,15 @@ function registrationDetailsLines(details: any): string[] {
   const jurisdictions = Array.isArray(d.jurisdictions) ? d.jurisdictions : [];
   const links = Array.isArray(d.linkDocuments) && d.linkDocuments.length ? d.linkDocuments : [d.linkDeed || {}];
   const lines: string[] = [];
+  const DATE_KEYS = new Set(["linkDocDate", "executionDate"]);
   const append = (heading: string, source: any, labels: Record<string, string>) => {
     const values = Object.entries(labels)
-      .map(([key, label]) => [label, source?.[key]] as const)
+      .map(([key, label]) => [label, DATE_KEYS.has(key) ? toDDMMYYYY(source?.[key]) : source?.[key]] as const)
       .filter(([, value]) => String(value || "").trim());
     if (values.length) lines.push(heading, ...values.map(([label, value]) => `${label}: ${value}`), "");
   };
   properties.forEach((property: any, index: number) => append(`PROPERTY ${index + 1}:`, property, {
-    propertyType: "Property Type", plotNo: "Plot No.", surveyNo: "Survey No.", nearHNo: "Near H. No.", adjacentHNo: "Adjacent H. No.", locality: "Locality", pincode: "Pincode", vltPtiNo: "VLT/PTI No.", ptiNo: "PTI No.", bltNo: "BLT No.",
+    propertyType: "Property Type", plotNo: "Plot No.", surveyNo: "Survey No.", nearHNo: "Near H. No.", adjacentHNo: "Adjacent H. No.", locality: "Locality", pincode: "Pincode", vltPtiNo: "V.L.T. No.", ptiNo: "P.T.I. No.", bltNo: "V.L.T. No.",
     extentSqYards: "Extent in Sq. Yards", extentSqMeters: "Extent in Sq. Metres", marketValuePerSqYard: "Market Value per Sq. Yard", marketValueTotal: "Market Value Total",
     houseBearingHNo: "House Bearing H. No.", houseNature: "Nature of House", houseFloors: "Floors", housePlinthArea: "House Plinth Area", houseAge: "Age of House", houseTapConnection: "Tap Connection", houseMetersNo: "Meter No.", houseTaxes: "Taxes Per Annum", houseRentalValue: "Annual Rental Value",
     demoBearingHNo: "Demolished House Bearing H. No.", demoLocality: "Demolished House Locality", demoTapConnection: "Demolished House Tap Connection", demoMetersNo: "Demolished House Meter No.",
@@ -797,47 +799,41 @@ ${templateText}`;
   return regexCleanDraft(resultText);
 }
 
-// Try converting a .docx buffer to PDF via LibreOffice (soffice). Returns null if
-// LibreOffice is not installed — PDF is a nice-to-have; Word export is mandatory.
-function convertDocxToPdf(docxBuffer: Buffer): Promise<Buffer | null> {
-  return new Promise(async (resolve) => {
-    let workDir: string | null = null;
-    try {
-      workDir = await fsp.mkdtemp(path.join(os.tmpdir(), "deed-pdf-"));
-      const inPath = path.join(workDir, "deed.docx");
-      const outPath = path.join(workDir, "deed.pdf");
-      await fsp.writeFile(inPath, docxBuffer);
+// The production Docker image contains LibreOffice. Local environments without
+// it return null so the established Word-export fallback remains available.
+async function convertDocxToPdf(docxBuffer: Buffer): Promise<Buffer | null> {
+  let workDir: string | null = null;
+  try {
+    workDir = await fsp.mkdtemp(path.join(os.tmpdir(), "deed-pdf-"));
+    const inPath = path.join(workDir, "deed.docx");
+    const outPath = path.join(workDir, "deed.pdf");
+    await fsp.writeFile(inPath, docxBuffer);
 
-      const candidates = ["soffice", "libreoffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice"];
-      const tryConvert = (idx: number) => {
-        if (idx >= candidates.length) return resolve(null);
+    const candidates = ["soffice", "libreoffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice"];
+    for (const command of candidates) {
+      const converted = await new Promise<boolean>((resolve) => {
         execFile(
-          candidates[idx],
+          command,
           ["--headless", "--convert-to", "pdf", "--outdir", workDir!, inPath],
           { timeout: 60000 },
-          async (err) => {
-            if (err) return tryConvert(idx + 1);
-            try {
-              const pdf = await fsp.readFile(outPath);
-              resolve(pdf);
-            } catch {
-              resolve(null);
-            }
-          }
+          (error) => resolve(!error)
         );
-      };
-      tryConvert(0);
-    } catch {
-      resolve(null);
-    } finally {
-      // Best-effort cleanup after a tick so the file read above can complete.
-      if (workDir) {
-        setTimeout(() => {
-          fsp.rm(workDir!, { recursive: true, force: true }).catch(() => {});
-        }, 2000);
+      });
+      if (!converted) continue;
+
+      try {
+        const pdf = await fsp.readFile(outPath);
+        if (pdf.length > 0) return pdf;
+      } catch {
+        // The command completed without creating a PDF; try the next binary name.
       }
     }
-  });
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (workDir) await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 const app = express();
@@ -963,7 +959,11 @@ app.post("/api/generate-document", async (req, res) => {
     if (typeof customTemplateDocxBase64 === "string" && customTemplateDocxBase64.trim().length > 0) {
       try {
         const { resolve } = buildAngleFieldResolver(details);
-        const filled = await fillDocxTemplate(customTemplateDocxBase64, resolve, { open: "<", close: ">" });
+        const filled = await fillDocxTemplate(customTemplateDocxBase64, resolve, {
+          open: "<",
+          close: ">",
+          preprocessXml: (xml) => expandMultiPartyParagraphs(xml, details),
+        });
         const filledBuffer = await appendRegistrationDetailsPageToDocx(
           filled.buffer,
           "ADDITIONAL REGISTRATION FORM DETAILS",
@@ -1165,7 +1165,11 @@ app.post("/api/export-document", async (req, res) => {
       docxBuffer = await withPlanPage(Buffer.from(raw, "base64"));
     } else if (tmplDocx) {
       const { resolve } = buildAngleFieldResolver(details);
-      const filled = await fillDocxTemplate(tmplDocx, resolve, { open: "<", close: ">" });
+      const filled = await fillDocxTemplate(tmplDocx, resolve, {
+        open: "<",
+        close: ">",
+        preprocessXml: (xml) => expandMultiPartyParagraphs(xml, details),
+      });
       docxBuffer = await withPlanPage(filled.buffer);
     } else {
       // ── FALLBACK PATH: rebuild from text (library templates / no upload) ──────

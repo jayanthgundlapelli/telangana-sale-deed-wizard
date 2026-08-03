@@ -86,6 +86,30 @@ function normKey(inner: string): string {
   return inner.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+// ---- Date normalisation ------------------------------------------------------
+// The finished deed must ALWAYS render dates as DD-MM-YYYY, regardless of the
+// format they arrive in: native <input type="date"> gives ISO "YYYY-MM-DD",
+// OCR/Aadhaar extraction gives "DD/MM/YYYY", some manual entry gives
+// "DD-MM-YYYY" already. Anything unparseable (e.g. a year-only value) is
+// returned unchanged rather than mangled.
+export function toDDMMYYYY(value: unknown): string {
+  const s = String(value || "").trim();
+  if (!s) return "";
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s); // ISO: YYYY-MM-DD
+  if (m) return `${m[3].padStart(2, "0")}-${m[2].padStart(2, "0")}-${m[1]}`;
+  m = /^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/.exec(s); // DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+  if (m) return `${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}-${m[3]}`;
+  return s;
+}
+
+// Capitalise ONLY the S/o, W/o, D/o, C/o relation-prefix abbreviation (matching
+// the registration convention shown in sample deeds), leaving the parent/
+// spouse's own name in normal case, e.g. "W/o Matety Mallikarjun" ->
+// "W/O Matety Mallikarjun".
+export function upperRelPrefix(rel: unknown): string {
+  return String(rel || "").replace(/^\s*(s|w|d|c)\s*\/\s*o\b\.?/i, (m) => m.toUpperCase());
+}
+
 // ---- Node model -------------------------------------------------------------
 type Node =
   | { type: "t"; open: string; text: string } // a <w:t ...>text</w:t>
@@ -636,6 +660,8 @@ export function buildAngleFieldResolver(details: any): {
   const prop = d.property || {};
   const bounds = prop.boundaries || {};
   const link = d.linkDeed || {};
+  const jurisdictions: any[] = Array.isArray(d.jurisdictions) ? d.jurisdictions : [];
+  const firstJur = jurisdictions[0] || {};
   const formatIndianCurrency = (value: unknown): string => {
     const raw = String(value || "")
       .replace(/[₹,\s]/g, "")
@@ -656,9 +682,9 @@ export function buildAngleFieldResolver(details: any): {
   const joinAadhaar = (arr: any[]) => arr.map((x) => x?.aadhaar).filter(Boolean).join(", ");
   const joinAges = (arr: any[]) =>
     arr.map((x) => (x?.age ? String(x.age) : "")).filter(Boolean).join(", ");
-  const joinDob = (arr: any[]) => arr.map((x) => x?.dob).filter(Boolean).join(", ");
+  const joinDob = (arr: any[]) => arr.map((x) => toDDMMYYYY(x?.dob)).filter(Boolean).join(", ");
   const joinAddr = (arr: any[]) => arr.map((x) => x?.address).filter(Boolean).join("; ");
-  const joinRel = (arr: any[]) => arr.map((x) => x?.relation).filter(Boolean).join(", ");
+  const joinRel = (arr: any[]) => arr.map((x) => upperRelPrefix(x?.relation)).filter(Boolean).join(", ");
   const joinOcc = (arr: any[]) => arr.map((x) => x?.occupation).filter(Boolean).join(", ");
   const joinCell = (arr: any[]) => arr.map((x) => x?.cellNo).filter(Boolean).join(", ");
 
@@ -684,6 +710,9 @@ export function buildAngleFieldResolver(details: any): {
     "market of value rs./-": formatIndianCurrency(d.marketValue || prop.marketValueTotal || ""),
     "stamp of rs/-": formatIndianCurrency(d.stampsAmount || ""),
     "market value per yard/-": String(perYard || ""),
+    "market value per sq.yard": prop.marketValuePerSqYard
+      ? formatIndianCurrency(prop.marketValuePerSqYard)
+      : String(perYard || ""),
 
     "executant name": joinNames(sellers),
     "executant relation name": joinRel(sellers),
@@ -706,13 +735,19 @@ export function buildAngleFieldResolver(details: any): {
     "link doct.type": String(link.docType || link.type || "Sale Deed"),
     "link doc type": String(link.docType || link.type || ""),
     "link doct.no.": String(link.deedNumber || ""),
-    "link doct.date": String(link.executionDate || ""),
+    "link doct.date": toDDMMYYYY(link.executionDate),
     "sub registrar": String(link.subRegistrar || link.village || ""),
     "sub registrar code": String(link.subRegistrarCode || ""),
     "sro code": String(link.subRegistrarCode || ""),
     "layout file no.": String(link.layoutFileNo || ""),
     "nala order no.": String(link.nalaOrderNo || ""),
     "house tax receipt": String(link.houseTaxReceipt || ""),
+
+    // SCHEDULE OF PROPERTY jurisdiction fields — sourced from the Jurisdiction
+    // table the user fills in on the property-details page (NOT the link-deed
+    // recital's "Sub Registrar", which is a different field/section).
+    "sub-registrar": String(firstJur.subRegistrar || ""),
+    "district registrar": String(firstJur.districtRegistrar || ""),
 
     "plot no.": String(prop.plotNo || ""),
     "extent in sq.yards": String(prop.extentSqYards || ""),
@@ -721,7 +756,8 @@ export function buildAngleFieldResolver(details: any): {
     "survey no.": String(prop.surveyNo || ""),
     "near h.no.": String(prop.hNo || ""),
     "pti no.": String(prop.ptiNo || prop.vltPtiNo || ""),
-    "blt no.": String(prop.bltNo || ""),
+    "v.l.t.no.": String(prop.vltPtiNo || prop.bltNo || ""),
+    "blt no.": String(prop.bltNo || prop.vltPtiNo || ""),
     "adjacent h.no.": String(prop.adjacentHNo || ""),
     locality: String(prop.locality || prop.village || ""),
     "village & mandal": [prop.village, prop.mandal].filter(Boolean).join(", "),
@@ -762,6 +798,176 @@ export function buildAngleFieldResolver(details: any): {
   return { resolve, knownLabels };
 }
 
+// -----------------------------------------------------------------------------
+// MULTI-PARTY PARAGRAPH EXPANSION (uploaded angle-bracket templates only).
+//
+// The uploaded deed template has ONE paragraph for the executant clause (with
+// <EXECUTANT NAME>, <EXECUTANT RELATION NAME>, ... markers) and ONE for the
+// claimant clause. When there is only a single executant/claimant this is
+// exactly right and the normal comma-joined resolver (buildAngleFieldResolver)
+// fills it in place, unchanged from before.
+//
+// When there are TWO OR MORE executants/claimants, the deed must list each
+// party in its OWN numbered paragraph ("1. Matety Aruna W/O ...", "2. Muthyala
+// Sathyanarayana S/O ..."), per the registration convention — NOT all of them
+// comma-joined into the one template paragraph. fillDocumentXml() never adds or
+// removes <w:p> nodes (by design, to keep formatting byte-identical), so that
+// restructuring cannot happen inside the normal single-pass fill. Instead we
+// pre-process the raw document.xml BEFORE the normal fill pass: locate the one
+// template paragraph carrying the party's "name" marker, clone its exact XML
+// (runs, rPr, position/size — everything) once per party, number each clone,
+// fill each clone with THAT party's own fields only (via a scoped one-party
+// resolver + the same fillDocumentXml() engine used for the whole document),
+// and splice the clones in place of the original single paragraph.
+//
+// This is intentionally scoped to the angle-bracket uploaded-template path
+// only; the curly-brace {{PLACEHOLDER}} library templates and the AI-drafting
+// flow are untouched.
+// -----------------------------------------------------------------------------
+
+function decodeParaText(paraXml: string): string {
+  let t = "";
+  const re = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>|<w:t\s*\/>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(paraXml))) t += m[1] ? decodeXml(m[1]) : "";
+  return t;
+}
+
+// Locate the first <w:p>...</w:p> block whose visible text matches `nameRe`
+// (e.g. the paragraph containing "<EXECUTANT NAME>"). Returns its position in
+// the document so the caller can splice in replacement paragraphs.
+function findPartyParagraph(
+  xml: string,
+  nameRe: RegExp
+): { start: number; end: number; raw: string } | null {
+  const paraRe = /<w:p\b[^>]*>[\s\S]*?<\/w:p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = paraRe.exec(xml))) {
+    if (nameRe.test(decodeParaText(m[0]))) {
+      return { start: m.index, end: m.index + m[0].length, raw: m[0] };
+    }
+  }
+  return null;
+}
+
+// The template's ONE clause paragraph ends with fixed legal boilerplate that
+// must appear only ONCE — after the LAST party — not after every cloned
+// party paragraph: '...Cell No: <Cell.No.>, (Hereinafter called the
+// "VENDOR/S") of the ONE PART.' Splitting the paragraph's runs at the start of
+// that boilerplate lets us repeat only the per-party field runs and append the
+// boilerplate solely to the final clone, matching the target sample deed
+// (each numbered party's own paragraph, closing clause only after the last).
+const CLOSING_CLAUSE_RE = /Hereinafter\s+called/i;
+
+function splitPartyParagraph(
+  paraXml: string
+): { pOpenTag: string; bodyRuns: string; closingRuns: string } | null {
+  const pPrMatch = /<w:pPr>[\s\S]*?<\/w:pPr>/.exec(paraXml);
+  const openTagEnd = paraXml.indexOf(">", paraXml.indexOf("<w:p")) + 1;
+  const afterPPr = pPrMatch ? pPrMatch.index! + pPrMatch[0].length : openTagEnd;
+  const pOpenTag = paraXml.slice(0, afterPPr);
+
+  const runRe = /<w:r\b[^>]*>[\s\S]*?<\/w:r>|<w:r\b[^>]*\/>/g;
+  const runs: { raw: string; text: string }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = runRe.exec(paraXml))) {
+    if (m.index < afterPPr) continue;
+    runs.push({ raw: m[0], text: decodeParaText(m[0]) });
+  }
+  let splitIdx = runs.findIndex((r) => CLOSING_CLAUSE_RE.test(r.text));
+  if (splitIdx === -1) return null; // no boilerplate found — caller falls back to whole-paragraph cloning
+  while (splitIdx > 0 && !runs[splitIdx - 1].text.trim()) splitIdx--; // fold trailing whitespace run into the closing half
+  const bodyRuns = runs.slice(0, splitIdx).map((r) => r.raw).join("");
+  const closingRuns = runs.slice(splitIdx).map((r) => r.raw).join("");
+  return { pOpenTag, bodyRuns, closingRuns };
+}
+
+// Build one numbered <w:p> per party. When the template paragraph carries the
+// "(Hereinafter called ...)" boilerplate, only the LAST party's paragraph gets
+// it; earlier parties' paragraphs contain just their own field runs. When that
+// boilerplate cannot be identified (template shape differs from expected), we
+// fall back to cloning the WHOLE paragraph per party — a safe degradation
+// that still numbers every party, just repeats any trailing fixed text too.
+function cloneAndNumberParagraph(paraXml: string, count: number): string[] {
+  const firstRunRPr = /<w:r\b[^>]*>\s*(<w:rPr>[\s\S]*?<\/w:rPr>)/.exec(paraXml)?.[1] || "";
+  const numberRun = (i: number) => `<w:r>${firstRunRPr}<w:t xml:space="preserve">${i}. </w:t></w:r>`;
+
+  const split = splitPartyParagraph(paraXml);
+  if (!split) {
+    const pPrMatch = /<w:pPr>[\s\S]*?<\/w:pPr>/.exec(paraXml);
+    const openTagEnd = paraXml.indexOf(">", paraXml.indexOf("<w:p")) + 1;
+    const insertAt = pPrMatch ? pPrMatch.index! + pPrMatch[0].length : openTagEnd;
+    const clones: string[] = [];
+    for (let i = 1; i <= count; i++) {
+      clones.push(paraXml.slice(0, insertAt) + numberRun(i) + paraXml.slice(insertAt));
+    }
+    return clones;
+  }
+
+  const { pOpenTag, bodyRuns, closingRuns } = split;
+  const clones: string[] = [];
+  for (let i = 1; i <= count; i++) {
+    const tail = i === count ? bodyRuns + closingRuns : bodyRuns;
+    clones.push(pOpenTag + numberRun(i) + tail + "</w:p>");
+  }
+  return clones;
+}
+
+// A resolver scoped to a SINGLE party (one executant or one claimant), reusing
+// the exact same per-field formatting rules as the multi-party resolver
+// (uppercase name, capitalised S/O·W/O·D/O·C/O prefix, DD-MM-YYYY dates).
+function buildSinglePartyResolver(party: any, prefix: "executant" | "claimant"): (label: string) => string | null {
+  const map: Record<string, string> = {
+    [`${prefix} name`]: (party?.name || "").toUpperCase().trim(),
+    [`${prefix} relation name`]: upperRelPrefix(party?.relation),
+    [`${prefix} age`]: party?.age ? String(party.age) : "",
+    [`${prefix} dob`]: toDDMMYYYY(party?.dob),
+    [`${prefix} occupation`]: party?.occupation || "",
+    [`${prefix} address`]: party?.address || "",
+    [`${prefix} adhar number`]: party?.aadhaar || "",
+    [`${prefix} cell.no.`]: party?.cellNo || "",
+  };
+  return (label: string): string | null => {
+    const key = normKey(label);
+    if (!(key in map)) return null;
+    const val = map[key];
+    return val && val.trim().length ? val : null;
+  };
+}
+
+function expandPartyGroup(
+  xml: string,
+  nameRe: RegExp,
+  parties: any[],
+  prefix: "executant" | "claimant"
+): string {
+  if (parties.length < 2) return xml; // single party: leave to the normal resolver, unchanged
+  const found = findPartyParagraph(xml, nameRe);
+  if (!found) return xml; // template doesn't have the expected clause paragraph — leave as-is
+  const clones = cloneAndNumberParagraph(found.raw, parties.length);
+  const filled = clones.map((paraXml, i) => {
+    const resolver = buildSinglePartyResolver(parties[i], prefix);
+    return fillDocumentXml(paraXml, resolver, "<", ">").xml;
+  });
+  return xml.slice(0, found.start) + filled.join("") + xml.slice(found.end);
+}
+
+/**
+ * Pre-process document.xml so that when there are 2+ executants or 2+
+ * claimants, each party gets their own numbered paragraph instead of being
+ * comma-joined into the template's single clause paragraph. No-op when a
+ * party group has 0 or 1 members, or when the expected clause paragraph
+ * cannot be located (template shape not as expected).
+ */
+export function expandMultiPartyParagraphs(xml: string, details: any): string {
+  const sellers: any[] = Array.isArray(details?.executants) ? details.executants : [];
+  const buyers: any[] = Array.isArray(details?.claimants) ? details.claimants : [];
+  let out = xml;
+  out = expandPartyGroup(out, /<\s*executant\s+name\s*>/i, sellers, "executant");
+  out = expandPartyGroup(out, /<\s*claimant\s+name\s*>/i, buyers, "claimant");
+  return out;
+}
+
 /**
  * Fill an entire .docx (base64 or Buffer) in place and return the new .docx
  * Buffer plus reporting metadata. Only word/document.xml text is modified.
@@ -769,7 +975,7 @@ export function buildAngleFieldResolver(details: any): {
 export async function fillDocxTemplate(
   input: Buffer | string,
   resolve: (inner: string) => string | null,
-  opts: { open?: string; close?: string } = {}
+  opts: { open?: string; close?: string; preprocessXml?: (xml: string) => string } = {}
 ): Promise<FillResult & { buffer: Buffer }> {
   const buf =
     typeof input === "string"
@@ -778,7 +984,8 @@ export async function fillDocxTemplate(
   const zip = await JSZip.loadAsync(buf);
   const docFile = zip.file("word/document.xml");
   if (!docFile) throw new Error("Not a valid .docx (missing word/document.xml).");
-  const xml = await docFile.async("string");
+  let xml = await docFile.async("string");
+  if (opts.preprocessXml) xml = opts.preprocessXml(xml);
 
   const result = fillDocumentXml(xml, resolve, opts.open ?? "<", opts.close ?? ">");
 

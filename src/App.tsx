@@ -3704,12 +3704,12 @@ const getTeluguRecommendation = (rec: string) => {
                                              />
                                            </div>
                                            <div>
-                                             <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">BLT No.</label>
+                                             <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">V.L.T. No.</label>
                                              <input
                                                type="text"
                                                value={prop.bltNo}
                                                onChange={(e) => updateProperty(prop.id, 'bltNo', e.target.value)}
-                                               placeholder="Enter BLT No."
+                                               placeholder="Enter V.L.T. No."
                                                className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
                                              />
                                            </div>
@@ -4013,6 +4013,16 @@ const getTeluguRecommendation = (rec: string) => {
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
                                             />
                                           </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">P.T.I. No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.ptiNo}
+                                              onChange={(e) => updateProperty(prop.id, 'ptiNo', e.target.value)}
+                                              placeholder="Enter P.T.I. No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
+                                            />
+                                          </div>
                                         </div>
                                       </div>
                                     ) : prop.propertyType === "Part of open place" ? (
@@ -4106,6 +4116,16 @@ const getTeluguRecommendation = (rec: string) => {
                                                onChange={(e) => updateProperty(prop.id, 'marketValuePerSqYard', formatIndianCurrency(e.target.value))}
                                               placeholder="Market Value per sq.yard"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono font-bold"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">P.T.I. No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.ptiNo}
+                                              onChange={(e) => updateProperty(prop.id, 'ptiNo', e.target.value)}
+                                              placeholder="Enter P.T.I. No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
                                             />
                                           </div>
                                         </div>
@@ -4308,6 +4328,16 @@ const getTeluguRecommendation = (rec: string) => {
                                               onChange={(e) => updateProperty(prop.id, 'flatTotalLand', e.target.value)}
                                               placeholder="Total land"
                                               className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a]"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-bold text-slate-600 uppercase mb-1">P.T.I. No.</label>
+                                            <input
+                                              type="text"
+                                              value={prop.ptiNo}
+                                              onChange={(e) => updateProperty(prop.id, 'ptiNo', e.target.value)}
+                                              placeholder="Enter P.T.I. No."
+                                              className="w-full border border-slate-300 rounded p-1.5 focus:ring-1 focus:ring-[#0a4d4a] font-mono"
                                             />
                                           </div>
                                         </div>
@@ -5021,7 +5051,7 @@ const getTeluguRecommendation = (rec: string) => {
                                  <Field label="H. No" value={review.property.hNo} />
                                  <Field label="Plot No" value={review.property.plotNo} />
                                  <Field label="PTI / Passbook No" value={review.property.ptiNo} />
-                                 <Field label="BLT No" value={review.property.bltNo} />
+                                 <Field label="V.L.T. No" value={review.property.bltNo} />
                                  <Field label="Extent (Sq. Yards)" value={review.property.extentSqYards} />
                                  <Field label="Extent (Sq. Metres)" value={review.property.extentSqMeters} />
                                  <Field label="Plinth Area" value={review.property.plinthArea} />
