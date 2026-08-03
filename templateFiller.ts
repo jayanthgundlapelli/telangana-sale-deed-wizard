@@ -759,11 +759,16 @@ export function buildAngleFieldResolver(details: any): {
     "v.l.t.no.": String(prop.vltPtiNo || prop.bltNo || ""),
     "blt no.": String(prop.bltNo || prop.vltPtiNo || ""),
     "adjacent h.no.": String(prop.adjacentHNo || ""),
-    locality: String(prop.locality || prop.village || ""),
-    "village & mandal": [prop.village, prop.mandal].filter(Boolean).join(", "),
-    district: String(prop.district || ""),
-    "pin code": String(prop.pincode || ""),
-    village: String(prop.village || ""),
+    locality: String(prop.locality || firstJur.village || prop.village || ""),
+    // Village/Mandal/District/Pin Code in the SCHEDULE OF PROPERTY paragraph
+    // must come from the Jurisdiction table (same source as Sub-Registrar /
+    // District Registrar above), falling back to the property-details fields
+    // only when no Jurisdiction row was filled in.
+    "village & mandal": [firstJur.village || prop.village, firstJur.mandal || prop.mandal].filter(Boolean).join(", "),
+    mandal: String(firstJur.mandal || prop.mandal || ""),
+    district: String(firstJur.district || prop.district || ""),
+    "pin code": String(firstJur.pincode || prop.pincode || ""),
+    village: String(firstJur.village || prop.village || ""),
     "house nature": String(prop.houseNature || ""),
     "house floors": String(prop.houseFloors || ""),
     "house plinth area": String(prop.housePlinthArea || prop.plinthArea || ""),
