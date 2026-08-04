@@ -7,7 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
 import { buildDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx } from "./documentBuilder";
-import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs } from "./templateFiller";
+import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs, upperRelPrefix } from "./templateFiller";
 import {
   renderPlanDataUrl,
   parsePlanPrompt,
@@ -404,13 +404,13 @@ function localFillTemplate(templateText: string, details: any): string {
   
   const replacements: Record<string, string> = {
     "{{SELLER_NAME}}": seller.name || "",
-    "{{SELLER_RELATION}}": seller.relation || "",
+    "{{SELLER_RELATION}}": upperRelPrefix(seller.relation),
     "{{SELLER_AGE}}": seller.age ? `${seller.age} Years` : "",
     "{{SELLER_AADHAAR}}": seller.aadhaar || "",
     "{{SELLER_PAN}}": seller.pan || "",
     "{{SELLER_ADDRESS}}": seller.address || "",
     "{{BUYER_NAME}}": buyer.name || "",
-    "{{BUYER_RELATION}}": buyer.relation || "",
+    "{{BUYER_RELATION}}": upperRelPrefix(buyer.relation),
     "{{BUYER_AGE}}": buyer.age ? `${buyer.age} Years` : "",
     "{{BUYER_AADHAAR}}": buyer.aadhaar || "",
     "{{BUYER_PAN}}": buyer.pan || "",
@@ -575,7 +575,7 @@ function buildPlaceholderMap(details: any): Record<string, string> {
   const joinAges = (arr: any[]) =>
     arr.map((x) => (x?.age ? `${x.age} Years` : "")).filter(Boolean).join(", ");
   const joinAddr = (arr: any[]) => arr.map((x) => x?.address).filter(Boolean).join("\n");
-  const joinRel = (arr: any[]) => arr.map((x) => x?.relation).filter(Boolean).join(", ");
+  const joinRel = (arr: any[]) => arr.map((x) => upperRelPrefix(x?.relation)).filter(Boolean).join(", ");
   const joinPan = (arr: any[]) => arr.map((x) => x?.pan).filter(Boolean).join(", ");
 
   const vltPti = prop.ptiNo || prop.vltPtiNo || "";
@@ -1170,7 +1170,19 @@ app.post("/api/export-document", async (req, res) => {
         close: ">",
         preprocessXml: (xml) => expandMultiPartyParagraphs(xml, details),
       });
-      docxBuffer = await withPlanPage(filled.buffer);
+      // Mirror /api/generate-document's custom-upload path: the uploaded
+      // template's author may not have a marker for every Step-1 field (e.g.
+      // Pattadar Passbook No., Passbook Khata No., NALA Order No., House Tax
+      // Receipt), so append them as a factual schedule page. Without this, any
+      // export that re-fills from the ORIGINAL template bytes (finalText edited
+      // in the preview, or generatedDocxBase64 missing) silently drops those
+      // manually-entered Step-1 values from the final downloaded document.
+      const withSchedule = await appendRegistrationDetailsPageToDocx(
+        filled.buffer,
+        "ADDITIONAL REGISTRATION FORM DETAILS",
+        registrationDetailsLines(details)
+      );
+      docxBuffer = await withPlanPage(withSchedule);
     } else {
       // ── FALLBACK PATH: rebuild from text (library templates / no upload) ──────
       let mergedText: string = typeof finalText === "string" ? finalText : "";
