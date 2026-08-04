@@ -216,22 +216,27 @@ function mergeAadhaar<T extends AadhaarRowData & { id: string }>(
   }
 
   if (idx >= 0) {
+    // Prefer the just-uploaded (incoming) value over the previously-stored one whenever the
+    // new extraction actually returned something for that field. This lets a re-upload (e.g.
+    // a clearer photo of the same card, or a corrected scan) fix a wrong/stale value such as
+    // pincode instead of being silently ignored. Only fall back to the old value when the new
+    // side genuinely has nothing for that field (e.g. the front side has no address/pincode).
     const cur = prev[idx];
-    const rel = cur.relation || incoming.relation;
-    const addr = cleanAddressWithoutRelation(cur.address || incoming.address, rel);
+    const rel = incoming.relation || cur.relation;
+    const addr = cleanAddressWithoutRelation(incoming.address || cur.address, rel);
     const filled: T = {
       ...cur,
-      name: cur.name || incoming.name,
+      name: incoming.name || cur.name,
       relation: rel,
-      occupation: cur.occupation || incoming.occupation,
-      cellNo: cur.cellNo || incoming.cellNo,
-      aadhaarNo: cur.aadhaarNo || incoming.aadhaarNo,
-      age: cur.age || incoming.age,
-      dob: cur.dob || incoming.dob,
+      occupation: incoming.occupation || cur.occupation,
+      cellNo: incoming.cellNo || cur.cellNo,
+      aadhaarNo: incoming.aadhaarNo || cur.aadhaarNo,
+      age: incoming.age || cur.age,
+      dob: incoming.dob || cur.dob,
       address: addr,
-      district: cur.district || incoming.district,
-      state: cur.state || incoming.state,
-      pincode: cur.pincode || incoming.pincode,
+      district: incoming.district || cur.district,
+      state: incoming.state || cur.state,
+      pincode: incoming.pincode || cur.pincode,
     };
     const rows = [...prev];
     rows[idx] = filled;
