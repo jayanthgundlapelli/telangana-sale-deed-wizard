@@ -741,8 +741,11 @@ export function buildAngleFieldResolver(details: any): {
     "sro code": String(link.subRegistrarCode || ""),
     "layout file no.": String(link.layoutFileNo || ""),
     "pattadar passbook no.": String(link.pattadarPassbookNo || ""),
+    "pattadar pass book no": String(link.pattadarPassbookNo || ""),
     "passbook khata no.": String(link.passbookKhataNo || ""),
+    "pass book khata no": String(link.passbookKhataNo || ""),
     "nala order no.": String(link.nalaOrderNo || ""),
+    "nala order no": String(link.nalaOrderNo || ""),
     "house tax receipt": String(link.houseTaxReceipt || ""),
 
     // SCHEDULE OF PROPERTY jurisdiction fields — sourced from the Jurisdiction
