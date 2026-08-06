@@ -1548,21 +1548,62 @@ export default function App() {
   };
 
   // NEW: Delete executant row
+  //
+  // Row 0 is mirrored into the legacy singular state (executantName, executantAadhaar,
+  // executantAddress, etc. — see handleAadhaarUploadExecutant and the table's row-0
+  // onChange handlers) so downstream code that still reads those single fields sees
+  // the same data. buildConsolidatedDetails() falls back to that legacy state ONLY
+  // when executantsList is empty. Previously the table's trash button deleted rows
+  // via a raw filter that never touched the legacy state and had no "keep at least
+  // one" guard — so removing the only executant left executantsList empty while
+  // executantName/executantAadhaar/etc. still held the just-removed party's data,
+  // which buildConsolidatedDetails() then silently resurrected into the generated
+  // document ("removed Aadhaar details reappear after Document Generation"). Keeping
+  // the guard makes the empty-list fallback unreachable once any row has existed, and
+  // re-syncing the legacy state to whatever is now row 0 (or blanking it when the
+  // list is left empty) means there is never a stale value left behind to resurrect.
   const deleteExecutant = (id: string) => {
     if (executantsList.length === 1) {
       alert("At least one executant is required!");
       return;
     }
-    setExecutantsList(prev => prev.filter(exec => exec.id !== id));
+    setExecutantsList(prev => {
+      const idx = prev.findIndex(exec => exec.id === id);
+      const next = prev.filter(exec => exec.id !== id);
+      if (idx === 0) {
+        const r = next[0];
+        setExecutantName(r?.name || "");
+        setExecutantRelation(r?.relation || "");
+        setExecutantAge(Number(r?.age) || 0);
+        setExecutantAadhaar(r?.aadhaarNo || "");
+        setExecutantDOB(r?.dob || "");
+        setExecutantAddress(r?.address || "");
+      }
+      return next;
+    });
   };
 
-  // NEW: Delete claimant row
+  // NEW: Delete claimant row (see deleteExecutant above for why the guard and the
+  // legacy-state re-sync both matter — same bug, same fix, for claimants).
   const deleteClaimant = (id: string) => {
     if (claimantsList.length === 1) {
       alert("At least one claimant is required!");
       return;
     }
-    setClaimantsList(prev => prev.filter(claim => claim.id !== id));
+    setClaimantsList(prev => {
+      const idx = prev.findIndex(claim => claim.id === id);
+      const next = prev.filter(claim => claim.id !== id);
+      if (idx === 0) {
+        const r = next[0];
+        setClaimantName(r?.name || "");
+        setClaimantRelation(r?.relation || "");
+        setClaimantAge(Number(r?.age) || 0);
+        setClaimantAadhaar(r?.aadhaarNo || "");
+        setClaimantDOB(r?.dob || "");
+        setClaimantAddress(r?.address || "");
+      }
+      return next;
+    });
   };
 
   // NEW: Update executant field
@@ -4764,9 +4805,7 @@ const getTeluguRecommendation = (rec: string) => {
                                     <td className="p-1 border border-slate-300 text-center">
                                       <button
                                         type="button"
-                                        onClick={() => {
-                                          setExecutantsList(executantsList.filter(e => e.id !== exec.id));
-                                        }}
+                                        onClick={() => deleteExecutant(exec.id)}
                                         className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors cursor-pointer"
                                         title="Delete executant"
                                       >
@@ -4971,9 +5010,7 @@ const getTeluguRecommendation = (rec: string) => {
                                     <td className="p-1 border border-slate-300 text-center">
                                       <button
                                         type="button"
-                                        onClick={() => {
-                                          setClaimantsList(claimantsList.filter(c => c.id !== claim.id));
-                                        }}
+                                        onClick={() => deleteClaimant(claim.id)}
                                         className="bg-red-500 hover:bg-red-600 text-white p-1.5 rounded transition-colors cursor-pointer"
                                         title="Delete claimant"
                                       >

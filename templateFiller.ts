@@ -788,6 +788,46 @@ export function buildAngleFieldResolver(details: any): {
     "flat plinth area": String(prop.flatPlinthArea || ""),
     "flat total land": String(prop.flatTotalLand || ""),
 
+    // ---- Property-type-specific field ALIASES ---------------------------------
+    // The keys above (e.g. "house nature", "house tap connection") were guessed
+    // internal names. Real uploaded templates for House / Demolished House / Flat
+    // / Part-of-open-place property types mark these fields the same way the
+    // Open-Plot markers already do: using the field's own Step-1 form label
+    // verbatim (e.g. <Nature of House>, <Tap Connection No.>, <Meter No>,
+    // <Taxes Per Annum>). Those labels normalise to keys like "nature of house"
+    // or "meter no", which were previously ABSENT from this map — so `resolve()`
+    // returned null and the markers were left unfilled (reported as "unfilled
+    // placeholders") even though the value was entered on Step 1, for every
+    // property type except Open Plot. Add the literal-label aliases so any
+    // property type behaves the same as Open Plot.
+    "nature of house": String(prop.houseNature || prop.flatNature || ""),
+    "floors": String(prop.houseFloors || ""),
+    "floor/s": String(prop.flatFloorS || ""),
+    "plinth area": String(prop.housePlinthArea || prop.flatPlinthArea || prop.plinthArea || ""),
+    "age of house": String(prop.houseAge || ""),
+    "age of flat": String(prop.flatAge || ""),
+    "tap connection no.": String(prop.houseTapConnection || prop.demoTapConnection || prop.flatTapConnection || ""),
+    "tap connection no": String(prop.houseTapConnection || prop.demoTapConnection || prop.flatTapConnection || ""),
+    "tap connection": String(prop.houseTapConnection || prop.demoTapConnection || prop.flatTapConnection || ""),
+    "meter no": String(prop.houseMetersNo || prop.demoMetersNo || prop.flatMetersNo || ""),
+    "meter no.": String(prop.houseMetersNo || prop.demoMetersNo || prop.flatMetersNo || ""),
+    "meters no": String(prop.houseMetersNo || prop.demoMetersNo || prop.flatMetersNo || ""),
+    "meters no.": String(prop.houseMetersNo || prop.demoMetersNo || prop.flatMetersNo || ""),
+    "meters no/s": String(prop.houseMetersNo || prop.demoMetersNo || prop.flatMetersNo || ""),
+    "taxes per annum": String(prop.houseTaxes || prop.flatTaxes || ""),
+    "annual rental value": String(prop.houseRentalValue || prop.flatRentalValue || ""),
+    "bearing h.no.": String(prop.houseBearingHNo || prop.flatBearingHNo || prop.hNo || ""),
+    "demolished bearing h.no.": String(prop.demoBearingHNo || ""),
+    "part open place of bearing h.no.": String(prop.partBearingHNo || ""),
+    "flat no/s": String(prop.flatNo || ""),
+    "building name": String(prop.flatBuildingName || ""),
+    "undivided share land in sq.yards": String(prop.flatUndividedSqYards || ""),
+    "undivided share land in sq.meters": String(prop.flatUndividedSqMeters || ""),
+    "uds in sq.yards": String(prop.flatUndividedSqYards || ""),
+    "uds in sq.meters": String(prop.flatUndividedSqMeters || ""),
+    "market value per sq.feet": String(prop.flatValuePerSqFeet || ""),
+    "total land": String(prop.flatTotalLand || ""),
+
     "east boundary": String(bounds.east || ""),
     "west boundary": String(bounds.west || ""),
     "north boundary": String(bounds.north || ""),
