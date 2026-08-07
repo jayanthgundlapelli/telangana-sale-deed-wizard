@@ -1,5 +1,18 @@
 @import "tailwindcss";
 
+/* Sree Krushnadevaraya (Telugu, SIL OFL licensed — see public/fonts/SreeKrushnadevaraya-OFL.txt).
+   Declared here so any in-browser rendering of Telugu deed content (e.g. a future
+   live preview of the Telugu-translated .docx) uses the same typeface that gets
+   embedded into the exported .docx, rather than silently falling back to
+   whatever generic Telugu font the OS happens to substitute. */
+@font-face {
+  font-family: "Sree Krushnadevaraya";
+  src: url("/fonts/SreeKrushnadevaraya-Regular.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* docx-preview (Auto-Fill Draft + Stamp Preview): render the real filled .docx
    with page shadows and spacing between sheets so it reads like a stack of A4
    pages, matching the download. docx-preview 0.4.0 with {className:"docxpv"}

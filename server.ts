@@ -6,7 +6,7 @@ import { execFile } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
-import { buildDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx } from "./documentBuilder";
+import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx } from "./documentBuilder";
 import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs, upperRelPrefix } from "./templateFiller";
 import {
   renderPlanDataUrl,
@@ -2311,6 +2311,220 @@ app.post("/api/verify", async (req, res) => {
       verificationRan: false,
       partialChecks: buildOfflinePlaceholderChecks(req.body?.draftText),
     });
+  }
+});
+
+// Pre-draft "Re-Audit" endpoint (Step 3, BEFORE the template is auto-filled).
+// There is no draft yet at this point in the flow, so this cross-checks only
+// the data the user entered/reviewed in Step 1-2 against the uploaded Aadhaar
+// cards and link/Pattadar documents — catching name/Aadhaar/property/boundary
+// mismatches BEFORE spending an AI call to merge them into the template. It
+// reuses the same fail-closed philosophy as /api/verify: no key or an upstream
+// failure returns an HTTP error, never a fabricated "all clear" verdict.
+app.post("/api/pre-audit", async (req, res) => {
+  try {
+    const { aadhaarCards, linkDocuments, enteredDetails, registrationDate } = req.body;
+
+    if (!enteredDetails) {
+      return res.status(400).json({ error: "Entered registration details are required." });
+    }
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      const f = notConfiguredFailure("pre-draft document audit");
+      logAiFailure("POST /api/pre-audit (no key)", f);
+      return res.status(f.status).json(aiErrorBody(f));
+    }
+
+    const contentsParts: any[] = [];
+
+    if (Array.isArray(aadhaarCards)) {
+      aadhaarCards.forEach((card, index) => {
+        if (card.base64 && card.mimeType) {
+          contentsParts.push({
+            inlineData: { mimeType: card.mimeType, data: card.base64.split(",")[1] || card.base64 },
+          });
+          contentsParts.push({ text: `This is Aadhaar Card #${index + 1} named: ${card.name || "Aadhaar Card"}.` });
+        }
+      });
+    }
+
+    if (Array.isArray(linkDocuments)) {
+      linkDocuments.forEach((doc, index) => {
+        if (doc.base64 && doc.mimeType) {
+          contentsParts.push({
+            inlineData: { mimeType: doc.mimeType, data: doc.base64.split(",")[1] || doc.base64 },
+          });
+          contentsParts.push({ text: `This is Link Document #${index + 1} named: ${doc.name || "Link Document"}.` });
+        }
+      });
+    }
+
+    if (!contentsParts.length) {
+      return res.status(400).json({
+        error: "No Aadhaar cards or link documents were uploaded to audit against. Upload them in Step 1 first.",
+      });
+    }
+
+    contentsParts.push({
+      text: `DATA ENTERED & REVIEWED BY THE USER IN STEP 1 (JSON) — this is the data that will be merged into the deed template NEXT, so it is what we are checking now, BEFORE any draft exists:\n${JSON.stringify(enteredDetails, null, 2)}`,
+    });
+
+    const dateContext = registrationDate
+      ? `Registration Date: ${registrationDate}`
+      : `Registration Date: ${new Date().toISOString().split("T")[0]}`;
+    contentsParts.push({
+      text: `Perform a PRE-DRAFT audit of the ENTERED DATA above against the uploaded Aadhaar/PAN cards and Link/Pattadar documents. No deed draft exists yet — you are catching errors before the template is filled.
+
+      CONTEXT:
+      ${dateContext}
+
+      Verify:
+      1. Names mismatch: seller/buyer names, spelling, and Aadhaar numbers in the entered JSON must exactly match the Aadhaar cards. Calculate age at the registration date from the Aadhaar DOB and compare to the entered age.
+      2. Property details mismatch: H.No, Plot No, Survey/Sub-division number, PTI No, Sq Yards, Plinth area, and boundaries (East/West/North/South) in the entered JSON must exactly match the Link Document / Pattadar Passbook.
+      3. Link document numbers mismatch: the link deed number entered in the JSON must exactly match the document number printed on the Link Document.
+      4. Completeness: flag any field required for drafting that is blank or clearly a placeholder/example value.
+
+      Group ALL discrepancies into: "Names mismatch", "Property details mismatch", "Link document numbers mismatch", "Completeness".
+      Response MUST be valid JSON. No trailing commas, no backticks outside the JSON.`,
+    });
+
+    const systemInstruction = `
+    You are an expert Indian Document Verification AI specializing in land registrations under the Registration and Stamps Department of Telangana, India.
+    Your task is to audit data a document writer has ENTERED (but not yet drafted into a deed) against official identity documents (Aadhaar cards) and older ownership documents (Link documents), so errors are caught BEFORE the deed template is auto-filled.
+    Aadhaar Card is the absolute source of truth for names, DOB, and Aadhaar numbers. Link Document is the absolute source of truth for property/boundary/deed-number details.
+    Flag even minor spelling, spacing, or punctuation mismatches. Round ages to the nearest integer.
+    Group all discrepancies strictly into: "Names mismatch", "Property details mismatch", "Link document numbers mismatch", "Completeness".
+    Return your report strictly in the requested JSON schema.
+    `;
+
+    const preAuditSchema = {
+      type: Type.OBJECT,
+      properties: {
+        summary: {
+          type: Type.OBJECT,
+          properties: {
+            status: { type: Type.STRING, description: "One of APPROVED, WARNING, or DISCREPANCY_FOUND" },
+            discrepancyCount: { type: Type.INTEGER },
+            message: { type: Type.STRING },
+          },
+          required: ["status", "discrepancyCount", "message"],
+        },
+        allDiscrepancies: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              category: { type: Type.STRING, description: "Must be: 'Names mismatch', 'Property details mismatch', 'Link document numbers mismatch', or 'Completeness'" },
+              severity: { type: Type.STRING, description: "CRITICAL or WARNING" },
+              description: { type: Type.STRING },
+              descriptionTe: { type: Type.STRING },
+              expected: { type: Type.STRING },
+              found: { type: Type.STRING },
+              recommendation: { type: Type.STRING },
+              recommendationTe: { type: Type.STRING },
+            },
+            required: ["category", "severity", "description", "descriptionTe", "expected", "found", "recommendation", "recommendationTe"],
+          },
+        },
+      },
+      required: ["summary", "allDiscrepancies"],
+    };
+
+    const response = await withAiTimeout(
+      ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: contentsParts,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: preAuditSchema,
+          temperature: 0.1,
+        },
+      }),
+      AI_TIMEOUT_MS,
+      "Pre-draft audit",
+    );
+
+    const resultText = response.text;
+    if (!resultText) throw new Error("Empty response received from Gemini API");
+
+    const report = parseModelJson(resultText);
+    if (!report || typeof report !== "object" || !report.summary) {
+      throw new Error("Gemini returned an unparseable pre-audit report");
+    }
+    return res.json({ ...report, ...OK_META });
+  } catch (error: any) {
+    // FAIL CLOSED — same reasoning as /api/verify: never substitute a fabricated
+    // "all clear" report for a check that did not actually run.
+    const f = classifyAiError(error, { label: "auditing the entered details" });
+    logAiFailure("POST /api/pre-audit", f);
+    return res.status(f.status).json(aiErrorBody(f));
+  }
+});
+
+// Feature #5: on-demand Telugu translation of the drafted deed (Step 4), shipped
+// as a SEPARATE, standalone .docx (not appended to the English deed) so a user
+// who does not need the Telugu copy never carries its extra pages/font along.
+// Fails closed like every other AI-backed endpoint here: no key or an upstream
+// failure returns an HTTP error, never a fabricated/empty "translation".
+app.post("/api/translate-deed", async (req, res) => {
+  try {
+    const { deedText } = req.body || {};
+    if (typeof deedText !== "string" || !deedText.trim()) {
+      return res.status(400).json({ error: "deedText is required — generate the deed in Step 4 first." });
+    }
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      const f = notConfiguredFailure("Telugu translation");
+      logAiFailure("POST /api/translate-deed (no key)", f);
+      return res.status(f.status).json(aiErrorBody(f));
+    }
+
+    const prompt = `Translate the following Telangana property Sale Deed text FROM English INTO Telugu (తెలుగు). This is a legal registration document, so the translation must be:
+- Complete: translate EVERY line, heading, clause, name, address, and number. Do not summarize, skip, or omit anything.
+- Faithful: preserve the exact meaning, structure, paragraph order, and any "---PAGE BREAK---" markers VERBATIM (keep that exact marker text untranslated, on its own line, wherever it occurs).
+- Proper names (people, villages, mandals, districts, survey/plot/door numbers, dates, Aadhaar/PAN numbers, monetary amounts) should be transliterated into Telugu script where that is standard registration-document practice (e.g. a person's name rendered in Telugu script), but numerals, Aadhaar numbers, PAN numbers, and amounts should stay in the same numeral form as the source (Telugu legal documents conventionally keep digits in Arabic numerals).
+- Use formal, registration-document Telugu (the register/tone used in actual Telangana Sub-Registrar office deeds), not casual conversational Telugu.
+
+Return ONLY the translated Telugu text. No markdown fences, no English commentary, no notes before or after.
+
+SOURCE (English):
+${deedText}`;
+
+    const response = await withAiTimeout<{ text?: string }>(
+      ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: prompt,
+        config: {
+          systemInstruction:
+            "You are an expert Telugu legal translator specializing in Telangana property registration documents (Sale Deeds). Translate completely and faithfully into formal registration Telugu. Return ONLY the translated text, no commentary, no markdown fences.",
+          temperature: 0.1,
+          maxOutputTokens: 16384,
+        },
+      }),
+      AI_TIMEOUT_MS,
+      "Telugu deed translation",
+    );
+
+    const teluguText = (response.text || "").replace(/^```[a-z]*\n?|\n?```$/g, "").trim();
+    if (!teluguText) throw new Error("Empty response from the translation model.");
+
+    const docxBuffer = await buildTeluguDeedDocx(teluguText);
+
+    return res.json({
+      teluguText,
+      docxBase64: docxBuffer.toString("base64"),
+      fontFamily: "Sree Krushnadevaraya",
+      ...OK_META,
+    });
+  } catch (error: any) {
+    // FAIL CLOSED — same reasoning as every other AI endpoint: never substitute
+    // a fabricated/empty translation for a step that did not actually run.
+    const f = classifyAiError(error, { label: "translating the deed to Telugu" });
+    logAiFailure("POST /api/translate-deed", f);
+    return res.status(f.status).json(aiErrorBody(f));
   }
 });
 

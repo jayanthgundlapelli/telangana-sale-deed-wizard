@@ -261,6 +261,8 @@ CRITICAL RULES:
     • lengthFeet  = that dimension in decimal feet (48'-3" -> 48.25, 66' -> 66, 19'-9" -> 19.75);
     • neighbour   = the abutter named outside that side (e.g. "HOUSE OF CHAKALI CHANDRAVVA"), else empty.
   Most plots have exactly 4 sides (NORTH, SOUTH, EAST, WEST). ALWAYS provide these sides with their directions (and lengths where written) — this measured, direction-tagged form is what lets us redraw the plot north-up; the polygon fallback below cannot be oriented reliably. If a bearing/angle is written on an edge, put it in bearingDeg (clockwise from North), else 0.
+- READ VERTICAL/ROTATED DIMENSION TEXT DIGIT-BY-DIGIT. Side lengths running along a vertical (East/West) edge are almost always written rotated 90°, and a rotated "6" is easily misread as "9" (and vice versa) — this is the single most common transcription error on these sketches. Before finalising each digit, mentally rotate it back to upright and re-check it individually; do not pattern-match the whole rotated numeral at a glance.
+- CROSS-CHECK YOUR SIDE LENGTHS AGAINST THE PRINTED AREA TABLE. If the sketch has a TOTAL AREA / total sq.yds or sq.ft figure printed in its table, compute width × height from the four sides you extracted and compare it to that printed area (1 sq.yd = 9 sq.ft). If your computed area does NOT reasonably match the printed area (e.g. within ~10%), you have very likely misread a rotated digit on one of the vertical sides — go back and re-read that side's numeral before answering, and prefer the side length that reconciles with the printed area over your first read.
 - Set drawing.plot.shape to 'square' if all sides are about equal, 'rectangle' if opposite sides are equal, else 'trapezoid' or 'irregular'.
 - For EVERY road bordering the plot, add drawing.roads with its side (NORTH/SOUTH/EAST/WEST), its label verbatim ("40' ROAD"), and widthFeet in decimal feet so we can draw it to scale (a 40' road must read wider than a 12' road).
 - Put inner structures (TINSHED / R.C.C. / OPEN PLACE) in drawing.interiorStructures with real widthFeet/depthFeet if written (else 0) and a position keyword.
@@ -327,6 +329,34 @@ function personLine(p: any): string {
   if (p.occupation) bits.push(`OCCU: ${p.occupation}`);
   if (p.address) bits.push(`R/O ${p.address}`);
   return bits.join(", ").toUpperCase() + (bits.length ? "." : "");
+}
+
+// Build the standard proforma description sentence from the authoritative form
+// fields (falls back gracefully when a field is blank, never fabricating data):
+//   "THE <TYPE>, ADMEASURING A TOTAL AREA OF <sqYds> SQUARE YARDS EQUIVALENT TO
+//    <sqMtrs> SQUARE METERS, IN SURVEY NO.<survey>, SITUATED AT NEAR H.NO.<hNo>
+//    OF '<locality>' LOCALITY OF <village>, <mandal>"
+function buildPlanDescription(plan: any, prop: any): string {
+  const structureType = (plan?.structureType || prop?.propertyType || "PROPERTY").toString().toUpperCase();
+  const tbl = plan?.table || {};
+  const stripUnit = (v: any) => String(v ?? "").replace(/\s*sq\.?\s*(yds?|yards?|mtrs?|meters?|metres?)\.?\s*$/i, "").trim();
+  const sqYds = stripUnit(tbl.totalAreaSqYds || prop?.extentSqYards || "");
+  const sqMtrsRaw = stripUnit(tbl.totalAreaSqMtrs || "");
+  const sqMtrs = sqMtrsRaw || (sqYds && isFinite(parseFloat(sqYds)) ? (parseFloat(sqYds) * 0.83612736).toFixed(2) : "");
+
+  const bits: string[] = [`THE ${structureType},`];
+  if (sqYds) {
+    bits.push(`ADMEASURING A TOTAL AREA OF ${sqYds} SQUARE YARDS`);
+    if (sqMtrs) bits.push(`EQUIVALENT TO ${sqMtrs} SQUARE METERS,`);
+    else bits[bits.length - 1] += ",";
+  }
+  if (prop?.surveyNo) bits.push(`IN SURVEY NO.${prop.surveyNo},`);
+  if (prop?.hNo) bits.push(`SITUATED AT NEAR H.NO.${prop.hNo}`);
+  else bits.push(`SITUATED AT`);
+  if (prop?.locality) bits.push(`OF '${String(prop.locality).toUpperCase()}' LOCALITY OF`);
+  const place = [prop?.village, prop?.mandal].filter(Boolean).join(", ");
+  if (place) bits.push(`${String(place).toUpperCase()}.`);
+  return bits.join(" ").replace(/\s+,/g, ",").toUpperCase();
 }
 
 // ---- surveying helpers -------------------------------------------------------
@@ -428,6 +458,121 @@ function closeTraverse(legs: { lengthFeet: number; bearingDeg: number }[]): Pt[]
   const last = pts[pts.length - 1];
   if (Math.hypot(last.x, last.y) < 0.02 * (Math.abs(x) + Math.abs(y) + 1)) pts.pop();
   return pts.length >= 3 ? pts : null;
+}
+
+// Digit-swap candidates for a suspected rotated-digit misread (a rotated "6" is
+// easily read as "9" and vice versa — the single most common vision-extraction
+// error on these hand-drawn sketches, since vertical/East-West dimension text is
+// conventionally written rotated 90°). Returns every number obtainable by
+// flipping some non-empty subset of the 6/9 digits in n, excluding n itself.
+function digitSwapCandidates(n: number): number[] {
+  const s = String(Math.round(n));
+  const positions: number[] = [];
+  for (let i = 0; i < s.length; i++) if (s[i] === "6" || s[i] === "9") positions.push(i);
+  if (!positions.length) return [];
+  const out = new Set<number>();
+  const total = 1 << positions.length;
+  for (let mask = 1; mask < total; mask++) {
+    const chars = s.split("");
+    positions.forEach((pos, bit) => {
+      if (mask & (1 << bit)) chars[pos] = chars[pos] === "6" ? "9" : "6";
+    });
+    const cand = Number(chars.join(""));
+    if (cand > 0 && cand !== n) out.add(cand);
+  }
+  return Array.from(out);
+}
+
+// Cross-check the extracted side lengths against the sketch's own printed TOTAL
+// AREA figure and repair a likely rotated-digit misread (6<->9) when the two
+// disagree beyond a reasonable tolerance. The model reliably transcribes the
+// printed area text even when it misreads an individual rotated dimension
+// numeral, so this gives a deterministic way to catch (and fix) that specific,
+// reproducible error class without depending on the vision model self-correcting
+// via prompt instructions alone (confirmed those instructions alone do not work).
+function reconcileSidesWithPrintedArea(byDir: ByDir, table: any): void {
+  const tbl = table || {};
+  const areaYdsStr = String(tbl.totalAreaSqYds || "").replace(/[^\d.]/g, "");
+  const areaMtrsStr = String(tbl.totalAreaSqMtrs || "").replace(/[^\d.]/g, "");
+  let areaSqFt = 0;
+  if (areaYdsStr && isFinite(parseFloat(areaYdsStr))) areaSqFt = parseFloat(areaYdsStr) * 9;
+  else if (areaMtrsStr && isFinite(parseFloat(areaMtrsStr))) areaSqFt = parseFloat(areaMtrsStr) * 10.7639;
+  if (!(areaSqFt > 0)) return; // no ground truth printed on this sketch to check against
+
+  const dirs: ("N" | "S" | "E" | "W")[] = ["N", "S", "E", "W"];
+  const impliedArea = () => {
+    const N = byDir.N?.lengthFeet || 0,
+      S = byDir.S?.lengthFeet || 0;
+    const E = byDir.E?.lengthFeet || 0,
+      W = byDir.W?.lengthFeet || 0;
+    const top = N || S,
+      bottom = S || N,
+      right = E || W,
+      left = W || E;
+    if (!(top > 0) || !(right > 0)) return 0;
+    const width = (top + bottom) / 2 || top;
+    const height = (left + right) / 2 || right;
+    return width * height;
+  };
+  const withinTolerance = (a: number, b: number) => a > 0 && b > 0 && Math.abs(a - b) / b <= 0.12;
+
+  const currentArea = impliedArea();
+  if (withinTolerance(currentArea, areaSqFt)) return; // already reconciles — nothing to fix
+
+  // Search over every side's original length PLUS its digit-swap candidates.
+  // Two opposite edges (e.g. both EAST and WEST) are commonly written rotated the
+  // same way, so BOTH can carry the identical misread independently — a
+  // single-side-at-a-time fix cannot reconcile that case since changing only one
+  // side leaves the other still wrong. Prefer the reconciling combination that
+  // changes the FEWEST sides, breaking ties by closeness to the printed area.
+  const present = dirs.filter((d) => byDir[d] && byDir[d]!.lengthFeet > 0);
+  if (!present.length) return;
+  const options: { dir: "N" | "S" | "E" | "W"; value: number; changed: boolean }[][] = present.map((dir) => {
+    const orig = byDir[dir]!.lengthFeet;
+    const cands = digitSwapCandidates(orig);
+    return [{ dir, value: orig, changed: false }, ...cands.map((c) => ({ dir, value: c, changed: true }))];
+  });
+  const origVals: Record<string, number> = {};
+  present.forEach((d) => (origVals[d] = byDir[d]!.lengthFeet));
+
+  let best: { assignment: Record<string, number>; changedCount: number; delta: number } | null = null;
+  const walk = (idx: number, acc: Record<string, number>, changedCount: number) => {
+    if (idx === options.length) {
+      const vals = { ...origVals, ...acc };
+      const N = vals.N || 0,
+        Sv = vals.S || 0,
+        E = vals.E || 0,
+        Wv = vals.W || 0;
+      const top = N || Sv,
+        bottom = Sv || N,
+        right = E || Wv,
+        left = Wv || E;
+      const area = top > 0 && right > 0 ? ((top + bottom) / 2 || top) * ((left + right) / 2 || right) : 0;
+      if (withinTolerance(area, areaSqFt)) {
+        const delta = Math.abs(area - areaSqFt);
+        if (!best || changedCount < best.changedCount || (changedCount === best.changedCount && delta < best.delta)) {
+          best = { assignment: { ...acc }, changedCount, delta };
+        }
+      }
+      return;
+    }
+    for (const opt of options[idx]) {
+      acc[opt.dir] = opt.value;
+      walk(idx + 1, acc, changedCount + (opt.changed ? 1 : 0));
+    }
+  };
+  walk(0, {}, 0);
+
+  if (best && best.changedCount > 0) {
+    for (const dir of present) {
+      const v = best.assignment[dir];
+      if (v !== origVals[dir]) {
+        const side = byDir[dir]!;
+        side.lengthFeet = v;
+        side.label = `${Math.round(v)}'`;
+      }
+    }
+  }
 }
 
 export interface PlanEdits {
@@ -546,18 +691,14 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   y += 30;
 
   // ---- Property description ----
-  const descType = plan.structureType || "";
-  const desc =
-    (plan.propertyDescription && plan.propertyDescription.trim()) ||
-    [
-      "THE",
-      descType ? descType.toUpperCase() : "PROPERTY",
-      prop.hNo ? `BEARING GRAM PANCHAYAT HOUSE NO.${prop.hNo},` : "",
-      prop.village ? `SITUATED AT ${String(prop.village).toUpperCase()}` : "",
-      prop.mandal ? `V/O ${String(prop.mandal).toUpperCase()} MANDAL.` : "",
-    ]
-      .filter(Boolean)
-      .join(" ");
+  // Matches the reference "PLAN FOR REGISTRATION" proforma paragraph:
+  //   "THE <TYPE>, ADMEASURING A TOTAL AREA OF <X> SQUARE YARDS EQUIVALENT TO
+  //    <Y> SQUARE METERS, IN SURVEY NO.<N>, SITUATED AT NEAR H.NO.<H> OF
+  //    '<LOCALITY>' LOCALITY OF <VILLAGE>, <MANDAL>"
+  // Built deterministically from the form's authoritative fields; a sketch that
+  // already carries this exact sentence verbatim (plan.propertyDescription) is
+  // preferred as-is, so nothing legible on the sketch is ever overwritten.
+  const desc = (plan.propertyDescription && plan.propertyDescription.trim()) || buildPlanDescription(plan, prop);
   for (const ln of wrap(desc, contentW, 16)) {
     S.push(`<text x="${contentX}" y="${y}" font-size="16">${esc(ln)}</text>`);
     y += 21;
@@ -575,8 +716,12 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     y += 8;
   }
 
-  // ---- Party paragraphs (role adapts to transaction type) ----
-  const roles = partyRoleLabels(d.natureOfTransaction || d.propertyType);
+  // ---- Party paragraphs ----
+  // The registration PLAN (unlike the deed body) always labels the parties
+  // "EXECUTANT/S" and "CLAIMANT/S" regardless of transaction type — that is the
+  // fixed proforma wording on the reference plan, distinct from the deed's
+  // transaction-specific VENDOR/S-VENDEE/S, DONOR/S-DONEE/S, etc.
+  const roles = { first: "EXECUTANT/S", second: "CLAIMANT/S" };
   const sellers: any[] = Array.isArray(d.executants) ? d.executants : [];
   const buyers: any[] = Array.isArray(d.claimants) ? d.claimants : [];
 
@@ -617,12 +762,15 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   emitParty(roles.first, firstList);
   emitParty(roles.second, secondList);
 
-  // ================= DRAWING + TABLE ROW =================
+  // ================= DRAWING (full width — reference proforma has no side
+  // TOTAL AREA/PLINTH/SCALE/INDEX table; that area info now lives in the
+  // description paragraph above, and the compass lives inside this region's
+  // top-right corner exactly as the reference plan shows it). =================
   const rowTop = Math.max(y + 18, 300);
   const RX = contentX + 6; // drawing region (left)
   const RY = rowTop + 10;
-  const RW = 410;
-  const RH = 340;
+  const RW = contentW - 12;
+  const RH = 460;
 
   // A white halo under drawing text keeps marks legible over lines/hatching
   // (paint-order="stroke" draws the white stroke first, then the black fill).
@@ -645,6 +793,11 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       byDir[dir] = { lengthFeet: len, label: String(s?.lengthLabel || `${Math.round(len)}'`), neighbour: String(s?.neighbour || "") };
     }
   }
+  // Cross-check the extracted side lengths against the sketch's own printed
+  // TOTAL AREA figure and repair a likely rotated-digit misread (6<->9) before
+  // this feeds into geometry reconstruction below — see reconcileSidesWithPrintedArea.
+  reconcileSidesWithPrintedArea(byDir, plan.table);
+
   // Boundary neighbours from the form fill in ONLY where the sketch omitted them.
   // Marked fromForm so we can suppress them on any side the sketch drew a road on —
   // the sketch's own roads/neighbours are authoritative ("roads exactly as drawn").
@@ -951,75 +1104,41 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     S.push(`<text x="${naX}" y="${naY - 15}" text-anchor="middle" font-size="11" font-weight="bold">N</text>`);
   }
 
-  // ---- Info table (right) : 2 cols x 3 rows ----
-  const TX = RX + RW + 24;
-  const TW = W - M - 14 - 6 - TX;
-  const TY = RY;
-  const colX = TX + TW / 2;
-  const r1 = TY, r1b = TY + 34, r2 = TY + 110, r2b = TY + 144, r3 = TY + 200, r3b = TY + 290;
-  const cell = (x: number, yy: number, w: number, h: number) =>
-    S.push(`<rect x="${x}" y="${yy}" width="${w}" height="${h}" fill="none" stroke="#000" stroke-width="1.2"/>`);
-  const tcenter = (x: number, yy: number, txt: string, size = 13, bold = false, underline = false) =>
-    S.push(`<text x="${x}" y="${yy}" text-anchor="middle" font-size="${size}"${bold ? ' font-weight="bold"' : ""}${underline ? ' text-decoration="underline"' : ""}>${esc(txt)}</text>`);
+  // ================= BOTTOM BLOCK (reference proforma layout) =================
+  // Left column: an empty "AREA UNDER REGN" checkbox, then "WITNESSESS." with
+  // two numbered blank signature lines. Right column: "EXECUTANT/S SIGN/S" and
+  // "CLAIMANT/S SIGN/S", each with a blank signature line. This replaces the
+  // old side TOTAL AREA/PLINTH/SCALE/INDEX table, which the reference plan
+  // does not carry — that area/scale information now lives in the description
+  // paragraph above the drawing instead.
+  const bottomY = RY + RH + 46;
+  const rightColX = contentX + contentW * 0.58;
 
-  const tbl = plan.table || {};
-  const stripUnit = (v: any) =>
-    String(v ?? "").replace(/\s*sq\.?\s*(yds?|yards?|mtrs?|meters?|metres?|fts?|feet)\.?\s*$/i, "").trim();
-  const areaYds = stripUnit(tbl.totalAreaSqYds || prop.extentSqYards || "");
-  const areaMtrsRaw = stripUnit(tbl.totalAreaSqMtrs || "");
-  const areaMtrs =
-    areaMtrsRaw ||
-    (areaYds && isFinite(parseFloat(areaYds)) ? (parseFloat(areaYds) * 0.83612736).toFixed(4).replace(/\.?(0+)$/, "") : "");
-  const plinthLabel = tbl.plinthLabel || plan.structureType || "";
-  const plinthFts = stripUnit(tbl.plinthAreaSqFts || prop.plinthArea || "");
-  const scale = tbl.scale || '1":20\'';
+  // "AREA UNDER REGN" checkbox (small empty square + label, bottom-left).
+  const chk = 16;
+  S.push(`<rect x="${contentX}" y="${bottomY - chk + 3}" width="${chk}" height="${chk}" fill="none" stroke="#000" stroke-width="1.2"/>`);
+  S.push(`<text x="${contentX + chk + 8}" y="${bottomY}" font-size="13" font-weight="bold">AREA UNDER REGN</text>`);
 
-  // Row 1: TOTAL AREA | PLINTH AREA
-  cell(TX, r1, TW / 2, r2 - r1);
-  cell(colX, r1, TW / 2, r2 - r1);
-  tcenter(TX + TW / 4, r1 + 22, "TOTAL AREA", 14, false, true);
-  tcenter(colX + TW / 4, r1 + 22, "PLINTH AREA", 14, false, true);
-  const areaLines = [areaYds ? `${areaYds} SQ.YDS` : "", areaYds && areaMtrs ? "OR EQU.TO" : "", areaMtrs ? `${areaMtrs} SQ.MTRS` : ""].filter(Boolean);
-  areaLines.forEach((ln, i) => tcenter(TX + TW / 4, r1b + 20 + i * 18, ln, 12.5));
-  const plinthLines = [plinthLabel && plinthFts ? `${plinthLabel}-${plinthFts}` : plinthFts || "", plinthFts ? "SQ.FTS" : ""].filter(Boolean);
-  plinthLines.forEach((ln, i) => tcenter(colX + TW / 4, r1b + 20 + i * 18, ln, 12.5));
-
-  // Row 2: SCALE | INDEX
-  cell(TX, r2, TW / 2, r3 - r2);
-  cell(colX, r2, TW / 2, r3 - r2);
-  tcenter(TX + TW / 4, r2 + 22, "SCALE", 14, false, true);
-  tcenter(colX + TW / 4, r2 + 22, "INDEX", 14, false, true);
-  tcenter(TX + TW / 4, r2b + 20, scale, 13);
-  // Index swatch shows the SAME cross-hatch used for the property under registration.
-  S.push(`<rect x="${colX + 12}" y="${r2b + 8}" width="30" height="14" fill="url(#propHatch)" stroke="#000" stroke-width="1"/>`);
-  S.push(`<text x="${colX + 48}" y="${r2b + 15}" font-size="11">PROPERTY</text>`);
-  S.push(`<text x="${colX + 48}" y="${r2b + 30}" font-size="11">UNDER REGN</text>`);
-
-  // Row 3: North arrow | (blank continuation)
-  cell(TX, r3, TW / 2, r3b - r3);
-  cell(colX, r3, TW / 2, r3b - r3);
-  const ncx = TX + TW / 4, ncy = r3 + (r3b - r3) / 2;
-  S.push(`<circle cx="${ncx}" cy="${ncy}" r="26" fill="none" stroke="#000" stroke-width="1.4"/>`);
-  S.push(`<path d="M ${ncx} ${ncy + 16} L ${ncx} ${ncy - 16} M ${ncx - 6} ${ncy - 8} L ${ncx} ${ncy - 16} L ${ncx + 6} ${ncy - 8}" fill="none" stroke="#000" stroke-width="1.6"/>`);
-  S.push(`<text x="${ncx + 12}" y="${ncy - 6}" font-size="13" font-weight="bold">N</text>`);
-
-  // ================= SIGNATURE BLOCKS (bottom) =================
-  const sigX = colX - 6;
-  let sy = r3b + 70;
-  const sig = (label: string) => {
+  // EXECUTANT/S SIGN/S (right column, aligned with the checkbox row).
+  const sig = (x: number, yy: number, label: string) => {
     const w2 = label.length * 13 * 0.62;
-    S.push(`<text x="${sigX}" y="${sy}" font-size="13" font-weight="bold">${esc(label)}</text>`);
-    S.push(`<line x1="${sigX}" y1="${sy + 4}" x2="${sigX + w2}" y2="${sy + 4}" stroke="#000" stroke-width="0.8"/>`);
+    S.push(`<text x="${x}" y="${yy}" font-size="13" font-weight="bold">${esc(label)}</text>`);
+    S.push(`<line x1="${x}" y1="${yy + 4}" x2="${x + w2}" y2="${yy + 4}" stroke="#000" stroke-width="0.8"/>`);
   };
-  sig(`${roles.first} SIGN/S`);
-  sy += 90;
-  sig(`${roles.second} SIGN/S`);
-  sy += 24;
-  S.push(`<text x="${sigX}" y="${sy}" font-size="13" font-weight="bold" text-decoration="underline">WITNESSESS.</text>`);
+  sig(rightColX, bottomY, `${roles.first} SIGN/S`);
+
+  // WITNESSESS. + two numbered blank lines (left column).
+  let sy = bottomY + 44;
+  S.push(`<text x="${contentX}" y="${sy}" font-size="13" font-weight="bold" text-decoration="underline">WITNESSESS.</text>`);
   sy += 34;
-  S.push(`<text x="${sigX + 6}" y="${sy}" font-size="13">1.</text>`);
+  S.push(`<text x="${contentX + 6}" y="${sy}" font-size="13">1.</text>`);
+  S.push(`<line x1="${contentX + 24}" y1="${sy + 2}" x2="${contentX + contentW * 0.42}" y2="${sy + 2}" stroke="#000" stroke-width="0.7"/>`);
   sy += 34;
-  S.push(`<text x="${sigX + 6}" y="${sy}" font-size="13">2.</text>`);
+  S.push(`<text x="${contentX + 6}" y="${sy}" font-size="13">2.</text>`);
+  S.push(`<line x1="${contentX + 24}" y1="${sy + 2}" x2="${contentX + contentW * 0.42}" y2="${sy + 2}" stroke="#000" stroke-width="0.7"/>`);
+
+  // CLAIMANT/S SIGN/S (right column, level with the witness lines).
+  sig(rightColX, bottomY + 78, `${roles.second} SIGN/S`);
 
   S.push(`</svg>`);
   return S.join("\n");

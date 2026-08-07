@@ -25,6 +25,8 @@ import {
   convertMillimetersToTwip,
 } from "docx";
 import { stripInvalidXmlChars } from "./templateFiller";
+import { promises as fsp } from "fs";
+import path from "path";
 
 export interface DeedFormatOptions {
   /** Inches from the top edge of PAGE 1 where the body should begin. Default 5.8. */
@@ -205,6 +207,159 @@ export async function buildDeedDocx(
             size: {
               width: convertMillimetersToTwip(210), // A4 width
               height: convertMillimetersToTwip(297), // A4 height
+            },
+            margin: {
+              top: convertInchesToTwip(opts.topMarginInches),
+              right: convertInchesToTwip(opts.rightMarginInches),
+              bottom: convertInchesToTwip(opts.bottomMarginInches),
+              left: convertInchesToTwip(opts.leftMarginInches),
+            },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+
+  return Packer.toBuffer(doc);
+}
+
+// -----------------------------------------------------------------------------
+// Telugu translation export (Feature #5): a SEPARATE, standalone .docx carrying
+// ONLY the Telugu translation of the deed, set in the "Sree Krushnadevaraya"
+// Telugu font. The font file is shipped in the repo (public/fonts — served to
+// the browser AND read here on the server) under its own SIL OFL license, and
+// EMBEDDED into the .docx (docx library's `fonts` option) so the document
+// renders in that exact typeface even on a machine that never installed it.
+// -----------------------------------------------------------------------------
+
+const TELUGU_FONT_NAME = "Sree Krushnadevaraya";
+// The font's ON-DISK location differs between dev and the built/production
+// image, so — mirroring the candidate-path approach already used for the
+// `soffice` binary lookup above — try every layout this app actually runs in.
+// Both are resolved relative to process.cwd() (NOT `__dirname`/import.meta.url:
+// this file is ESM (package.json "type":"module") under `npx tsx`, where
+// `__dirname` does not exist, and it is bundled to CJS by esbuild for
+// production — a single cwd-relative strategy works correctly in both):
+//   1. `npx tsx server.ts` from the repo root (dev): CWD is the repo root,
+//      where the font lives at public/fonts/... (source location).
+//   2. The bundled `dist/server.cjs` (prod, Dockerfile's CMD): the container's
+//      WORKDIR/CWD is /app, and `vite build` copies public/* into dist/, so the
+//      font ends up at dist/fonts/... — NOT public/fonts/... (only dist/ and
+//      templates/ are copied into the runtime image).
+const TELUGU_FONT_CANDIDATES = [
+  path.join(process.cwd(), "public", "fonts", "SreeKrushnadevaraya-Regular.ttf"),
+  path.join(process.cwd(), "dist", "fonts", "SreeKrushnadevaraya-Regular.ttf"),
+];
+
+let cachedTeluguFontBuffer: Buffer | null | undefined; // undefined = not yet attempted
+
+// Best-effort font load, cached after the first successful/failed attempt.
+// Returns null (never throws) when the font file cannot be found in ANY
+// candidate location, so callers can still produce a Telugu .docx — Word will
+// just substitute a fallback font for it rather than the document failing to
+// generate at all.
+async function loadTeluguFontBuffer(): Promise<Buffer | null> {
+  if (cachedTeluguFontBuffer !== undefined) return cachedTeluguFontBuffer;
+  for (const candidate of TELUGU_FONT_CANDIDATES) {
+    try {
+      cachedTeluguFontBuffer = await fsp.readFile(candidate);
+      return cachedTeluguFontBuffer;
+    } catch {
+      // try the next candidate
+    }
+  }
+  console.warn(
+    `Telugu font (Sree Krushnadevaraya) not found in any of: ${TELUGU_FONT_CANDIDATES.join(", ")} — Telugu .docx will use a fallback font.`
+  );
+  cachedTeluguFontBuffer = null;
+  return cachedTeluguFontBuffer;
+}
+
+/**
+ * Build a STANDALONE .docx containing ONLY the supplied Telugu text, formatted
+ * to the same A4/margins/spacer layout as the main deed (so it visually matches
+ * the English original), but in the Sree Krushnadevaraya Telugu font — embedded
+ * into the file itself so it displays correctly for any recipient.
+ */
+export async function buildTeluguDeedDocx(
+  teluguText: string,
+  options: DeedFormatOptions = {}
+): Promise<Buffer> {
+  const opts = { ...DEFAULTS, ...options, fontFamily: TELUGU_FONT_NAME };
+  const halfPointSize = Math.round(opts.fontSizePt * 2);
+
+  const lines = stripInvalidXmlChars((teluguText || "").replace(/\r\n/g, "\n")).split("\n");
+  const spacerTwips = convertInchesToTwip(
+    Math.max(0, opts.firstPageBodyStartInches - opts.topMarginInches)
+  );
+
+  const paragraphs: Paragraph[] = [];
+  let firstParagraphEmitted = false;
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/g, "");
+
+    if (/^-{2,}\s*PAGE\s*BREAK\s*-{2,}$/i.test(line.trim())) {
+      paragraphs.push(new Paragraph({ children: [new PageBreak()] }));
+      firstParagraphEmitted = true;
+      continue;
+    }
+
+    const heading = isHeadingLine(line);
+    const subHeading = !heading && isSubHeadingLine(line);
+
+    const runs = line.trim().length
+      ? [new TextRun({ text: line, bold: heading || subHeading, font: TELUGU_FONT_NAME })]
+      : [new TextRun({ text: "", font: TELUGU_FONT_NAME })];
+
+    paragraphs.push(
+      new Paragraph({
+        children: runs,
+        alignment: heading
+          ? AlignmentType.CENTER
+          : line.trim().length
+          ? AlignmentType.JUSTIFIED
+          : AlignmentType.LEFT,
+        spacing: {
+          before: !firstParagraphEmitted ? spacerTwips : heading ? 240 : 60,
+          after: heading ? 160 : 120,
+          line: 360, // Telugu vowel signs/conjuncts need more line height than Latin text
+        },
+      })
+    );
+    firstParagraphEmitted = true;
+  }
+
+  if (paragraphs.length === 0) {
+    paragraphs.push(
+      new Paragraph({
+        children: [new TextRun({ text: "", font: TELUGU_FONT_NAME })],
+        spacing: { before: spacerTwips },
+      })
+    );
+  }
+
+  const teluguFontBuffer = await loadTeluguFontBuffer();
+
+  const doc = new Document({
+    creator: "Telangana Sale Deed Wizard",
+    title: "Sale Deed (Telugu Translation)",
+    ...(teluguFontBuffer ? { fonts: [{ name: TELUGU_FONT_NAME, data: teluguFontBuffer }] } : {}),
+    styles: {
+      default: {
+        document: {
+          run: { font: opts.fontFamily, size: halfPointSize },
+        },
+      },
+    },
+    sections: [
+      {
+        properties: {
+          page: {
+            size: {
+              width: convertMillimetersToTwip(210),
+              height: convertMillimetersToTwip(297),
             },
             margin: {
               top: convertInchesToTwip(opts.topMarginInches),

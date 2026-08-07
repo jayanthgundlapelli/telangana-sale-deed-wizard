@@ -745,6 +745,20 @@ export default function App() {
   const [auditing, setAuditing] = useState(false);
   const [auditStepIndex, setAuditStepIndex] = useState(0);
 
+  // Step 3 "Re-Audit" (Feature #4): cross-checks the entered Step 1/2 data
+  // against the uploaded Aadhaar/link documents BEFORE the draft is auto-filled
+  // in Step 4. Kept separate from `report` (the post-draft Step 5 audit) since
+  // they check different things and can both be open/stale at once.
+  const [preAuditReport, setPreAuditReport] = useState<any | null>(null);
+  const [preAuditing, setPreAuditing] = useState(false);
+
+  // Step 4 "Translate to Telugu" (Feature #5): on-demand translation of the
+  // generated deed into a SEPARATE, standalone .docx set in the Sree
+  // Krushnadevaraya Telugu font. Kept apart from filledDeedText/generatedDocxBase64
+  // (the English draft) since this is an additional artifact, not a replacement.
+  const [teluguTranslating, setTeluguTranslating] = useState(false);
+  const [teluguDocxBase64, setTeluguDocxBase64] = useState<string>("");
+
   // Generate Plan Feature State
   const [sketchImage, setSketchImage] = useState<string | null>(null);
   const [sketchFileName, setSketchFileName] = useState<string>("");
@@ -773,6 +787,7 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [isPresetsExpanded, setIsPresetsExpanded] = useState(false);
   const [savedDrafts, setSavedDrafts] = useState<any[]>([]);
+  const [isDraftsExpanded, setIsDraftsExpanded] = useState(false);
   const [activeAuditTab, setActiveAuditTab] = useState<"all" | "critical" | "warnings">("all");
 
   // ---- AI failure reporting helpers -------------------------------------
@@ -2769,6 +2784,73 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
     }
   };
 
+  // Step 3 "Re-Audit": cross-checks the entered/reviewed Step 1-2 data against
+  // the uploaded Aadhaar/link documents BEFORE the template gets auto-filled in
+  // Step 4 — so a name/Aadhaar/property mismatch is caught before spending an AI
+  // call merging bad data into the draft.
+  const triggerPreAudit = async () => {
+    setPreAuditing(true);
+    setPreAuditReport(null);
+    clearAiStatus();
+    try {
+      const response = await fetch("/api/pre-audit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          aadhaarCards,
+          linkDocuments,
+          enteredDetails: buildConsolidatedDetails(),
+          registrationDate,
+        }),
+      });
+
+      if (!response.ok) await failOn(response, "Pre-draft audit");
+
+      const data = await response.json();
+      setPreAuditReport(data);
+    } catch (err: any) {
+      // Same fail-closed reasoning as the post-draft audit: show NO report
+      // rather than a fabricated verdict on data nobody actually checked.
+      setPreAuditReport(null);
+      reportFailure(err, "Pre-draft audit", () => triggerPreAudit());
+    } finally {
+      setPreAuditing(false);
+    }
+  };
+
+  // Feature #5: translate the generated deed (filledDeedText) into Telugu via
+  // Gemini and produce a SEPARATE, standalone .docx set in the Sree
+  // Krushnadevaraya font — downloaded independently of the main English deed.
+  const translateDeedToTelugu = async () => {
+    if (!filledDeedText.trim()) return;
+    setTeluguTranslating(true);
+    setTeluguDocxBase64("");
+    clearAiStatus();
+    try {
+      const response = await fetch("/api/translate-deed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deedText: filledDeedText }),
+      });
+      if (!response.ok) await failOn(response, "Telugu translation");
+      const data = await response.json();
+      setTeluguDocxBase64(data.docxBase64 || "");
+      if (data.docxBase64) {
+        const nameForFile = (claimantsList[0]?.name || claimantName || "deed").replace(/\s+/g, "_");
+        downloadBase64(
+          data.docxBase64,
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          `Telugu_Translation_${nameForFile}.docx`
+        );
+      }
+    } catch (err: any) {
+      setTeluguDocxBase64("");
+      reportFailure(err, "Telugu translation", () => translateDeedToTelugu());
+    } finally {
+      setTeluguTranslating(false);
+    }
+  };
+
 const getTeluguCategory = (category: string) => {
   if (!category) return "";
   const catLower = category.toLowerCase();
@@ -2843,7 +2925,143 @@ const getTeluguRecommendation = (rec: string) => {
   // Rendered in the report card it was indistinguishable from a real audit.
   // Verification now fails visibly instead of fabricating a verdict.
 
-  // Step 10: Save Draft to localStorage Registry History
+  // ---- Persistent Save / Resume (Feature #1) --------------------------------
+  // Captures every FORM-DATA field needed to resume drafting and regenerate the
+  // document — deliberately EXCLUDES binary blobs (uploaded Aadhaar/link images,
+  // the plan sketch image, the generated plan image, and generated .docx bytes).
+  // Those can be several MB each and the browser's localStorage quota is only
+  // ~5-10MB total, so keeping them out means Save never risks hitting that
+  // ceiling after a handful of drafts. Resuming a draft that used those uploads
+  // just asks the user to re-attach that one file if they want to re-run that
+  // specific AI step (Aadhaar extraction / plan sketch extraction).
+  const buildDraftSnapshot = () => ({
+    currentStep,
+    registrationDate,
+    propertyDistrict, propertyMandal, propertyVillage, propertySurvey, propertyHNo,
+    propertyPlotNo, propertyPTINo, propertyExtent, propertyPlinth,
+    boundaryEast, boundaryWest, boundaryNorth, boundarySouth,
+    executantName, executantRelation, executantAge, executantAadhaar, executantPan, executantDOB, executantAddress,
+    claimantName, claimantRelation, claimantAge, claimantAadhaar, claimantPan, claimantDOB, claimantAddress,
+    marketValue, stampsAmount, natureOfTransaction, propertyType,
+    executantsList, claimantsList, linkDocumentsList, propertiesList, boundariesList, jurisdictionsList,
+    jurDistrictRegistrar, jurSubRegistrar, jurDistrict, jurMandal, jurVillage, jurPincode,
+    linkDocNo, linkDocDate, linkSubRegistrar, linkSubRegistrarCode, linkPattadarPassbook,
+    linkPassbookKhataNo, linkNalaOrderNo, linkLayoutFileNo, linkHouseTaxReceipt,
+    propertyTypeFilter, propPlotNo, propExtentSqYards, propExtentSqMeters, propSurveyNo,
+    propNearHNo, propAdjacentHNo, propLocality, propPincode, propVltPtiNo,
+    propMarketValuePerSqYard, propMarketValueTotal, autoAdjustBlanks,
+    selectedModelId, customModelText,
+    selectedTemplateId, customTemplateText, customTemplateName,
+    filledDeedText, mergeMode, unresolvedPlaceholders,
+    report,
+    planCustomPrompt, planMasterPrompt, planVerificationReport,
+    extractedDetails,
+  });
+
+  // Restores every field buildDraftSnapshot() captured. Uses `?? existing` so an
+  // older/partial snapshot (or a future format change) never wipes a field to
+  // blank — it just leaves whatever is already on screen for anything missing.
+  const restoreDraftSnapshot = (snap: any) => {
+    if (!snap) return;
+    setCurrentStep(snap.currentStep ?? 1);
+    setRegistrationDate(snap.registrationDate ?? registrationDate);
+    setPropertyDistrict(snap.propertyDistrict ?? "");
+    setPropertyMandal(snap.propertyMandal ?? "");
+    setPropertyVillage(snap.propertyVillage ?? "");
+    setPropertySurvey(snap.propertySurvey ?? "");
+    setPropertyHNo(snap.propertyHNo ?? "");
+    setPropertyPlotNo(snap.propertyPlotNo ?? "");
+    setPropertyPTINo(snap.propertyPTINo ?? "");
+    setPropertyExtent(snap.propertyExtent ?? "");
+    setPropertyPlinth(snap.propertyPlinth ?? "");
+    setBoundaryEast(snap.boundaryEast ?? "");
+    setBoundaryWest(snap.boundaryWest ?? "");
+    setBoundaryNorth(snap.boundaryNorth ?? "");
+    setBoundarySouth(snap.boundarySouth ?? "");
+    setExecutantName(snap.executantName ?? "");
+    setExecutantRelation(snap.executantRelation ?? "");
+    setExecutantAge(snap.executantAge ?? 0);
+    setExecutantAadhaar(snap.executantAadhaar ?? "");
+    setExecutantPan(snap.executantPan ?? "");
+    setExecutantDOB(snap.executantDOB ?? "");
+    setExecutantAddress(snap.executantAddress ?? "");
+    setClaimantName(snap.claimantName ?? "");
+    setClaimantRelation(snap.claimantRelation ?? "");
+    setClaimantAge(snap.claimantAge ?? 0);
+    setClaimantAadhaar(snap.claimantAadhaar ?? "");
+    setClaimantPan(snap.claimantPan ?? "");
+    setClaimantDOB(snap.claimantDOB ?? "");
+    setClaimantAddress(snap.claimantAddress ?? "");
+    setMarketValue(snap.marketValue ?? "");
+    setStampsAmount(snap.stampsAmount ?? "");
+    setNatureOfTransaction(snap.natureOfTransaction ?? "");
+    setPropertyType(snap.propertyType ?? "");
+    setExecutantsList(snap.executantsList ?? []);
+    setClaimantsList(snap.claimantsList ?? []);
+    setLinkDocumentsList(snap.linkDocumentsList ?? []);
+    setPropertiesList(snap.propertiesList ?? []);
+    setBoundariesList(snap.boundariesList ?? []);
+    setJurisdictionsList(snap.jurisdictionsList ?? []);
+    setJurDistrictRegistrar(snap.jurDistrictRegistrar ?? "");
+    setJurSubRegistrar(snap.jurSubRegistrar ?? "");
+    setJurDistrict(snap.jurDistrict ?? "");
+    setJurMandal(snap.jurMandal ?? "");
+    setJurVillage(snap.jurVillage ?? "");
+    setJurPincode(snap.jurPincode ?? "");
+    setLinkDocNo(snap.linkDocNo ?? "");
+    setLinkDocDate(snap.linkDocDate ?? "");
+    setLinkSubRegistrar(snap.linkSubRegistrar ?? "");
+    setLinkSubRegistrarCode(snap.linkSubRegistrarCode ?? "");
+    setLinkPattadarPassbook(snap.linkPattadarPassbook ?? "");
+    setLinkPassbookKhataNo(snap.linkPassbookKhataNo ?? "");
+    setLinkNalaOrderNo(snap.linkNalaOrderNo ?? "");
+    setLinkLayoutFileNo(snap.linkLayoutFileNo ?? "");
+    setLinkHouseTaxReceipt(snap.linkHouseTaxReceipt ?? "");
+    setPropertyTypeFilter(snap.propertyTypeFilter ?? "Open Plot");
+    setPropPlotNo(snap.propPlotNo ?? "");
+    setPropExtentSqYards(snap.propExtentSqYards ?? "");
+    setPropExtentSqMeters(snap.propExtentSqMeters ?? "");
+    setPropSurveyNo(snap.propSurveyNo ?? "");
+    setPropNearHNo(snap.propNearHNo ?? "");
+    setPropAdjacentHNo(snap.propAdjacentHNo ?? "");
+    setPropLocality(snap.propLocality ?? "");
+    setPropPincode(snap.propPincode ?? "");
+    setPropVltPtiNo(snap.propVltPtiNo ?? "");
+    setPropMarketValuePerSqYard(snap.propMarketValuePerSqYard ?? "");
+    setPropMarketValueTotal(snap.propMarketValueTotal ?? "");
+    setAutoAdjustBlanks(snap.autoAdjustBlanks ?? true);
+    setSelectedModelId(snap.selectedModelId ?? "custom-uploaded");
+    setCustomModelText(snap.customModelText ?? "");
+    setSelectedTemplateId(snap.selectedTemplateId ?? "");
+    setCustomTemplateText(snap.customTemplateText ?? "");
+    setCustomTemplateName(snap.customTemplateName ?? "");
+    setFilledDeedText(snap.filledDeedText ?? "");
+    setMergeMode(snap.mergeMode ?? "");
+    setUnresolvedPlaceholders(snap.unresolvedPlaceholders ?? []);
+    setReport(snap.report ?? null);
+    setPlanCustomPrompt(snap.planCustomPrompt ?? "");
+    setPlanMasterPrompt(snap.planMasterPrompt ?? "");
+    setPlanVerificationReport(snap.planVerificationReport ?? null);
+    setExtractedDetails(snap.extractedDetails ?? null);
+    // Binary uploads (Aadhaar/link images, sketch, generated plan/docx bytes) were
+    // never saved — clear any leftovers from the CURRENT session so nothing from
+    // a different draft lingers on screen after resuming this one.
+    setAadhaarCards([]);
+    setLinkDocuments([]);
+    setCustomTemplateDocxBase64("");
+    setGeneratedDocxBase64("");
+    setSketchImage(null);
+    setSketchFileName("");
+    setGeneratedPlanImage(null);
+    setActivePresetId(null);
+    setError(null);
+    setFailure(null);
+    setDegraded(null);
+  };
+
+  // Save the current form state as a new entry in the offline registry. Existing
+  // entries are kept newest-first; a localStorage quota failure (e.g. many large
+  // drafts) is reported instead of silently losing the save.
   const saveDraftToRegistry = () => {
     const newRecord = {
       id: "Deed-" + Date.now(),
@@ -2853,13 +3071,43 @@ const getTeluguRecommendation = (rec: string) => {
       property: `${propertyVillage}, Survey: ${propertySurvey}, H.No: ${propertyHNo}`,
       date: registrationDate,
       status: report?.summary?.status || "PENDING_AUDIT",
-      deedText: filledDeedText
+      snapshot: buildDraftSnapshot(),
     };
 
     const updated = [newRecord, ...savedDrafts];
+    try {
+      localStorage.setItem("telangana_deeds_registry", JSON.stringify(updated));
+    } catch (err) {
+      console.error("Failed to save draft to localStorage:", err);
+      alert(
+        "Could not save this draft — your browser's local storage appears to be full. " +
+        "Delete an older saved draft (trash icon in \"Saved Drafts\") and try again."
+      );
+      return;
+    }
     setSavedDrafts(updated);
-    localStorage.setItem("telangana_deeds_registry", JSON.stringify(updated));
-    alert("Sale Deed draft successfully saved to your offline registration desk logs!");
+    alert(
+      "Draft saved! Find it under \"Saved Drafts\" in the header any time — even after closing this tab — " +
+      "to pick up exactly where you left off."
+    );
+  };
+
+  // Resume a previously saved draft: restores every form field and jumps back to
+  // the step the user was on when they saved. Older records saved before this
+  // feature existed have no `snapshot` and cannot be resumed.
+  const loadDraftFromRegistry = (id: string) => {
+    const rec = savedDrafts.find((item) => item.id === id);
+    if (!rec) return;
+    if (!rec.snapshot) {
+      alert("This saved entry predates the Resume feature and has no saved form data to restore.");
+      return;
+    }
+    restoreDraftSnapshot(rec.snapshot);
+    setIsDraftsExpanded(false);
+    alert(
+      "Draft resumed — continue right where you left off. " +
+      "Re-attach any Aadhaar/link photos or the plan sketch if you want to re-run those AI steps."
+    );
   };
 
   const deleteRegistryRecord = (id: string, e: React.MouseEvent) => {
@@ -2928,6 +3176,23 @@ const getTeluguRecommendation = (rec: string) => {
             </div>
             
             <button
+              onClick={saveDraftToRegistry}
+              title="Save your progress so far — separate from Download, this lets you close the tab and pick up later."
+              className="bg-white border border-[#0a4d4a] text-[#0a4d4a] hover:bg-[#eef6f5] text-xs font-bold py-2 px-3.5 rounded-lg flex items-center gap-1.5 shadow-sm transition-all"
+            >
+              <Save className="w-3.5 h-3.5" />
+              Save Draft
+            </button>
+
+            <button
+              onClick={() => setIsDraftsExpanded(!isDraftsExpanded)}
+              className="bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 text-xs font-bold py-2 px-3.5 rounded-lg flex items-center gap-1.5 shadow-sm transition-all"
+            >
+              <Database className="w-3.5 h-3.5" />
+              Saved Drafts{savedDrafts.length > 0 ? ` (${savedDrafts.length})` : ""}
+            </button>
+
+            <button
               onClick={() => setIsPresetsExpanded(!isPresetsExpanded)}
               className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-xs font-bold py-2 px-3.5 rounded-lg flex items-center gap-1.5 shadow-sm transition-all"
             >
@@ -2984,6 +3249,60 @@ const getTeluguRecommendation = (rec: string) => {
                   </button>
                 ))}
               </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Saved Drafts bar — persistent Save/Resume, separate from Download */}
+      <AnimatePresence>
+        {isDraftsExpanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="bg-[#f3f6fb] border-b border-[#d6e0f0]"
+          >
+            <div className="w-full mx-auto px-4 py-4 sm:px-6 lg:px-8">
+              <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                <Database className="w-4 h-4" /> Saved Drafts (stored locally in this browser)
+              </h3>
+              {savedDrafts.length === 0 ? (
+                <p className="text-xs text-slate-500">
+                  No drafts saved yet. Click <span className="font-bold">Save Draft</span> at any time to save your progress and
+                  come back to it later — even after closing this tab.
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {savedDrafts.map((rec) => (
+                    <button
+                      key={rec.id}
+                      onClick={() => loadDraftFromRegistry(rec.id)}
+                      className="p-3 text-left rounded-lg bg-white border border-slate-200 hover:border-[#0a4d4a] hover:shadow-sm text-xs transition-all flex flex-col justify-between"
+                    >
+                      <div>
+                        <p className="font-bold text-slate-900 flex items-center justify-between gap-2 mb-1">
+                          <span className="truncate">{rec.seller || "Untitled draft"} → {rec.buyer || "?"}</span>
+                          <span
+                            onClick={(e) => deleteRegistryRecord(rec.id, e)}
+                            title="Delete this saved draft"
+                            className="text-slate-300 hover:text-red-600 shrink-0"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </span>
+                        </p>
+                        <p className="text-slate-500 leading-relaxed text-[11px] line-clamp-2">
+                          {rec.property || "No property details"}
+                        </p>
+                        <p className="text-[10px] text-slate-400 mt-1">Saved {rec.savedAt}</p>
+                      </div>
+                      <div className="mt-2 text-[10px] text-[#0a4d4a] font-mono text-right font-medium">
+                        {rec.snapshot ? "Resume Draft →" : "No saved data (legacy entry)"}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </motion.div>
         )}
@@ -5257,6 +5576,77 @@ const getTeluguRecommendation = (rec: string) => {
                         </p>
                       </div>
 
+                      {/* RE-AUDIT (Feature #4): cross-check the entered Step 1/2 data against the
+                          uploaded Aadhaar/link documents BEFORE spending an AI call to auto-fill
+                          the template in Step 4. No deed draft exists yet at this point, so this
+                          audits the ENTERED DATA itself, not a draft. */}
+                      <div className="p-4 rounded-xl border border-slate-200 bg-white space-y-3">
+                        <div className="flex items-center justify-between gap-3 flex-wrap">
+                          <div>
+                            <h4 className="font-extrabold text-[13px] text-slate-900 flex items-center gap-1.5">
+                              <Search className="w-4 h-4 text-[#0a4d4a]" /> Re-Audit Entered Details
+                            </h4>
+                            <p className="text-[11px] text-slate-500 mt-1 max-w-md">
+                              Cross-checks the names, Aadhaar numbers, ages, and property/boundary details you entered in Step 1
+                              against the uploaded Aadhaar cards and Link Document — catching mismatches before they get merged into the draft.
+                            </p>
+                          </div>
+                          <button
+                            onClick={triggerPreAudit}
+                            disabled={preAuditing || (aadhaarCards.length === 0 && linkDocuments.length === 0)}
+                            title={aadhaarCards.length === 0 && linkDocuments.length === 0 ? "Upload an Aadhaar card or Link document in Step 1 to enable this check." : undefined}
+                            className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold py-2 px-4 rounded-lg flex items-center gap-1.5 shadow-sm shrink-0"
+                          >
+                            {preAuditing ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                            {preAuditing ? "Auditing…" : "Re-Audit"}
+                          </button>
+                        </div>
+
+                        {preAuditReport && (
+                          <div className="space-y-2.5 pt-1">
+                            <div className={`p-3 rounded-lg text-white flex justify-between items-center ${preAuditReport.summary?.status === "APPROVED" ? "bg-emerald-800" : "bg-red-800"}`}>
+                              <div>
+                                <h5 className="font-bold text-[11px] uppercase">
+                                  {preAuditReport.summary?.status === "APPROVED" ? "All Clear" : "Discrepancies Found"}
+                                </h5>
+                                <p className="text-[10px] text-white/80 mt-0.5">{preAuditReport.summary?.message}</p>
+                              </div>
+                              <div className="text-lg font-extrabold">{preAuditReport.summary?.discrepancyCount ?? 0}</div>
+                            </div>
+                            {(preAuditReport.allDiscrepancies || []).length > 0 && (
+                              <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
+                                {preAuditReport.allDiscrepancies.map((item: any, idx: number) => (
+                                  <div key={idx} className="p-2.5 bg-red-50/50 border border-red-200 rounded-lg text-[11px] space-y-1.5">
+                                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                                      <span className="text-[9px] bg-red-100 text-red-800 font-black px-2 py-0.5 rounded-full uppercase">
+                                        {item.severity}
+                                      </span>
+                                      <span className="text-[10px] text-slate-600 font-bold bg-white px-2 py-0.5 rounded border border-slate-200">
+                                        {item.category}
+                                      </span>
+                                    </div>
+                                    <p className="font-bold text-slate-900 leading-snug">{item.description}</p>
+                                    <div className="grid grid-cols-2 gap-2 text-[10px] bg-white p-2 rounded-md border border-slate-200">
+                                      <div>
+                                        <span className="text-slate-500 block font-bold uppercase text-[9px]">EXPECTED:</span>
+                                        <span className="text-emerald-700 font-black font-mono text-[11px]">{item.expected}</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-slate-500 block font-bold uppercase text-[9px]">FOUND:</span>
+                                        <span className="text-red-600 font-black font-mono text-[11px]">{item.found}</span>
+                                      </div>
+                                    </div>
+                                    <p className="text-[10px] text-amber-900 bg-amber-50/60 p-1.5 rounded-md border border-amber-200">
+                                      <strong>Recommendation:</strong> {item.recommendation}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
                       {/* TEMPLATE-LIBRARY STATUS.
                           There is no manual library picker on this step — loadTemplates()
                           auto-selects a template matching the property type. So when the
@@ -5413,8 +5803,42 @@ const getTeluguRecommendation = (rec: string) => {
                               >
                                 <RefreshCw className="w-3.5 h-3.5" /> Regenerate
                               </button>
+                              {/* Feature #5: on-demand Telugu translation, downloaded as its own
+                                  standalone .docx (Sree Krushnadevaraya font) — separate from the
+                                  English deed above, which is left untouched. */}
+                              <button
+                                onClick={translateDeedToTelugu}
+                                disabled={teluguTranslating || !filledDeedText.trim()}
+                                title="Translate this deed into Telugu and download it as a separate Word document, set in the Sree Krushnadevaraya Telugu font."
+                                className="bg-white border border-[#0a4d4a] text-[#0a4d4a] hover:bg-[#eef6f5] disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold py-2 px-4 rounded-lg flex items-center gap-1.5"
+                              >
+                                {teluguTranslating ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Languages className="w-3.5 h-3.5" />}
+                                {teluguTranslating ? "Translating…" : "Translate to Telugu"}
+                              </button>
                             </div>
                           </div>
+
+                          {teluguDocxBase64 && !teluguTranslating && (
+                            <div className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-[11px] text-emerald-900 flex items-center gap-2">
+                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                              <span>
+                                Telugu translation downloaded as a separate Word document (Sree Krushnadevaraya font).{" "}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    downloadBase64(
+                                      teluguDocxBase64,
+                                      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                      `Telugu_Translation_${(claimantsList[0]?.name || claimantName || "deed").replace(/\s+/g, "_")}.docx`
+                                    )
+                                  }
+                                  className="font-bold underline underline-offset-2 hover:text-emerald-700"
+                                >
+                                  Download again
+                                </button>
+                              </span>
+                            </div>
+                          )}
 
                           {unresolvedPlaceholders.length > 0 && (
                             <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900">
