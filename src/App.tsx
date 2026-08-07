@@ -770,6 +770,10 @@ export default function App() {
   const [planVerificationReport, setPlanVerificationReport] = useState<any | null>(null);
   // Fullscreen expand/preview of the generated plan (with inline prompt refine).
   const [planExpanded, setPlanExpanded] = useState(false);
+  // Sequence counter for /api/generate-plan calls — see handleGeneratePlan's
+  // race-guard comment. Prevents an in-flight, now-stale request's response
+  // from clobbering a NEWER request's result when the two overlap.
+  const planRequestSeqRef = useRef(0);
 
   // General App states
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
@@ -2683,6 +2687,18 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       return;
     }
 
+    // Guards against a stale response overwriting a newer one. If the user
+    // fires "Apply Prompt", then edits/clears the prompt box and clicks
+    // "Apply & Re-generate" again before the FIRST request has returned, the
+    // two requests race — and without this guard, whichever HTTP response
+    // happens to land last wins, even if it was the one sent first. That is
+    // exactly what made "clear the prompt and re-generate" appear to silently
+    // revert to the earlier prompted image: the earlier (prompted) request's
+    // response arrived after the later (cleared-prompt) one. Tagging each call
+    // with an incrementing sequence number and only applying the result if it
+    // is still the MOST RECENT call in flight fixes this regardless of timing.
+    const myRequestId = ++planRequestSeqRef.current;
+
     setPlanGenerating(true);
     setPlanError(null);
     setDegraded(null);
@@ -2728,6 +2744,11 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       if (!response.ok) await failOn(response, "Plan generation");
 
       const data = await response.json();
+      // A newer call to handleGeneratePlan started while THIS request was still
+      // in flight — drop this now-stale response instead of letting it overwrite
+      // the newer call's (possibly already-applied) result. See the race-guard
+      // comment above where myRequestId was assigned.
+      if (myRequestId !== planRequestSeqRef.current) return;
       if (data.generatedImageBase64) {
         setGeneratedPlanImage(data.generatedImageBase64);
       }
@@ -2746,6 +2767,7 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
         console.warn("Plan generation notice:", data.imageError);
       }
     } catch (err: any) {
+      if (myRequestId !== planRequestSeqRef.current) return; // stale — a newer call already took over
       console.error("Error generating plan:", err);
       if (err?.name === "AbortError") {
         setPlanError(
@@ -2759,7 +2781,7 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       }
     } finally {
       clearTimeout(timeoutId);
-      setPlanGenerating(false);
+      if (myRequestId === planRequestSeqRef.current) setPlanGenerating(false);
     }
   };
 

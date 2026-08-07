@@ -282,6 +282,21 @@ function esc(s: any): string {
     .replace(/>/g, "&gt;");
 }
 
+// Draws the north-arrow compass symbol (circle + arrow + "N" label) centred at
+// (cx, cy), optionally rotated `rotationDeg` clockwise from pointing straight
+// up. The plot geometry itself is always drawn north-up regardless of this —
+// rotating just the SYMBOL is what a prompt like "rotate north symbol into 90
+// degrees" is asking for (a stylistic/annotation change to the compass glyph,
+// not a request to redraw the plot at an angle).
+function drawNorthArrow(S: string[], cx: number, cy: number, rotationDeg: number): void {
+  S.push(`<circle cx="${cx}" cy="${cy}" r="18" fill="#ffffff" stroke="#000" stroke-width="1.2"/>`);
+  const rot = rotationDeg ? ` transform="rotate(${rotationDeg} ${cx} ${cy})"` : "";
+  S.push(`<g${rot}>`);
+  S.push(`<path d="M ${cx} ${cy + 12} L ${cx} ${cy - 12} M ${cx - 5} ${cy - 5} L ${cx} ${cy - 12} L ${cx + 5} ${cy - 5}" fill="none" stroke="#000" stroke-width="1.6"/>`);
+  S.push(`<text x="${cx}" y="${cy - 15}" text-anchor="middle" font-size="11" font-weight="bold">N</text>`);
+  S.push(`</g>`);
+}
+
 // Greedy word-wrap: returns lines that fit within maxWidth px at the given font size.
 // The text rendered through this (title, description, party paragraphs) is
 // effectively ALL-UPPERCASE, and uppercase serif glyphs are noticeably wider than
@@ -597,7 +612,17 @@ export interface PlanEdits {
   /** Fill colour for an interior structure whose label matches a keyword, e.g.
    *  "highlight RCC house in light green" -> { rcc: "#a9dfbf" }. */
   structureColors?: Record<string, string>;
-  /** Any remaining instruction, drawn as a visible note so the prompt always takes effect. */
+  /** Degrees CLOCKWISE to rotate the drawn north-arrow symbol, from
+   *  "rotate north symbol/arrow ... NN degrees". 0 = arrow points straight up. */
+  northRotationDeg?: number;
+  /** "change/replace measurement X as/to Y" pairs (also matches "24' road as
+   *  40' road"), applied to any side length or road width equal to X (within a
+   *  small tolerance) wherever it appears in the drawing. */
+  dimensionRemap?: Array<{ from: number; to: number }>;
+  /** Any remaining instruction the structured rules above could not parse. Kept
+   *  for debugging/telemetry only — NOT drawn on the plan itself, since the
+   *  plan is a real registration document and should never carry the raw
+   *  free-text prompt as visible content. */
   note?: string;
 }
 
@@ -627,9 +652,12 @@ const LIGHT_COLOR_WORDS: Record<string, string> = {
 
 // Turn a free-text plan prompt into deterministic edits the SVG renderer can
 // apply. Recognises: an explicit title, per-direction boundary/road overrides,
-// a property fill colour, and per-structure highlight colours. Anything not
-// matched is ALSO kept as a visible NOTE so the user always sees their
-// instruction reflected on the plan even where parsing falls short.
+// a property fill colour, per-structure highlight colours, a north-arrow
+// rotation, and dimension remaps ("36' as 40'"). Called with an EMPTY/blank
+// prompt string this returns {} — the caller (server.ts) only invokes this
+// when there IS a non-empty prompt, and passes `edits: null` otherwise, which
+// is what makes clearing the prompt box actually revert the plan to the plain
+// sketch/form-derived drawing instead of reusing the last-applied edits.
 export function parsePlanPrompt(prompt: string): PlanEdits {
   const p = (prompt || "").trim();
   if (!p) return {};
@@ -637,6 +665,25 @@ export function parsePlanPrompt(prompt: string): PlanEdits {
 
   const titleM = p.match(/\btitle\s*[:=]\s*([^\n.;]+)/i);
   if (titleM) edits.title = titleM[1].trim();
+
+  // North-arrow rotation, e.g. "rotate north symbol into 90 degrees",
+  // "rotate the compass by 45°", "turn north arrow 180 degrees clockwise".
+  const northRotM = p.match(/\b(?:rotate|turn)\b[^.\n]*?\b(?:north\s*(?:arrow|symbol|sign)?|compass)\b[^.\n]*?(-?\d+(?:\.\d+)?)\s*(?:degrees?|°|deg\b)/i)
+    || p.match(/\b(?:north\s*(?:arrow|symbol|sign)?|compass)\b[^.\n]*?\brotat\w*\b[^.\n]*?(-?\d+(?:\.\d+)?)\s*(?:degrees?|°|deg\b)/i);
+  if (northRotM) edits.northRotationDeg = parseFloat(northRotM[1]);
+
+  // Dimension remaps, e.g. "change the measurement 36' as 40'", "replace 60'
+  // with 65'", "24' road as 40' road". Each match becomes a {from,to} pair the
+  // renderer applies to any side length / road width equal to `from`.
+  const dimensionRemap: Array<{ from: number; to: number }> = [];
+  const remapRe = /(\d+(?:\.\d+)?)\s*(?:'|feet|ft)[^.\n\d]{0,25}?\b(?:as|to|with|=|->|→)\b[^.\n\d]{0,15}?(\d+(?:\.\d+)?)\s*(?:'|feet|ft)/gi;
+  let dm: RegExpExecArray | null;
+  while ((dm = remapRe.exec(p))) {
+    const from = parseFloat(dm[1]);
+    const to = parseFloat(dm[2]);
+    if (isFinite(from) && isFinite(to) && from !== to) dimensionRemap.push({ from, to });
+  }
+  if (dimensionRemap.length) edits.dimensionRemap = dimensionRemap;
 
   // Per-direction boundary/road phrases, e.g. "north side is 30 feet road",
   // "draw 18' road in south", "east boundary is X's land". These OVERRIDE
@@ -775,16 +822,15 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   }
   y += 10;
 
-  // ---- Instruction note ----
-  // Draw the user's custom instruction so the prompt ALWAYS visibly affects the
-  // plan, even when the structured rules above did not fully capture it.
-  if (edits.note) {
-    for (const ln of wrap("As per instruction: " + edits.note, contentW, 12)) {
-      S.push(`<text x="${contentX}" y="${y}" font-size="12" font-style="italic" fill="#334155">${esc(ln)}</text>`);
-      y += 16;
-    }
-    y += 8;
-  }
+  // NOTE: earlier versions drew the user's raw prompt text here as an italic
+  // "As per instruction: ..." line. That made the free-text prompt itself
+  // appear as permanent content on a real registration document (visible even
+  // in the final exported deed), which is wrong on two counts: it is not
+  // something a registration plan should ever show, and it gave the
+  // impression the prompt "took effect" whether or not the structured edits
+  // below actually changed anything. The prompt is now applied ONLY through
+  // the structured edits (boundaries/roads/colours/rotation/dimension remap)
+  // and is never rendered as literal text.
 
   // ---- Party paragraphs ----
   // The registration PLAN (unlike the deed body) always labels the parties
@@ -840,7 +886,18 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   const RX = contentX + 6; // drawing region (left)
   const RY = rowTop + 10;
   const RW = contentW - 12;
-  const RH = 460;
+  // Fixed bottom block ("AREA UNDER REGN" checkbox, WITNESSESS. lines, both
+  // signature blocks) needs ~188px below the drawing region — see bottomY's
+  // construction further down. RH used to be a flat 460px regardless of how
+  // much vertical room the page actually had left after the (variable-length)
+  // description/party paragraphs above, which routinely left a visible band of
+  // unused whitespace between the drawing and the signature block — i.e. the
+  // plan looked shorter than a full A4 page instead of using it. Stretching RH
+  // to fill whatever room remains (bounded so it can never overflow the page,
+  // and never shrink below the old 460 floor for very long descriptions) makes
+  // the drawing consistently fill the full A4 sheet.
+  const BOTTOM_BLOCK_H = 188;
+  const RH = Math.max(460, H - M - 5 - RY - BOTTOM_BLOCK_H);
 
   // A white halo under drawing text keeps marks legible over lines/hatching
   // (paint-order="stroke" draws the white stroke first, then the black fill).
@@ -867,6 +924,23 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   // TOTAL AREA figure and repair a likely rotated-digit misread (6<->9) before
   // this feeds into geometry reconstruction below — see reconcileSidesWithPrintedArea.
   reconcileSidesWithPrintedArea(byDir, plan.table);
+
+  // Prompt-driven dimension remaps ("change the measurement 36' as 40'") OVERRIDE
+  // whatever the sketch read for any side whose length matches `from` — applied
+  // AFTER the printed-area reconciliation above so a deliberate user correction
+  // always wins over the sketch's own (possibly still-wrong) reading.
+  if (edits.dimensionRemap?.length) {
+    for (const side of Object.values(byDir)) {
+      if (!side) continue;
+      for (const { from, to } of edits.dimensionRemap) {
+        if (Math.abs(side.lengthFeet - from) < 0.5) {
+          side.lengthFeet = to;
+          side.label = `${Math.round(to)}'`;
+          break;
+        }
+      }
+    }
+  }
 
   // Boundary neighbours from the form fill in ONLY where the sketch omitted them.
   // Marked fromForm so we can suppress them on any side the sketch drew a road on —
@@ -934,6 +1008,19 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
         const ov = (edits.roads as any)?.[k];
         if (ov) roadBySide.set(k, { label: ov.label, widthFeet: ov.widthFeet || 0 });
       });
+    }
+    // Dimension remaps also apply to road widths ("24' road as 40' road"), so a
+    // correction to a road's width takes effect even when the road came from
+    // the sketch rather than an explicit edits.roads override above.
+    if (edits.dimensionRemap?.length) {
+      for (const [side, info] of roadBySide) {
+        for (const { from, to } of edits.dimensionRemap) {
+          if (Math.abs(info.widthFeet - from) < 0.5) {
+            roadBySide.set(side, { label: `${Math.round(to)}' ROAD`, widthFeet: to });
+            break;
+          }
+        }
+      }
     }
 
     // Plot bounding box (feet).
@@ -1150,11 +1237,10 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       }
     }
 
-    // North arrow — ALWAYS points up (the plot is drawn north-up by construction).
-    const naX = regR - 24, naY = regT + 30;
-    S.push(`<circle cx="${naX}" cy="${naY}" r="18" fill="#ffffff" stroke="#000" stroke-width="1.2"/>`);
-    S.push(`<path d="M ${naX} ${naY + 12} L ${naX} ${naY - 12} M ${naX - 5} ${naY - 5} L ${naX} ${naY - 12} L ${naX + 5} ${naY - 5}" fill="none" stroke="#000" stroke-width="1.6"/>`);
-    S.push(`<text x="${naX}" y="${naY - 15} " text-anchor="middle" font-size="11" font-weight="bold">N</text>`);
+    // North arrow — plot is drawn north-up by construction; the SYMBOL itself
+    // additionally rotates by edits.northRotationDeg when the prompt asked for it
+    // (e.g. "rotate north symbol into 90 degrees"), independent of the drawing.
+    drawNorthArrow(S, regR - 24, regT + 30, edits.northRotationDeg || 0);
   } else {
     // ===== FALLBACK: no usable side measurements =============================
     // Draw from the model's traced polygon (rotated so its north points UP) if it
@@ -1208,11 +1294,8 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       if (b.west) S.push(`<text x="${bx - 10}" y="${by + bh / 2}" font-size="12" transform="rotate(-90 ${bx - 10} ${by + bh / 2})" text-anchor="middle"${HALO}>${esc(b.west)}</text>`);
       if (b.east) S.push(`<text x="${bx + bw + 10}" y="${by + bh / 2}" font-size="12" transform="rotate(-90 ${bx + bw + 10} ${by + bh / 2})" text-anchor="middle"${HALO}>${esc(b.east)}</text>`);
     }
-    // North arrow (up).
-    const naX = regR - 24, naY = regT + 30;
-    S.push(`<circle cx="${naX}" cy="${naY}" r="18" fill="#ffffff" stroke="#000" stroke-width="1.2"/>`);
-    S.push(`<path d="M ${naX} ${naY + 12} L ${naX} ${naY - 12} M ${naX - 5} ${naY - 5} L ${naX} ${naY - 12} L ${naX + 5} ${naY - 5}" fill="none" stroke="#000" stroke-width="1.6"/>`);
-    S.push(`<text x="${naX}" y="${naY - 15}" text-anchor="middle" font-size="11" font-weight="bold">N</text>`);
+    // North arrow (up, rotated per edits.northRotationDeg if requested).
+    drawNorthArrow(S, regR - 24, regT + 30, edits.northRotationDeg || 0);
   }
 
   // ================= BOTTOM BLOCK (reference proforma layout) =================
