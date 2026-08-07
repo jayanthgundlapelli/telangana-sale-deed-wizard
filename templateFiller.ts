@@ -102,12 +102,14 @@ export function toDDMMYYYY(value: unknown): string {
   return s;
 }
 
-// Capitalise ONLY the S/o, W/o, D/o, C/o relation-prefix abbreviation (matching
-// the registration convention shown in sample deeds), leaving the parent/
-// spouse's own name in normal case, e.g. "W/o Matety Mallikarjun" ->
-// "W/O Matety Mallikarjun".
+// Uppercase the WHOLE relation line — both the S/o, W/o, D/o, C/o prefix AND
+// the parent/spouse's own name — matching the registration convention that
+// party names print in capitals throughout the deed, e.g. "W/o Matety
+// Mallikarjun" -> "W/O MATETY MALLIKARJUN". (Previously only the prefix
+// abbreviation was capitalised, leaving the parent/spouse's name in mixed
+// case while the party's own name elsewhere in the deed was already ALL CAPS.)
 export function upperRelPrefix(rel: unknown): string {
-  return String(rel || "").replace(/^\s*(s|w|d|c)\s*\/\s*o\b\.?/i, (m) => m.toUpperCase());
+  return String(rel || "").toUpperCase();
 }
 
 // ---- Node model -------------------------------------------------------------

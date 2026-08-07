@@ -575,12 +575,28 @@ function reconcileSidesWithPrintedArea(byDir: ByDir, table: any): void {
   }
 }
 
+interface RoadEdit {
+  label: string;
+  widthFeet: number;
+}
+
 export interface PlanEdits {
   title?: string;
-  /** Boundary neighbour text overrides, per cardinal direction. */
+  /** Boundary neighbour text overrides, per cardinal direction. OVERRIDES
+   *  whatever the sketch itself showed on that side — this is what makes an
+   *  instruction like "north side is now a 30 feet road" actually change the
+   *  drawn plan instead of being silently dropped because the sketch already
+   *  had text there. */
   boundaries?: { N?: string; S?: string; E?: string; W?: string };
+  /** Road to draw (or replace) on a given side, parsed from phrases like
+   *  "18' road on the south" or "north side is now a 30 feet road". Also
+   *  OVERRIDES anything the sketch extraction found for that side. */
+  roads?: { N?: RoadEdit; S?: RoadEdit; E?: RoadEdit; W?: RoadEdit };
   /** Hex colour for the property cross-hatch (e.g. from "shade the plot blue"). */
   propertyColor?: string;
+  /** Fill colour for an interior structure whose label matches a keyword, e.g.
+   *  "highlight RCC house in light green" -> { rcc: "#a9dfbf" }. */
+  structureColors?: Record<string, string>;
   /** Any remaining instruction, drawn as a visible note so the prompt always takes effect. */
   note?: string;
 }
@@ -600,10 +616,20 @@ const COLOR_WORDS: Record<string, string> = {
   gray: "#6b7280", purple: "#7e3ff2", pink: "#d81b8c", teal: "#0a4d4a",
 };
 
+// Light colour variants for "light green", "light blue" etc — a plain colour
+// word maps to the bold COLOR_WORDS hex, but structure highlights read better
+// pastel since they sit as a small fill inside the plot, not a hatch stroke.
+const LIGHT_COLOR_WORDS: Record<string, string> = {
+  red: "#f5b7b1", blue: "#aed6f1", green: "#a9dfbf", yellow: "#f9e79f",
+  orange: "#f5cba7", brown: "#d7bfa9", grey: "#d5d8dc", gray: "#d5d8dc",
+  purple: "#d7bde2", pink: "#f5b7cf", teal: "#a3d9d5",
+};
+
 // Turn a free-text plan prompt into deterministic edits the SVG renderer can
-// apply. Recognises: an explicit title, per-direction boundary neighbours, and a
-// property fill colour. Anything not matched is kept as a visible NOTE so the
-// user always sees their instruction reflected on the plan.
+// apply. Recognises: an explicit title, per-direction boundary/road overrides,
+// a property fill colour, and per-structure highlight colours. Anything not
+// matched is ALSO kept as a visible NOTE so the user always sees their
+// instruction reflected on the plan even where parsing falls short.
 export function parsePlanPrompt(prompt: string): PlanEdits {
   const p = (prompt || "").trim();
   if (!p) return {};
@@ -612,19 +638,63 @@ export function parsePlanPrompt(prompt: string): PlanEdits {
   const titleM = p.match(/\btitle\s*[:=]\s*([^\n.;]+)/i);
   if (titleM) edits.title = titleM[1].trim();
 
+  // Per-direction boundary/road phrases, e.g. "north side is 30 feet road",
+  // "draw 18' road in south", "east boundary is X's land". These OVERRIDE
+  // whatever the sketch itself showed on that side — that's what makes a
+  // prompt actually change the drawn plan instead of being dropped because
+  // the sketch already had text there.
   const boundaries: { N?: string; S?: string; E?: string; W?: string } = {};
+  const roads: { N?: RoadEdit; S?: RoadEdit; E?: RoadEdit; W?: RoadEdit } = {};
+  const feetRe = /(\d+(?:\.\d+)?)\s*(?:feet|ft|'|foot)/i;
+
   const dirRe = /\b(north|south|east|west)\b\s*(?:side|boundary|bounded by|:|is|=|-)\s*([^,.;\n]+)/gi;
   let bm: RegExpExecArray | null;
   while ((bm = dirRe.exec(p))) {
     const key = bm[1][0].toUpperCase() as "N" | "S" | "E" | "W";
     const val = bm[2].trim();
-    if (val) (boundaries as any)[key] = val;
+    if (!val) continue;
+    if (/\broad\b/i.test(val)) {
+      const wf = feetRe.exec(val);
+      const widthFeet = wf ? parseFloat(wf[1]) : 0;
+      const label = widthFeet > 0 ? `${widthFeet}' ROAD` : val.toUpperCase();
+      roads[key] = { label, widthFeet };
+      boundaries[key] = label;
+    } else {
+      boundaries[key] = val;
+    }
+  }
+  // Also catch "draw/add/put/move/widen NN' road ... [in/to/at] the <dir>"
+  // phrasing, which the direction-first regex above does not match.
+  const roadFirstRe = /\b(?:draw|add|put|move|widen)\b[^.\n]*?(\d+(?:\.\d+)?)\s*(?:feet|ft|')\s*(?:wide\s+)?road[^.\n]*?\b(?:in|to|at|on)\s+(?:the\s+)?(north|south|east|west)/gi;
+  let rm: RegExpExecArray | null;
+  while ((rm = roadFirstRe.exec(p))) {
+    const key = rm[2][0].toUpperCase() as "N" | "S" | "E" | "W";
+    const wf = parseFloat(rm[1]);
+    const label = `${wf}' ROAD`;
+    roads[key] = { label, widthFeet: wf };
+    boundaries[key] = label;
   }
   if (Object.keys(boundaries).length) edits.boundaries = boundaries;
+  if (Object.keys(roads).length) edits.roads = roads;
 
   const colorM = p.match(/\b(?:plot|land|property|schedule)\b[^.\n]*?\b(red|blue|green|yellow|orange|brown|black|grey|gray|purple|pink|teal)\b/i)
     || p.match(/\b(red|blue|green|yellow|orange|brown|black|grey|gray|purple|pink|teal)\b[^.\n]*?\b(?:plot|land|property|hatch|shade)\b/i);
   if (colorM) edits.propertyColor = COLOR_WORDS[colorM[1].toLowerCase()];
+
+  // Per-structure highlight, e.g. "highlight RCC house in light green",
+  // "make the tinshed blue". Matches the keyword the interior-structure
+  // labels use (RCC / TINSHED / OPEN) so renderRegistrationPlanSvg can look
+  // up a fill colour by the same keyword when it draws each structure box.
+  const structureColors: Record<string, string> = {};
+  const structRe = /\b(rcc|r\.c\.c\.?|tinshed|tin\s*shed|house|building)\b[^.\n]*?\b(light\s+)?(red|blue|green|yellow|orange|brown|black|grey|gray|purple|pink|teal)\b/gi;
+  let sm: RegExpExecArray | null;
+  while ((sm = structRe.exec(p))) {
+    const key = sm[1].toLowerCase().replace(/[.\s]/g, "").replace(/^r\.?c\.?c\.?$/i, "rcc");
+    const light = !!sm[2];
+    const colorWord = sm[3].toLowerCase();
+    structureColors[key] = (light ? LIGHT_COLOR_WORDS : COLOR_WORDS)[colorWord] || COLOR_WORDS[colorWord];
+  }
+  if (Object.keys(structureColors).length) edits.structureColors = structureColors;
 
   // Whatever the user wrote is retained as a note so ANY instruction visibly
   // affects the output, even one the structured rules above did not capture.
@@ -810,6 +880,23 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     }
   });
 
+  // Prompt-driven boundary edits OVERRIDE whatever the sketch (or form) showed
+  // on that side — unlike the form fallback above, this is a deliberate
+  // instruction from the user ("Apply Prompt" / "Apply & Re-generate"), so it
+  // must actually change the drawn label, not just sit in a footnote. Without
+  // this, an instruction like "north side is now a 30 feet road" was silently
+  // discarded whenever the sketch already had ANY text on that side — which is
+  // true for almost every real hand-drawn sketch.
+  if (edits.boundaries) {
+    (["N", "S", "E", "W"] as const).forEach((k) => {
+      const ov = (edits.boundaries as any)?.[k];
+      if (!ov) return;
+      if (!byDir[k]) byDir[k] = { lengthFeet: 0, label: "", neighbour: "" };
+      byDir[k]!.neighbour = ov;
+      byDir[k]!.fromForm = false;
+    });
+  }
+
   // Prefer a bearing-based closed traverse when bearings are present for enough
   // sides; otherwise reconstruct rectilinearly from the side lengths.
   const dirOrder: ("N" | "E" | "S" | "W")[] = ["N", "E", "S", "W"];
@@ -837,6 +924,16 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       if (!side) continue;
       const wf = isFinite(rd?.widthFeet) && rd.widthFeet > 0 ? rd.widthFeet : parseFeet(rd?.label) || 0;
       if (!roadBySide.has(side)) roadBySide.set(side, { label: String(rd?.label || ""), widthFeet: wf });
+    }
+    // Prompt-driven road edits OVERRIDE whatever the sketch showed on that
+    // side (or add a road the sketch never had) — same reasoning as the
+    // boundary override above: a deliberate "Apply Prompt" instruction must
+    // visibly change the drawing, not just add a footnote.
+    if (edits.roads) {
+      (["N", "S", "E", "W"] as const).forEach((k) => {
+        const ov = (edits.roads as any)?.[k];
+        if (ov) roadBySide.set(k, { label: ov.label, widthFeet: ov.widthFeet || 0 });
+      });
     }
 
     // Plot bounding box (feet).
@@ -928,7 +1025,20 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     // region is left unfilled so the property hatch shows through (it is not a
     // building). Labels are shrunk to fit their box width so they never overflow.
     const interiors: any[] = Array.isArray(drawing?.interiorStructures) ? drawing.interiorStructures : [];
-    type IB = { label: string; bx: number; by: number; bw: number; bh: number; boxed: boolean; open: boolean; tx: number; ty: number };
+    type IB = { label: string; bx: number; by: number; bw: number; bh: number; boxed: boolean; open: boolean; tx: number; ty: number; fill: string };
+    // A prompt like "highlight RCC house in light green" is matched against
+    // each structure's own label by keyword (rcc / tinshed / house / building),
+    // so the highlight lands on whichever structure the sketch actually has.
+    const colorForLabel = (label: string): string => {
+      const sc2 = edits.structureColors;
+      if (!sc2) return "#ffffff";
+      const norm = label.toLowerCase();
+      for (const key of Object.keys(sc2)) {
+        const kw = key === "rcc" ? /r\.?c\.?c\.?/i : new RegExp(key, "i");
+        if (kw.test(norm)) return sc2[key];
+      }
+      return "#ffffff";
+    };
     const interiorBoxes: IB[] = [];
     for (const st of interiors) {
       const label = String(st?.label || "").trim();
@@ -937,6 +1047,7 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       const wF = isFinite(st?.widthFeet) && st.widthFeet > 0 ? st.widthFeet : 0;
       const dF = isFinite(st?.depthFeet) && st.depthFeet > 0 ? st.depthFeet : 0;
       const pos = String(st?.position || "center").toLowerCase();
+      const fill = colorForLabel(label);
       // Anchor point inside the plot bbox from the position keyword.
       let ax = cx, ay = cy;
       const insetX = plotWpx * 0.26, insetY = plotHpx * 0.26;
@@ -949,15 +1060,15 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
         const bh = Math.min(plotHpx * 0.92, dF * sc);
         const bx = Math.max(plotL + 2, Math.min(plotR - bw - 2, ax - bw / 2));
         const by = Math.max(plotT + 2, Math.min(plotB - bh - 2, ay - bh / 2));
-        interiorBoxes.push({ label, bx, by, bw, bh, boxed: !open, open, tx: bx + bw / 2, ty: by + bh / 2 });
+        interiorBoxes.push({ label, bx, by, bw, bh, boxed: !open, open, tx: bx + bw / 2, ty: by + bh / 2, fill });
       } else {
-        interiorBoxes.push({ label, bx: ax, by: ay, bw: 0, bh: 0, boxed: false, open, tx: ax, ty: ay });
+        interiorBoxes.push({ label, bx: ax, by: ay, bw: 0, bh: 0, boxed: false, open, tx: ax, ty: ay, fill });
       }
     }
     // Pass 1: boxes (built structures only — open areas stay hatched).
     for (const b of interiorBoxes) {
       if (b.boxed && b.bw > 0 && b.bh > 0) {
-        S.push(`<rect x="${b.bx.toFixed(1)}" y="${b.by.toFixed(1)}" width="${b.bw.toFixed(1)}" height="${b.bh.toFixed(1)}" fill="#ffffff" stroke="#000" stroke-width="1.4"/>`);
+        S.push(`<rect x="${b.bx.toFixed(1)}" y="${b.by.toFixed(1)}" width="${b.bw.toFixed(1)}" height="${b.bh.toFixed(1)}" fill="${b.fill}" stroke="#000" stroke-width="1.4"/>`);
       }
     }
     // Pass 2: labels on top of every box, shrunk to fit the box width.

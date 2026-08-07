@@ -787,6 +787,15 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [isPresetsExpanded, setIsPresetsExpanded] = useState(false);
   const [savedDrafts, setSavedDrafts] = useState<any[]>([]);
+  // Identity of the saved-draft record the CURRENT session is editing, if any.
+  // Set when a draft is resumed (loadDraftFromRegistry) or after the first
+  // successful save. As long as this points at a record that still exists,
+  // saveDraftToRegistry() UPDATES that record in place instead of prepending a
+  // brand-new one — this is what stops "Save Draft" from piling up duplicate
+  // entries every time it's clicked for what is really the same deed. Cleared
+  // whenever the user starts a genuinely different deed (preset load) or
+  // deletes the record it points to.
+  const [currentDraftId, setCurrentDraftId] = useState<string | null>(null);
   const [isDraftsExpanded, setIsDraftsExpanded] = useState(false);
   const [activeAuditTab, setActiveAuditTab] = useState<"all" | "critical" | "warnings">("all");
 
@@ -883,6 +892,11 @@ export default function App() {
 
   // Preset Selector Loader
   const handleSelectPreset = async (preset: Preset) => {
+    // A preset loads a distinct sample deed — it must not be treated as "the
+    // same deed" as whatever was previously saved/resumed in this session, so
+    // the next Save Draft creates its own new entry rather than overwriting
+    // an unrelated one.
+    setCurrentDraftId(null);
     setActivePresetId(preset.id);
     setRegistrationDate(preset.registrationDate);
     
@@ -2222,6 +2236,32 @@ export default function App() {
     }
   };
 
+  // Auto-reverify EVERY placeholder — not a fixed list — the moment the user
+  // leaves Step 1. Previously, unresolvedPlaceholders was a snapshot taken the
+  // instant Generate/Regenerate ran; if the document had already been generated
+  // with gaps (e.g. "<Executant Dob>") and the user then went back to Step 1 and
+  // filled those fields, nothing re-ran the merge — the stale placeholder list
+  // (and the literal <Angle Bracket> text baked into the document) just sat there
+  // until a manual "Regenerate" click. Since generateDocument() always rebuilds
+  // from buildConsolidatedDetails() + the template, silently re-running it here
+  // re-checks the WHOLE placeholder set, whatever it is, not any specific field.
+  const prevStepRef = useRef(currentStep);
+  useEffect(() => {
+    const prevStep = prevStepRef.current;
+    prevStepRef.current = currentStep;
+    if (
+      prevStep === 1 &&
+      currentStep !== 1 &&
+      filledDeedText.trim() &&
+      unresolvedPlaceholders.length > 0 &&
+      !previewEditing &&
+      !filling
+    ) {
+      generateDocument(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep]);
+
   // Convert a base64 payload to a Blob and trigger a browser download.
   const downloadBase64 = (base64: string, mimeType: string, filename: string) => {
     const byteChars = atob(base64);
@@ -3059,12 +3099,18 @@ const getTeluguRecommendation = (rec: string) => {
     setDegraded(null);
   };
 
-  // Save the current form state as a new entry in the offline registry. Existing
-  // entries are kept newest-first; a localStorage quota failure (e.g. many large
-  // drafts) is reported instead of silently losing the save.
-  const saveDraftToRegistry = () => {
-    const newRecord = {
-      id: "Deed-" + Date.now(),
+  // Save the current form state to the offline registry. If this session is
+  // already tied to a saved record (currentDraftId — set by a previous save in
+  // this session, or by resuming a saved draft), that SAME record is updated
+  // in place: same id, refreshed fields/snapshot/savedAt. Only when there is no
+  // such record (first save ever for this deed, or its record was deleted) is
+  // a brand-new entry created. This is what stops repeated "Save Draft" clicks
+  // on the same deed from piling up duplicate entries in "Saved Drafts".
+  const saveDraftToRegistry = (asNew: boolean = false) => {
+    const existingIdx = asNew ? -1 : savedDrafts.findIndex((r) => r.id === currentDraftId);
+    const id = existingIdx >= 0 ? savedDrafts[existingIdx].id : "Deed-" + Date.now();
+    const record = {
+      id,
       savedAt: new Date().toLocaleString(),
       seller: executantName,
       buyer: claimantName,
@@ -3074,7 +3120,10 @@ const getTeluguRecommendation = (rec: string) => {
       snapshot: buildDraftSnapshot(),
     };
 
-    const updated = [newRecord, ...savedDrafts];
+    const updated =
+      existingIdx >= 0
+        ? savedDrafts.map((r, i) => (i === existingIdx ? record : r))
+        : [record, ...savedDrafts];
     try {
       localStorage.setItem("telangana_deeds_registry", JSON.stringify(updated));
     } catch (err) {
@@ -3086,9 +3135,12 @@ const getTeluguRecommendation = (rec: string) => {
       return;
     }
     setSavedDrafts(updated);
+    setCurrentDraftId(id);
     alert(
-      "Draft saved! Find it under \"Saved Drafts\" in the header any time — even after closing this tab — " +
-      "to pick up exactly where you left off."
+      existingIdx >= 0
+        ? "Draft updated! Your existing saved entry now reflects the latest changes."
+        : "Draft saved! Find it under \"Saved Drafts\" in the header any time — even after closing this tab — " +
+          "to pick up exactly where you left off."
     );
   };
 
@@ -3103,6 +3155,9 @@ const getTeluguRecommendation = (rec: string) => {
       return;
     }
     restoreDraftSnapshot(rec.snapshot);
+    // Tie this session to the record we just resumed, so the next "Save Draft"
+    // updates it in place instead of creating a sibling copy.
+    setCurrentDraftId(rec.id);
     setIsDraftsExpanded(false);
     alert(
       "Draft resumed — continue right where you left off. " +
@@ -3115,6 +3170,10 @@ const getTeluguRecommendation = (rec: string) => {
     const filtered = savedDrafts.filter(item => item.id !== id);
     setSavedDrafts(filtered);
     localStorage.setItem("telangana_deeds_registry", JSON.stringify(filtered));
+    // If the deleted record was the one this session was tracking, the next
+    // Save Draft should create a fresh entry rather than "update" a record
+    // that no longer exists.
+    if (id === currentDraftId) setCurrentDraftId(null);
   };
 
   // Trigger Native Print Dialog with styled print media
@@ -3176,13 +3235,28 @@ const getTeluguRecommendation = (rec: string) => {
             </div>
             
             <button
-              onClick={saveDraftToRegistry}
-              title="Save your progress so far — separate from Download, this lets you close the tab and pick up later."
+              onClick={() => saveDraftToRegistry()}
+              title={
+                currentDraftId
+                  ? "Update the saved draft you're currently working on — this replaces its saved data, it does not create a duplicate."
+                  : "Save your progress so far — separate from Download, this lets you close the tab and pick up later."
+              }
               className="bg-white border border-[#0a4d4a] text-[#0a4d4a] hover:bg-[#eef6f5] text-xs font-bold py-2 px-3.5 rounded-lg flex items-center gap-1.5 shadow-sm transition-all"
             >
               <Save className="w-3.5 h-3.5" />
-              Save Draft
+              {currentDraftId ? "Update Draft" : "Save Draft"}
             </button>
+
+            {currentDraftId && (
+              <button
+                onClick={() => saveDraftToRegistry(true)}
+                title="Keep the original saved draft untouched and save the current form state as a brand-new, separate entry."
+                className="bg-white border border-slate-300 text-slate-600 hover:bg-slate-100 text-xs font-bold py-2 px-3.5 rounded-lg flex items-center gap-1.5 shadow-sm transition-all"
+              >
+                <Save className="w-3.5 h-3.5" />
+                Save as New
+              </button>
+            )}
 
             <button
               onClick={() => setIsDraftsExpanded(!isDraftsExpanded)}

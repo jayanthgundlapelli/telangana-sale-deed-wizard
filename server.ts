@@ -751,6 +751,7 @@ The TEMPLATE is a document whose specimen details MUST be updated with the corre
 2. EXECUTION DATE — DATA.registrationDate.
 3. VENDOR/S (SELLER/S) block — for EACH seller: full NAME, relation (S/o | W/o | D/o + parent's name), age, DOB, occupation, full address (H.No, street/locality, village/mandal, district, state, pin), Aadhaar No, PAN → DATA.executants[].
 4. VENDEE/S (BUYER/S) block — for EACH buyer: NAME, relation, age, DOB, occupation, full address, Cell No, Aadhaar No, PAN → DATA.claimants[].
+   NAME CASING (both blocks): render the party's own NAME **and** the parent/spouse's name that follows S/o, W/o, D/o, or C/o entirely in CAPITAL LETTERS — e.g. "W/o Matety Mallikarjun" must print as "W/O MATETY MALLIKARJUN", not left in mixed case.
 5. LINK / PARENT DOCUMENT recital — DATA.linkDeed (deedNumber, village/S.R.O., executionDate).
 6. CONSIDERATION amounts — set ALL occurrences to DATA.marketValue.
 7. SCHEDULE OF THE PROPERTY — plot no, total area (sq yards AND sq meters), survey no, near H.No, locality/village, mandal, district, pin code, Gram Panchayat, Sub-Registrar office, District Registrar jurisdiction → DATA.property.
