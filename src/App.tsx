@@ -3029,6 +3029,88 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       severity: d.severity || "",
     }));
 
+  // VERIFY FLOW — open a clean, self-contained print window for the report. We
+  // build standalone HTML instead of window.print() on the page because the
+  // on-screen report lives in a CSS scale() transform inside a scroll box, which
+  // browsers clip/misscale when printing directly.
+  const printVerificationReport = () => {
+    if (!report) return;
+    const esc = (v: unknown) =>
+      String(v ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    const discs = buildReportDiscrepancies();
+    const rows = discs.length
+      ? discs
+          .map((d: any) => {
+            const crit = String(d.severity || "").toUpperCase() === "CRITICAL";
+            const fill = crit ? "#fdecec" : "#fff6e5";
+            const sevColor = crit ? "#b00020" : "#8a5a00";
+            const sevTe = crit ? "తీవ్రమైనది" : "హెచ్చరిక";
+            return `<tr style="background:${fill}">
+              <td><strong>${esc(d.category) || "—"}</strong>${d.categoryTe ? `<div class="te">${esc(d.categoryTe)}</div>` : ""}</td>
+              <td>${esc(d.description) || "—"}${d.descriptionTe ? `<div class="te">${esc(d.descriptionTe)}</div>` : ""}</td>
+              <td class="found">${esc(d.found) || "—"}</td>
+              <td class="expected">${esc(d.expected) || "—"}</td>
+              <td class="sev" style="color:${sevColor}"><strong>${esc((d.severity || "").toUpperCase())}</strong><div class="te">${sevTe}</div></td>
+            </tr>`;
+          })
+          .join("")
+      : `<tr><td colspan="5" style="background:#ecfdf3;color:#0a6b33;font-weight:600">No discrepancies detected — the document matches the entered details and uploaded documents.<div class="te">ఎటువంటి తేడాలు కనుగొనబడలేదు — పత్రం నమోదు వివరాలతో సరిపోలింది.</div></td></tr>`;
+
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Deed Verification Report</title>
+      <style>
+        @page { size: A4; margin: 14mm; }
+        * { box-sizing: border-box; }
+        body { font-family: "Nirmala UI", "Segoe UI", Arial, sans-serif; color:#1e293b; margin:0; }
+        .title { text-align:center; border-bottom:2px double #94a3b8; padding-bottom:10px; margin-bottom:16px; }
+        .title h1 { font-size:20px; margin:0; text-transform:uppercase; letter-spacing:.5px; }
+        .title .te { font-size:14px; color:#0a4d4a; font-weight:700; margin-top:2px; }
+        .meta { font-size:12px; margin-bottom:14px; }
+        .meta p { margin:2px 0; }
+        table { width:100%; border-collapse:collapse; font-size:11px; table-layout:fixed; }
+        th, td { border:1px solid #c9d6d4; padding:6px 7px; text-align:left; vertical-align:top; word-wrap:break-word; }
+        thead th { background:#0a4d4a; color:#fff; }
+        thead .te { color:#bfe3df; font-size:9px; font-weight:600; }
+        col.c1{width:20%} col.c2{width:30%} col.c3{width:19%} col.c4{width:19%} col.c5{width:12%}
+        .te { color:#0a4d4a; font-size:10px; margin-top:2px; }
+        .found { color:#b00020; font-weight:700; }
+        .expected { color:#0a6b33; font-weight:700; }
+        .sev { text-align:center; }
+        tr, tr { page-break-inside: avoid; }
+      </style></head>
+      <body>
+        <div class="title"><h1>Deed Verification Report</h1><div class="te">దస్తావేజు పరిశీలన నివేదిక</div></div>
+        <div class="meta">
+          ${verifyDocName ? `<p><strong>Document / పత్రం:</strong> ${esc(verifyDocName)}</p>` : ""}
+          <p><strong>Registration Date / తేదీ:</strong> ${esc(registrationDate) || "—"}</p>
+          <p><strong>Discrepancies found / గుర్తించిన తేడాలు:</strong> <span style="color:#b00020;font-weight:700">${discs.length}</span></p>
+        </div>
+        <table>
+          <colgroup><col class="c1"><col class="c2"><col class="c3"><col class="c4"><col class="c5"></colgroup>
+          <thead><tr>
+            <th>Category<div class="te">వర్గం</div></th>
+            <th>Issue<div class="te">సమస్య</div></th>
+            <th>In Document<div class="te">పత్రంలో ఉన్నది</div></th>
+            <th>Should Be<div class="te">ఉండవలసినది</div></th>
+            <th>Severity<div class="te">తీవ్రత</div></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <script>window.onload=function(){window.focus();window.print();};<\/script>
+      </body></html>`;
+
+    const win = window.open("", "_blank", "width=900,height=1000");
+    if (!win) {
+      reportFailure(new Error("Popup blocked. Allow pop-ups to print the report."), "Print report");
+      return;
+    }
+    win.document.open();
+    win.document.write(html);
+    win.document.close();
+  };
+
   // VERIFY FLOW — download the discrepancy report as a Word .docx (5-column table).
   const downloadVerificationReport = async () => {
     if (!report) return;
@@ -5866,6 +5948,9 @@ const getTeluguRecommendation = (rec: string) => {
                               <button onClick={triggerDeedVerificationAudit} className="ml-1 px-3 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-[11px] font-bold flex items-center gap-1.5">
                                 <RefreshCw className="w-3.5 h-3.5" /> Re-run
                               </button>
+                              <button onClick={printVerificationReport} title="Print report" className="px-3 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-[11px] font-bold flex items-center gap-1.5">
+                                <Printer className="w-3.5 h-3.5" /> Print
+                              </button>
                             </div>
                           </div>
 
@@ -5953,6 +6038,12 @@ const getTeluguRecommendation = (rec: string) => {
                               className="bg-white border border-[#0a4d4a] text-[#0a4d4a] hover:bg-[#eef6f5] disabled:opacity-50 text-xs font-bold py-3 px-6 rounded-lg flex items-center gap-1.5 shadow-sm"
                             >
                               <Download className="w-4 h-4" /> {reportDownloading === "corrected" ? "Preparing…" : "Download Corrected Deed (Word)"}
+                            </button>
+                            <button
+                              onClick={printVerificationReport}
+                              className="bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 text-xs font-bold py-3 px-6 rounded-lg flex items-center gap-1.5 shadow-sm"
+                            >
+                              <Printer className="w-4 h-4" /> Print Report
                             </button>
                           </div>
                           <p className="text-[10px] text-slate-400 text-center max-w-lg mx-auto">
