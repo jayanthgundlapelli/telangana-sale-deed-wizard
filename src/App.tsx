@@ -2926,6 +2926,9 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
           enteredDetails: buildConsolidatedDetails(),
           unresolvedPlaceholders,
           templateName: selectedTemplateName(),
+          // VERIFY FLOW ONLY: request one row per atomic discrepancy. The generate
+          // flow omits this, so its verification behaviour is unchanged.
+          granularDiscrepancies: flowMode === "verify",
         })
       });
 

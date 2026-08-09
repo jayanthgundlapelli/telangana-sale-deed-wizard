@@ -2035,6 +2035,11 @@ app.post("/api/verify", async (req, res) => {
       enteredDetails,
       unresolvedPlaceholders,
       templateName,
+      // VERIFY FLOW ONLY: when true, the model must emit one row per atomic
+      // discrepancy instead of grouping related issues into a single item. The
+      // generate flow never sends this, so its verification behaviour is
+      // unchanged.
+      granularDiscrepancies,
     } = req.body;
 
     if (!draftText) {
@@ -2138,7 +2143,8 @@ app.post("/api/verify", async (req, res) => {
          - "Link document numbers mismatch"
          - "Residual content"
          - "Completeness"
-
+${granularDiscrepancies ? `
+      GRANULARITY (IMPORTANT): In "allDiscrepancies", emit ONE separate item for EACH individual field that differs — do NOT combine several fields into a single row, even when they share a category or belong to the same person/property. For example, if Plot No, Survey No and Extent (area) all differ, that is THREE separate items, not one. If two sellers each have a name-spelling issue, that is TWO items. Each item's "found" and "expected" must name the single specific field it is about (e.g. "Plot No", "Survey No", "Seller 2 name") and contain ONLY that field's value. Include every discrepancy no matter how minor.` : ""}
       Response MUST be in valid JSON. No trailing commas, no backticks outside the JSON.`,
     });
 
