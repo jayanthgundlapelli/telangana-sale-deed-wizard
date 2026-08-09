@@ -6,7 +6,7 @@ import { execFile } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
-import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx } from "./documentBuilder";
+import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendEditablePlanPageToDocx, appendImagesPageToDocx } from "./documentBuilder";
 import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs, upperRelPrefix } from "./templateFiller";
 import {
   renderPlanDataUrl,
@@ -648,82 +648,6 @@ function addMissingLinkRegistrationReference(templateText: string, details: any)
     : `${templateText.slice(0, insertion)}${reference}${templateText.slice(insertion)}`;
 }
 
-// The certified library templates contain only the common deed fields. Append a
-// factual schedule for any additional Step-1 values so type-specific property,
-// jurisdiction and secondary-row data always survive into the final document.
-// Uploaded templates remain untouched because their author controls the layout.
-function addMissingFormDetailsSchedule(templateText: string, details: any): string {
-  const d = details || {};
-  const properties = Array.isArray(d.properties) && d.properties.length ? d.properties : [d.property || {}];
-  const jurisdictions = Array.isArray(d.jurisdictions) ? d.jurisdictions : [];
-  const linkDocuments = Array.isArray(d.linkDocuments) && d.linkDocuments.length ? d.linkDocuments : [d.linkDeed || {}];
-  const fieldLabel: Record<string, string> = {
-    propertyType: "Property Type", extentSqMeters: "Extent in Sq. Metres", adjacentHNo: "Adjacent H. No.", bltNo: "V.L.T. No.", ptiNo: "P.T.I. No.",
-    locality: "Locality", marketValuePerSqYard: "Market Value per Sq. Yard", houseBearingHNo: "House Bearing H. No.",
-    houseNature: "Nature of House", houseFloors: "Floors", housePlinthArea: "House Plinth Area", houseAge: "Age of House",
-    houseTapConnection: "Tap Connection No.", houseMetersNo: "Meter No.", houseTaxes: "Taxes Per Annum", houseRentalValue: "Annual Rental Value",
-    demoBearingHNo: "Demolished House Bearing H. No.", demoLocality: "Demolished House Locality", demoTapConnection: "Demolished House Tap Connection", demoMetersNo: "Demolished House Meter No.",
-    partBearingHNo: "Part-Open-Place Bearing H. No.", partLocality: "Part-Open-Place Locality", flatNo: "Flat No.",
-    flatUndividedSqYards: "Undivided Share in Sq. Yards", flatUndividedSqMeters: "Undivided Share in Sq. Metres", flatBearingHNo: "Flat Bearing H. No.",
-    flatNature: "Nature of Flat", flatLocality: "Flat Locality", flatValuePerSqFeet: "Flat Value per Sq. Ft.", flatMarketValueTotal: "Flat Market Value Total",
-    flatAge: "Age of Flat", flatTapConnection: "Flat Tap Connection", flatMetersNo: "Flat Meter No.", flatTaxes: "Flat Taxes Per Annum",
-    flatRentalValue: "Flat Annual Rental Value", flatBuildingName: "Building Name", flatNearHNo: "Flat Near H. No.", flatFloorS: "Floor", flatPlinthArea: "Flat Plinth Area", flatTotalLand: "Total Land",
-  };
-  const propertyLines = properties.flatMap((property: any, index: number) => {
-    const rows = Object.entries(fieldLabel)
-      .filter(([key]) => String(property?.[key] || "").trim())
-      .map(([key, label]) => `${label}: ${property[key]}`);
-    return rows.length ? [`PROPERTY ${index + 1} ADDITIONAL DETAILS:`, ...rows, ""] : [];
-  });
-  const jurisdictionLines = jurisdictions.flatMap((jurisdiction: any, index: number) => {
-    const rows = [
-      ["District Registrar", jurisdiction.districtRegistrar], ["Sub-Registrar", jurisdiction.subRegistrar],
-      ["District", jurisdiction.district], ["Mandal", jurisdiction.mandal], ["Village", jurisdiction.village], ["Pincode", jurisdiction.pincode],
-    ].filter(([, value]) => String(value || "").trim()).map(([label, value]) => `${label}: ${value}`);
-    return rows.length ? [`JURISDICTION ${index + 1}:`, ...rows, ""] : [];
-  });
-  const linkLines = linkDocuments.flatMap((link: any, index: number) => {
-    const rows = [
-      ["Layout File No.", link.layoutFileNo], ["Link Document Type", link.linkDocType || link.docType || link.type], ["Link Document No.", link.linkDocNo || link.deedNumber],
-      ["Link Document Date", link.linkDocDate || link.executionDate], ["Sub-Registrar", link.subRegistrar || link.village],
-      ["SRO Code", link.subRegistrarCode], ["Pattadar Passbook No.", link.pattadarPassbookNo],
-      ["Passbook Khata No.", link.passbookKhataNo], ["NALA Order No.", link.nalaOrderNo], ["House Tax Receipt", link.houseTaxReceipt],
-    ].filter(([, value]) => String(value || "").trim()).map(([label, value]) => `${label}: ${value}`);
-    return rows.length ? [`LINK DOCUMENT ${index + 1}:`, ...rows, ""] : [];
-  });
-  const schedule = [...propertyLines, ...jurisdictionLines, ...linkLines];
-  return schedule.length ? `${templateText.trim()}\n\nADDITIONAL REGISTRATION FORM DETAILS:\n${schedule.join("\n")}` : templateText;
-}
-
-function registrationDetailsLines(details: any): string[] {
-  const d = details || {};
-  const properties = Array.isArray(d.properties) && d.properties.length ? d.properties : [d.property || {}];
-  const jurisdictions = Array.isArray(d.jurisdictions) ? d.jurisdictions : [];
-  const links = Array.isArray(d.linkDocuments) && d.linkDocuments.length ? d.linkDocuments : [d.linkDeed || {}];
-  const lines: string[] = [];
-  const DATE_KEYS = new Set(["linkDocDate", "executionDate"]);
-  const append = (heading: string, source: any, labels: Record<string, string>) => {
-    const values = Object.entries(labels)
-      .map(([key, label]) => [label, DATE_KEYS.has(key) ? toDDMMYYYY(source?.[key]) : source?.[key]] as const)
-      .filter(([, value]) => String(value || "").trim());
-    if (values.length) lines.push(heading, ...values.map(([label, value]) => `${label}: ${value}`), "");
-  };
-  properties.forEach((property: any, index: number) => append(`PROPERTY ${index + 1}:`, property, {
-    propertyType: "Property Type", plotNo: "Plot No.", surveyNo: "Survey No.", nearHNo: "Near H. No.", adjacentHNo: "Adjacent H. No.", locality: "Locality", pincode: "Pincode", vltPtiNo: "V.L.T. No.", ptiNo: "P.T.I. No.", bltNo: "V.L.T. No.",
-    extentSqYards: "Extent in Sq. Yards", extentSqMeters: "Extent in Sq. Metres", marketValuePerSqYard: "Market Value per Sq. Yard", marketValueTotal: "Market Value Total",
-    houseBearingHNo: "House Bearing H. No.", houseNature: "Nature of House", houseFloors: "Floors", housePlinthArea: "House Plinth Area", houseAge: "Age of House", houseTapConnection: "Tap Connection", houseMetersNo: "Meter No.", houseTaxes: "Taxes Per Annum", houseRentalValue: "Annual Rental Value",
-    demoBearingHNo: "Demolished House Bearing H. No.", demoLocality: "Demolished House Locality", demoTapConnection: "Demolished House Tap Connection", demoMetersNo: "Demolished House Meter No.",
-    partBearingHNo: "Part-Open-Place Bearing H. No.", partLocality: "Part-Open-Place Locality", flatNo: "Flat No.", flatUndividedSqYards: "Undivided Share in Sq. Yards", flatUndividedSqMeters: "Undivided Share in Sq. Metres", flatBearingHNo: "Flat Bearing H. No.", flatNature: "Nature of Flat", flatLocality: "Flat Locality", flatValuePerSqFeet: "Flat Value per Sq. Ft.", flatMarketValueTotal: "Flat Market Value Total", flatAge: "Age of Flat", flatTapConnection: "Flat Tap Connection", flatMetersNo: "Flat Meter No.", flatTaxes: "Flat Taxes Per Annum", flatRentalValue: "Flat Annual Rental Value", flatBuildingName: "Building Name", flatNearHNo: "Flat Near H. No.", flatFloorS: "Floor", flatPlinthArea: "Flat Plinth Area", flatTotalLand: "Total Land",
-  }));
-  jurisdictions.forEach((jurisdiction: any, index: number) => append(`JURISDICTION ${index + 1}:`, jurisdiction, {
-    districtRegistrar: "District Registrar", subRegistrar: "Sub-Registrar", district: "District", mandal: "Mandal", village: "Village", pincode: "Pincode",
-  }));
-  links.forEach((link: any, index: number) => append(`LINK DOCUMENT ${index + 1}:`, link, {
-    layoutFileNo: "Layout File No.", linkDocType: "Link Document Type", docType: "Link Document Type", type: "Link Document Type", linkDocNo: "Link Document No.", linkDocDate: "Link Document Date", deedNumber: "Link Document No.", executionDate: "Link Document Date", subRegistrar: "Sub-Registrar", subRegistrarCode: "SRO Code", pattadarPassbookNo: "Pattadar Passbook No.", passbookKhataNo: "Passbook Khata No.", nalaOrderNo: "NALA Order No.", houseTaxReceipt: "House Tax Receipt",
-  }));
-  return lines;
-}
-
 // AI-assisted fill for USER-SUPPLIED templates. A custom template the user uploads
 // may use any placeholder style ({{X}}, [X], <X>, ____ blanks, or descriptive slots),
 // so we let Gemini map the consolidated registration facts into the template's own
@@ -965,11 +889,6 @@ app.post("/api/generate-document", async (req, res) => {
           close: ">",
           preprocessXml: (xml) => expandMultiPartyParagraphs(xml, details),
         });
-        const filledBuffer = await appendRegistrationDetailsPageToDocx(
-          filled.buffer,
-          "ADDITIONAL REGISTRATION FORM DETAILS",
-          registrationDetailsLines(details)
-        );
         return res.json({
           templateId: "custom-upload",
           templateName: customTemplateName || "Custom Uploaded Template",
@@ -977,7 +896,7 @@ app.post("/api/generate-document", async (req, res) => {
           mergedText: filled.text,
           unresolvedPlaceholders: filled.unresolved,
           replacedCount: filled.replaced,
-          docxBase64: filledBuffer.toString("base64"),
+          docxBase64: filled.buffer.toString("base64"),
           format: { preserved: true, source: "uploaded-template" },
         });
       } catch (e: any) {
@@ -1006,7 +925,6 @@ app.post("/api/generate-document", async (req, res) => {
     // is carried forward without changing any user-uploaded document.
     if (!custom) {
       templateText = addMissingLinkRegistrationReference(templateText, details);
-      templateText = addMissingFormDetailsSchedule(templateText, details);
     }
 
     // Merge the consolidated facts into the template.
@@ -1112,14 +1030,26 @@ app.post("/api/export-document", async (req, res) => {
       planImagePngBase64,
       planImageWidthPx,
       planImageHeightPx,
+      // Opt-in ADDITIONAL export of the plan as native, editable Word shapes
+      // (text boxes, freeform plot outline, lines, north-arrow primitives) in
+      // place of/alongside the flat picture. The image-based plan page above
+      // remains the default; this is only added when the client explicitly
+      // requests it (e.g. an "Editable Plan (Word)" export option), since Word/
+      // LibreOffice rendering of these raw DrawingML shapes has not been
+      // visually verified outside XML well-formedness checks.
+      editablePlan,
+      editablePlanOnly,
       // Uploaded Aadhaar/PAN card images, appended as ONE page after the plan.
       aadhaarImages,
     } = req.body || {};
 
     // Plan image (already rasterised on the client). Appended as the LAST page of
     // whatever docx we produce, so the download carries the deed AND its plan.
+    // Skipped entirely when the client asked for the editable-only variant.
     const planImg =
-      typeof planImagePngBase64 === "string" && planImagePngBase64.trim().length > 0
+      !editablePlanOnly &&
+      typeof planImagePngBase64 === "string" &&
+      planImagePngBase64.trim().length > 0
         ? planImagePngBase64
         : undefined;
     const planW = Number(planImageWidthPx) || undefined;
@@ -1138,6 +1068,27 @@ app.post("/api/export-document", async (req, res) => {
         });
       } catch (e: any) {
         console.warn("Failed to append plan page to docx:", e?.message || e);
+        return buf;
+      }
+    };
+
+    // Helper: splice the EDITABLE (native Word shapes) plan page in as the LAST
+    // page. Runs after withPlanPage so, if the client sends both, the editable
+    // page ends up after the image page — never replacing it unless the client
+    // set editablePlanOnly (in which case withPlanPage above was already a no-op).
+    const withEditablePlanPage = async (buf: Buffer): Promise<Buffer> => {
+      if (!editablePlan || typeof editablePlan !== "object") return buf;
+      try {
+        const promptText =
+          typeof editablePlan.customPrompt === "string" ? editablePlan.customPrompt.trim() : "";
+        const edits = editablePlan.edits ?? (promptText ? parsePlanPrompt(promptText) : null);
+        return await appendEditablePlanPageToDocx(buf, {
+          plan: editablePlan.plan ?? null,
+          details: editablePlan.details ?? details ?? null,
+          edits,
+        });
+      } catch (e: any) {
+        console.warn("Failed to append editable plan page to docx:", e?.message || e);
         return buf;
       }
     };
@@ -1163,7 +1114,7 @@ app.post("/api/export-document", async (req, res) => {
       "";
     if (preFilled) {
       const raw = preFilled.replace(/^data:[^,]+,/, "");
-      docxBuffer = await withPlanPage(Buffer.from(raw, "base64"));
+      docxBuffer = await withEditablePlanPage(await withPlanPage(Buffer.from(raw, "base64")));
     } else if (tmplDocx) {
       const { resolve } = buildAngleFieldResolver(details);
       const filled = await fillDocxTemplate(tmplDocx, resolve, {
@@ -1171,19 +1122,7 @@ app.post("/api/export-document", async (req, res) => {
         close: ">",
         preprocessXml: (xml) => expandMultiPartyParagraphs(xml, details),
       });
-      // Mirror /api/generate-document's custom-upload path: the uploaded
-      // template's author may not have a marker for every Step-1 field (e.g.
-      // Pattadar Passbook No., Passbook Khata No., NALA Order No., House Tax
-      // Receipt), so append them as a factual schedule page. Without this, any
-      // export that re-fills from the ORIGINAL template bytes (finalText edited
-      // in the preview, or generatedDocxBase64 missing) silently drops those
-      // manually-entered Step-1 values from the final downloaded document.
-      const withSchedule = await appendRegistrationDetailsPageToDocx(
-        filled.buffer,
-        "ADDITIONAL REGISTRATION FORM DETAILS",
-        registrationDetailsLines(details)
-      );
-      docxBuffer = await withPlanPage(withSchedule);
+      docxBuffer = await withEditablePlanPage(await withPlanPage(filled.buffer));
     } else {
       // ── FALLBACK PATH: rebuild from text (library templates / no upload) ──────
       let mergedText: string = typeof finalText === "string" ? finalText : "";
@@ -1203,11 +1142,13 @@ app.post("/api/export-document", async (req, res) => {
       // when WE built the text from a template. A user's hand-edited finalText is
       // left exactly as typed so their edits are never silently rewritten.
       if (builtFromTemplate) mergedText = regexCleanDraft(mergedText);
-      docxBuffer = await buildDeedDocx(mergedText, {
-        planImagePngBase64: planImg,
-        planImageWidthPx: planW,
-        planImageHeightPx: planH,
-      });
+      docxBuffer = await withEditablePlanPage(
+        await buildDeedDocx(mergedText, {
+          planImagePngBase64: planImg,
+          planImageWidthPx: planW,
+          planImageHeightPx: planH,
+        })
+      );
     }
 
     // Append the uploaded Aadhaar/PAN card images as ONE final page, AFTER the

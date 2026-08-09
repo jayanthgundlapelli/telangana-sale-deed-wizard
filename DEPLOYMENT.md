@@ -86,15 +86,15 @@ Best zero-cost path with the fewest steps. The repo already contains
 - **Ephemeral filesystem** — anything written at runtime is lost on restart. This
   app is fine with that (templates self-seed on boot; generated files stream to
   the client).
-- No server-side LibreOffice → PDF export falls back to `.docx` (see §6).
+- PDF export is generated server-side through the Docker image's LibreOffice
+  installation (see §6).
 
 **Steps:**
 
 1. Push this repo to GitHub (after completing §0).
 2. In the **Render dashboard → New → Blueprint**, connect the repo. Render reads
    `render.yaml` and provisions a free Web Service:
-   - `buildCommand: npm ci && npm run build`
-   - `startCommand: npm start`
+   - `runtime: docker` (builds the repository `Dockerfile`)
    - `healthCheckPath: /api/health`
    - region `singapore` (closest to India; change if you prefer).
 3. When prompted, set the **`GEMINI_API_KEY`** environment variable in the
@@ -230,23 +230,24 @@ are consolidating on Firebase for other reasons.
 
 ## 6. PDF export in production
 
-Server-side PDF conversion requires **LibreOffice (`soffice`)**, which is **not**
-present on Render Free or the base Node image. The app detects its absence and
-**falls back to `.docx`** — users get a perfect Word file and can "Print → Save
-as PDF" in the browser. No errors, no data loss.
+Server-side PDF conversion requires **LibreOffice (`soffice`)**. The supplied
+`Dockerfile` installs it with Liberation fonts, and the Render Blueprint builds
+that image, so PDF exports are generated on the server.
 
-To enable true server-side PDF on Cloud Run, extend the `Dockerfile` to install
-LibreOffice:
+The endpoint still returns a `.docx` with an explanatory message when it runs
+in an environment where LibreOffice is unavailable, such as a local Node process
+outside the Docker image.
+
+For a custom Cloud Run image, retain this runtime-stage Dockerfile installation:
 
 ```dockerfile
-# In the runtime stage, before switching to the non-root user:
-RUN apk add --no-cache libreoffice ttf-liberation fontconfig
+RUN apk add --no-cache libreoffice ttf-liberation fontconfig \
+  && fc-cache -f
 ```
 
-This adds ~300–400 MB to the image and needs more memory — bump Cloud Run to
-`--memory=1Gi` (or `2Gi`). It still fits comfortably in the free/low-cost tier
-for light use, but leave it off unless server PDF is a hard requirement; the
-`.docx` + browser-print path covers most needs at zero extra cost.
+This adds ~300–400 MB to the image and needs more memory, so `cloudbuild.yaml`
+sets Cloud Run to `--memory=1Gi`. For a different container host, preserve the
+same memory floor and verify a PDF export after deployment.
 
 ---
 

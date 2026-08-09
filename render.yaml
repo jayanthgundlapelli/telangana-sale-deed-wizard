@@ -7,11 +7,10 @@
 services:
   - type: web
     name: telangana-sale-deed-wizard
-    runtime: node
+    # Build the Dockerfile so LibreOffice is available for PDF exports.
+    runtime: docker
     region: singapore # closest Render region to India; also: oregon, frankfurt
     plan: free
-    buildCommand: npm ci && npm run build
-    startCommand: npm start
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:

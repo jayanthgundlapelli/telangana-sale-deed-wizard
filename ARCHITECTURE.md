@@ -20,7 +20,7 @@ A single-deployable **full-stack TypeScript app**:
      for document extraction and verification.
   3. Generates Word `.docx` deeds (`documentBuilder.ts`) and manages the deed
      template library (`templateManager.ts`), optionally converting to PDF via
-     LibreOffice if present.
+     LibreOffice in the production container.
 
 There is **no database**. State is the request payload plus a small on-disk
 template library that self-seeds on boot. The browser keeps a local registry in
@@ -34,7 +34,7 @@ Express server  ──────────────►  Google Gemini API
    ├── serves dist/ (static SPA)
    ├── /api/extract, /api/extract-aadhaar, /api/extract-link-document
    ├── /api/generate-document, /api/fill-template   (docx merge)
-   ├── /api/export-document        (docx; optional PDF via LibreOffice)
+   ├── /api/export-document        (docx or PDF via LibreOffice)
    ├── /api/verify                 (comprehensive AI audit)
    └── /api/health                 (liveness probe)
         │
@@ -53,7 +53,7 @@ Express server  ──────────────►  Google Gemini API
 | `/api/extract-link-document` | POST | Extract link-document fields |
 | `/api/generate-document` | POST | Merge reviewed data into the chosen template |
 | `/api/fill-template` | POST | AI-assisted template fill |
-| `/api/export-document` | POST | Return `.docx` (and PDF if LibreOffice present) |
+| `/api/export-document` | POST | Return `.docx` or PDF via LibreOffice |
 | `/api/verify` | POST | Cross-check documents ↔ entered data ↔ final deed |
 | `/api/parse-doc` | POST | Parse an uploaded legacy `.doc`/`.docx` |
 

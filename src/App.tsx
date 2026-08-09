@@ -247,7 +247,7 @@ function mergeAadhaar<T extends AadhaarRowData & { id: string }>(
   return { rows, index: rows.length - 1, merged: false };
 }
 
-// ---- Step 6 A4 pagination geometry ----------------------------------------
+// ---- Step 7 A4 pagination geometry ----------------------------------------
 // The on-screen preview mirrors the server .docx spec EXACTLY so what you see is
 // what prints: A4 (210×297mm), Times New Roman 14pt / 1.5 line-height, 0.75in
 // side + 1in bottom margins. PAGE 1 reserves 5.8in at the top for the pre-printed
@@ -730,7 +730,7 @@ export default function App() {
   const deedMeasureRef = useRef<HTMLDivElement | null>(null);
   const previewWrapRef = useRef<HTMLDivElement | null>(null);
   // Set true when docx-preview cannot render the filled .docx bytes; both the
-  // Auto-Fill Draft (Step 4) and Stamp Preview (Step 6) then fall back to their
+  // Auto-Fill Draft (Step 4) and Stamp Preview (Step 7) then fall back to their
   // text views. Reset to false whenever new bytes are generated. The actual
   // rendering/measuring/scaling lives in the shared <DocxLivePreview> component.
   const [docxPreviewError, setDocxPreviewError] = useState(false);
@@ -768,6 +768,12 @@ export default function App() {
   const [planError, setPlanError] = useState<string | null>(null);
   const [planMasterPrompt, setPlanMasterPrompt] = useState<string>("");
   const [planVerificationReport, setPlanVerificationReport] = useState<any | null>(null);
+  // Structured plan JSON (sketch extraction result) behind the currently-shown
+  // generatedPlanImage. Kept so the "Editable Plan (Word)" export can hand the
+  // server the SAME data the image was rendered from, rather than re-deriving
+  // it — the native-shapes docx renderer computes identical geometry from this.
+  const [extractedPlan, setExtractedPlan] = useState<any | null>(null);
+  const [exportingEditablePlan, setExportingEditablePlan] = useState(false);
   // Fullscreen expand/preview of the generated plan (with inline prompt refine).
   const [planExpanded, setPlanExpanded] = useState(false);
   // Sequence counter for /api/generate-plan calls — see handleGeneratePlan's
@@ -846,8 +852,8 @@ export default function App() {
     { number: 3, title: "Select Template", telugu: "మోడల్ సేల్ డీడ్", desc: "Choose Word deed template" },
     { number: 4, title: "Auto-Fill Draft", telugu: "డీడ్ తయారీ", desc: "Merge details into template" },
     { number: 5, title: "Re-Verify Deed", telugu: "సరిపోలిక తనిఖీ", desc: "Deep audit for errors" },
-    { number: 6, title: "Stamp Preview", telugu: "రిజిస్ట్రేషన్ ప్రివ్యూ", desc: "A4 stamp-paper preview" },
-    { number: 7, title: "Generate Plan", telugu: "ప్లాన్ జనరేషన్", desc: "Convert hand sketch to CAD AI image" },
+    { number: 6, title: "Generate Plan", telugu: "ప్లాన్ జనరేషన్", desc: "Convert hand sketch to CAD AI image" },
+    { number: 7, title: "Stamp Preview", telugu: "రిజిస్ట్రేషన్ ప్రివ్యూ", desc: "A4 stamp-paper preview" },
     { number: 8, title: "Download & Print", telugu: "డౌన్‌లోడ్ & ప్రింట్", desc: "Export Word/PDF & print" }
   ];
 
@@ -2147,13 +2153,13 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTemplateId]);
 
-  // Step 6: recompute the A4 page split whenever the deed text changes or we land
-  // on Step 6. Measured against a hidden node sized to the exact printable width so
+  // Step 7: recompute the A4 page split whenever the deed text changes or we land
+  // on Step 7. Measured against a hidden node sized to the exact printable width so
   // on-screen line wrapping matches the .docx. Deferred to rAF so the measurer has
   // laid out. When NOT actively editing, we re-flow; while editing we leave the
   // page list alone so the caret doesn't jump.
   useEffect(() => {
-    if (currentStep !== 6) return;
+    if (currentStep !== 7) return;
     if (previewEditing) return;
     let raf = 0;
     const run = () => {
@@ -2168,10 +2174,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filledDeedText, currentStep, previewEditing]);
 
-  // Step 6: scale the full-size A4 sheet down to fit the panel width (never up past
+  // Step 7: scale the full-size A4 sheet down to fit the panel width (never up past
   // 1:1), so the page is fully visible without a horizontal scrollbar on any screen.
   useEffect(() => {
-    if (currentStep !== 6) return;
+    if (currentStep !== 7) return;
     const fit = () => {
       const wrap = previewWrapRef.current;
       if (!wrap) return;
@@ -2189,7 +2195,7 @@ export default function App() {
   }, [currentStep, deedPages.length]);
 
   // Whenever a fresh filled .docx arrives from the server, clear any prior
-  // render error so the live preview is attempted again (both Step 4 and Step 6).
+  // render error so the live preview is attempted again (both Step 4 and Step 7).
   useEffect(() => {
     if (generatedDocxBase64) setDocxPreviewError(false);
   }, [generatedDocxBase64]);
@@ -2347,7 +2353,7 @@ export default function App() {
     }
   };
 
-  // Step 7: export the final deed as .docx (mandatory) or .pdf (best-effort).
+  // Step 8: export the final deed as .docx (mandatory) or .pdf (best-effort).
   // Manual text edits diverge from the server-filled .docx, so we drop those bytes:
   // the preview then re-renders from the edited text and the download rebuilds from
   // it too — keeping preview === download and honoring every edit. (When the user
@@ -2510,7 +2516,7 @@ export default function App() {
         setDegraded({
           code: "UNKNOWN",
           message:
-            "The document downloaded, but the registration plan could not be added as a page. Please re-open Step 7, regenerate the plan, then export again.",
+            "The document downloaded, but the registration plan could not be added as a page. Please re-open Step 6, regenerate the plan, then export again.",
           retryable: true,
           status: 200,
         });
@@ -2519,6 +2525,58 @@ export default function App() {
       reportFailure(err, `${format.toUpperCase()} export`, () => exportDocument(format));
     } finally {
       setExporting("");
+    }
+  };
+
+  // ADDITIONAL export option: appends the registration plan as native, editable
+  // Word shapes (text boxes for every label/dimension/party paragraph, a
+  // freeform plot outline, road-band rectangles, north-arrow primitives)
+  // instead of one flat picture — so in Word the user can click and retype a
+  // dimension, drag a boundary vertex, or delete/redraw a line. This does NOT
+  // replace the existing image-based plan page; it downloads a SEPARATE .docx
+  // so the always-reliable image export stays available regardless of how this
+  // new native-shapes rendering looks once actually opened in Word/LibreOffice
+  // (not visually verified in the dev environment — please check the result
+  // opens correctly on your own machine before relying on it).
+  const exportEditablePlanDocument = async () => {
+    if (!generatedPlanImage) {
+      setError("Generate the plan first (Step 6) before exporting an editable version.");
+      return;
+    }
+    setExportingEditablePlan(true);
+    clearAiStatus();
+    try {
+      const consolidated = buildConsolidatedDetails();
+      const aadhaarImages = aadhaarCards
+        .filter((c) => c.base64 && !c.isMock)
+        .map((c) => ({ base64: c.base64 as string, mimeType: c.mimeType || "image/jpeg", name: c.name || "aadhaar" }));
+      const res = await fetch("/api/export-document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          format: "docx",
+          filledDocxBase64: (!previewEditing && generatedDocxBase64) || undefined,
+          finalText: filledDeedText,
+          templateDocxBase64: customTemplateDocxBase64 || undefined,
+          details: consolidated,
+          aadhaarImages,
+          // Editable plan page only — the flat-image plan page is a separate,
+          // already-available export (the plain "Download Word" button).
+          editablePlanOnly: true,
+          editablePlan: {
+            plan: extractedPlan,
+            details: consolidated,
+            customPrompt: planCustomPrompt,
+          },
+        }),
+      });
+      if (!res.ok) await failOn(res, "Editable plan export");
+      const data = await res.json();
+      downloadBase64(data.fileBase64, data.mimeType, buildDeedFileName("docx").replace(/\.docx$/i, " - Editable Plan.docx"));
+    } catch (err: any) {
+      reportFailure(err, "Editable plan export", exportEditablePlanDocument);
+    } finally {
+      setExportingEditablePlan(false);
     }
   };
 
@@ -2758,6 +2816,10 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       if (data.verificationReport) {
         setPlanVerificationReport(data.verificationReport);
       }
+      // May legitimately be null (no AI key / sketch read failed) — the editable
+      // export still works in that case, falling back to form-boundary data only,
+      // same as the image renderer does.
+      setExtractedPlan(data.extractedPlan ?? null);
       // The plan image is always rendered from the user's own form data, so a
       // failed AI leg degrades rather than blocks. But it must be VISIBLE: this
       // used to go to console.warn only, so the user saw a plan with no hint
@@ -2797,6 +2859,7 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       setSketchImage(result);
       setGeneratedPlanImage(null);
       setPlanVerificationReport(null);
+      setExtractedPlan(null);
       // Auto-trigger plan generation upon upload
       handleGeneratePlan(planCustomPrompt, result);
     };
@@ -3461,7 +3524,7 @@ const getTeluguRecommendation = (rec: string) => {
               {/* STEP HEADER */}
               <div className="border-b border-slate-100 pb-4 mb-6">
                 <span className="text-[10px] font-bold uppercase tracking-widest text-[#0a4d4a] bg-[#eef6f5] px-2.5 py-1 rounded-md border border-[#c3dedb]">
-                  Step {currentStep} of 7: {workflowSteps[currentStep - 1].telugu}
+                  Step {currentStep} of {workflowSteps.length}: {workflowSteps[currentStep - 1].telugu}
                 </span>
                 <h2 className="text-xl font-bold text-slate-900 mt-2 flex items-center gap-2">
                   {currentStep === 1 && "Property Registration Details Form"}
@@ -3469,8 +3532,9 @@ const getTeluguRecommendation = (rec: string) => {
                   {currentStep === 3 && "Select Word Deed Template"}
                   {currentStep === 4 && "Auto-Fill Details into Selected Template"}
                   {currentStep === 5 && "Re-Verify Draft & Cross-Check Uploads"}
-                  {currentStep === 6 && "A4 Stamp Paper Print Preview"}
-                  {currentStep === 7 && "Download & Print Final Deed"}
+                  {currentStep === 6 && "Convert Hand Sketch to CAD-Style Plan"}
+                  {currentStep === 7 && "A4 Stamp Paper Print Preview"}
+                  {currentStep === 8 && "Download & Print Final Deed"}
                 </h2>
                 <p className="text-xs text-slate-500 mt-1">
                   {currentStep === 1 && "Bilingual official details such as Pattadar Passbook, NALA Conversion, Layout approval details, bounds, seller/buyer names, and all supporting Aadhaar & Link document uploads."}
@@ -3478,8 +3542,9 @@ const getTeluguRecommendation = (rec: string) => {
                   {currentStep === 3 && "Select a pre-certified Word (.docx) deed template matching your registration type from the Telangana stamps template library."}
                   {currentStep === 4 && "The system merges all reviewed details into the selected Word template and formats it to the official Telangana stamp-paper layout."}
                   {currentStep === 5 && "Comprehensive AI audit: cross-checks the final deed against uploads and entered data, and confirms no residual content from other documents leaked in."}
-                  {currentStep === 6 && "Preview the finalized sale deed exactly as it will print — A4, Times New Roman 14, with the stamp/header space reserved on page one."}
-                  {currentStep === 7 && "Download the deed as an editable Microsoft Word (.docx) or PDF, or print it directly from this page."}
+                  {currentStep === 6 && "Upload or draw the hand sketch of the plot and let AI convert it into a clean, CAD-style boundary plan with dimensions."}
+                  {currentStep === 7 && "Preview the finalized sale deed exactly as it will print — A4, Times New Roman 14, with the stamp/header space reserved on page one."}
+                  {currentStep === 8 && "Download the deed as an editable Microsoft Word (.docx) or PDF, or print it directly from this page."}
                 </p>
               </div>
 
@@ -5946,7 +6011,7 @@ const getTeluguRecommendation = (rec: string) => {
 
                           {/* Full document content. When a filled .docx is available (and not
                               editing), show the REAL Word document via the SAME shared preview
-                              component used by Step 6 (Stamp Preview) — real tables, centered/bold
+                              component used by Step 7 (Stamp Preview) — real tables, centered/bold
                               headings, correct fonts and true page breaks, i.e. exactly what
                               downloads. Editing (or a render failure) falls back to the A4-styled
                               editable text. */}
@@ -6081,7 +6146,7 @@ const getTeluguRecommendation = (rec: string) => {
                               <RefreshCw className="w-4 h-4" /> Re-run Verification
                             </button>
                             <button onClick={() => setCurrentStep(6)} className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-xs font-bold py-2.5 px-6 rounded-lg flex items-center gap-1.5">
-                              Proceed to Stamp Preview <ArrowRight className="w-4 h-4" />
+                              Proceed to Generate Plan <ArrowRight className="w-4 h-4" />
                             </button>
                           </div>
                         </div>
@@ -6103,8 +6168,8 @@ const getTeluguRecommendation = (rec: string) => {
                     </div>
                   )}
 
-                  {/* STEP 6: A4 Stamp-Paper Print Preview — paginated, Word-style (matches server .docx) */}
-                  {currentStep === 6 && (() => {
+                  {/* STEP 7: A4 Stamp-Paper Print Preview — paginated, Word-style (matches server .docx) */}
+                  {currentStep === 7 && (() => {
                     const pageCount = Math.max(1, deedPages.length);
                     const safeIdx = Math.min(currentPageIdx, pageCount - 1);
                     const isFirst = safeIdx === 0;
@@ -6301,8 +6366,8 @@ const getTeluguRecommendation = (rec: string) => {
                     );
                   })()}
 
-                  {/* STEP 7: Generate Property Plan (Hand-Drawn Sketch -> CAD AI Image) */}
-                  {currentStep === 7 && (
+                  {/* STEP 6: Generate Property Plan (Hand-Drawn Sketch -> CAD AI Image) */}
+                  {currentStep === 6 && (
                     <div className="space-y-6">
                       {/* Top Header Card */}
                       <div className="p-4 bg-[#eef6f5] border border-[#c3dedb] rounded-xl flex items-start justify-between gap-4 flex-wrap">
@@ -6430,6 +6495,7 @@ const getTeluguRecommendation = (rec: string) => {
                                     setSketchImage(null);
                                     setGeneratedPlanImage(null);
                                     setPlanVerificationReport(null);
+                                    setExtractedPlan(null);
                                   }}
                                   className="text-[11px] font-bold text-red-600 hover:underline cursor-pointer"
                                 >
@@ -6459,6 +6525,19 @@ const getTeluguRecommendation = (rec: string) => {
                                   className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer"
                                 >
                                   <Download className="w-3 h-3" /> Download JPG
+                                </button>
+                                <button
+                                  onClick={exportEditablePlanDocument}
+                                  disabled={exportingEditablePlan}
+                                  title="Downloads a SEPARATE .docx where every plan element (text, dimensions, boundary lines, north arrow) is a native, editable Word shape instead of one flat picture. Not yet verified visually in Word/LibreOffice — please check it opens correctly on your machine."
+                                  className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+                                >
+                                  {exportingEditablePlan ? (
+                                    <RefreshCw className="w-3 h-3 animate-spin" />
+                                  ) : (
+                                    <FileText className="w-3 h-3" />
+                                  )}
+                                  Editable Plan (Word)
                                 </button>
                               </div>
                             )}
@@ -6623,6 +6702,19 @@ const getTeluguRecommendation = (rec: string) => {
                                   <Download className="w-3.5 h-3.5" /> Download JPG
                                 </button>
                                 <button
+                                  onClick={exportEditablePlanDocument}
+                                  disabled={exportingEditablePlan}
+                                  title="Downloads a SEPARATE .docx where every plan element (text, dimensions, boundary lines, north arrow) is a native, editable Word shape instead of one flat picture. Not yet verified visually in Word/LibreOffice — please check it opens correctly on your machine."
+                                  className="text-[11px] font-extrabold text-[#0a4d4a] bg-white hover:bg-[#c3dedb] px-3 py-1.5 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+                                >
+                                  {exportingEditablePlan ? (
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <FileText className="w-3.5 h-3.5" />
+                                  )}
+                                  Editable Plan (Word)
+                                </button>
+                                <button
                                   onClick={() => setPlanExpanded(false)}
                                   className="text-slate-500 hover:text-slate-900 p-1.5 rounded hover:bg-white cursor-pointer"
                                   title="Close"
@@ -6757,7 +6849,7 @@ const getTeluguRecommendation = (rec: string) => {
                       if (report) setCurrentStep(6);
                       else triggerDeedVerificationAudit();
                     } else if (currentStep === 6) {
-                      setCurrentStep(7); // proceed to Generate Plan
+                      setCurrentStep(7); // proceed to Stamp Preview
                     } else if (currentStep === 7) {
                       setCurrentStep(8); // proceed to Download & Print
                     }
@@ -6768,8 +6860,8 @@ const getTeluguRecommendation = (rec: string) => {
                   {currentStep === 2 && "Proceed to Select Template"}
                   {currentStep === 3 && (selectedTemplateId ? "Proceed to Auto-Fill" : "Select a template first")}
                   {currentStep === 4 && (filling ? "Generating…" : filledDeedText ? "Proceed to Re-Verify" : "Generate & Fill Document")}
-                  {currentStep === 5 && (auditing ? "Auditing…" : report ? "Proceed to Stamp Preview" : "Run Verification Audit")}
-                  {currentStep === 6 && "Proceed to Generate Plan"}
+                  {currentStep === 5 && (auditing ? "Auditing…" : report ? "Proceed to Generate Plan" : "Run Verification Audit")}
+                  {currentStep === 6 && "Proceed to Stamp Preview"}
                   {currentStep === 7 && "Proceed to Download & Print"}
                   {" "}<ChevronRight className="w-4 h-4" />
                 </button>

@@ -24,6 +24,11 @@ FROM node:20-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 
+# The export endpoint invokes soffice for server-side DOCX-to-PDF conversion.
+# Liberation fonts keep common Word layouts stable in headless LibreOffice.
+RUN apk add --no-cache libreoffice ttf-liberation fontconfig \
+  && fc-cache -f
+
 # Only production dependencies are needed at runtime — the server bundle keeps
 # npm packages external (see the esbuild --packages=external flag).
 COPY package*.json ./

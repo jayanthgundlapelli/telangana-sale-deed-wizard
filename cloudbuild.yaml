@@ -37,7 +37,8 @@ steps:
       - --platform=managed
       - --allow-unauthenticated
       - --port=3000
-      - --memory=512Mi
+      # LibreOffice runs in the application container for PDF exports.
+      - --memory=1Gi
       - --cpu=1
       - --min-instances=0
       - --max-instances=3
