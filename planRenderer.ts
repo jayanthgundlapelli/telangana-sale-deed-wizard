@@ -335,7 +335,7 @@ export function partyRoleLabels(nature?: string): { first: string; second: strin
 }
 
 // Build a party paragraph line from a form person object.
-function personLine(p: any): string {
+export function personLine(p: any): string {
   if (!p) return "";
   const bits: string[] = [];
   const nameRel = [p.name, p.relation].filter(Boolean).join(" ");
@@ -351,7 +351,7 @@ function personLine(p: any): string {
 //   "THE <TYPE>, ADMEASURING A TOTAL AREA OF <sqYds> SQUARE YARDS EQUIVALENT TO
 //    <sqMtrs> SQUARE METERS, IN SURVEY NO.<survey>, SITUATED AT NEAR H.NO.<hNo>
 //    OF '<locality>' LOCALITY OF <village>, <mandal>"
-function buildPlanDescription(plan: any, prop: any): string {
+export function buildPlanDescription(plan: any, prop: any): string {
   const structureType = (plan?.structureType || prop?.propertyType || "PROPERTY").toString().toUpperCase();
   const tbl = plan?.table || {};
   const stripUnit = (v: any) => String(v ?? "").replace(/\s*sq\.?\s*(yds?|yards?|mtrs?|meters?|metres?)\.?\s*$/i, "").trim();
@@ -398,7 +398,7 @@ export function parseFeet(s: any): number | null {
 }
 
 // Normalise a compass word/letter to a single cardinal N/S/E/W ("" if unknown).
-function normDir(s: any): "N" | "S" | "E" | "W" | "" {
+export function normDir(s: any): "N" | "S" | "E" | "W" | "" {
   const t = String(s || "").trim().toUpperCase();
   if (!t) return "";
   if (t.startsWith("NORTH") || t === "N") return "N";
@@ -408,14 +408,14 @@ function normDir(s: any): "N" | "S" | "E" | "W" | "" {
   return "";
 }
 
-interface SideInfo {
+export interface SideInfo {
   lengthFeet: number;
   label: string;
   neighbour: string;
   fromForm?: boolean; // neighbour text came from the FORM boundaries, not the sketch
 }
-type ByDir = { N?: SideInfo; S?: SideInfo; E?: SideInfo; W?: SideInfo };
-interface Pt {
+export type ByDir = { N?: SideInfo; S?: SideInfo; E?: SideInfo; W?: SideInfo };
+export interface Pt {
   x: number; // East (+right)
   y: number; // North (+up)
 }
@@ -432,7 +432,7 @@ interface Pt {
 //                                         parallel edges, with height = avg of the
 //                                         two vertical sides.
 // Corners returned clockwise from top-left: TL, TR, BR, BL (north edge on top).
-function reconstructRectilinear(byDir: ByDir): { corners: Pt[] } | null {
+export function reconstructRectilinear(byDir: ByDir): { corners: Pt[] } | null {
   const N = byDir.N?.lengthFeet;
   const S = byDir.S?.lengthFeet;
   const E = byDir.E?.lengthFeet;
@@ -457,7 +457,7 @@ function reconstructRectilinear(byDir: ByDir): { corners: Pt[] } | null {
 // when the sketch actually carries bearings. Bearing is azimuth clockwise from
 // North; a leg advances the pen by (ΔE, ΔN) = (L·sin θ, L·cos θ). Returns the
 // vertices (feet, x=East, y=North-up) or null if fewer than 3 valid legs.
-function closeTraverse(legs: { lengthFeet: number; bearingDeg: number }[]): Pt[] | null {
+export function closeTraverse(legs: { lengthFeet: number; bearingDeg: number }[]): Pt[] | null {
   const good = legs.filter((l) => l && l.lengthFeet > 0 && isFinite(l.bearingDeg));
   if (good.length < 3) return null;
   const pts: Pt[] = [{ x: 0, y: 0 }];
@@ -505,7 +505,7 @@ function digitSwapCandidates(n: number): number[] {
 // numeral, so this gives a deterministic way to catch (and fix) that specific,
 // reproducible error class without depending on the vision model self-correcting
 // via prompt instructions alone (confirmed those instructions alone do not work).
-function reconcileSidesWithPrintedArea(byDir: ByDir, table: any): void {
+export function reconcileSidesWithPrintedArea(byDir: ByDir, table: any): void {
   const tbl = table || {};
   const areaYdsStr = String(tbl.totalAreaSqYds || "").replace(/[^\d.]/g, "");
   const areaMtrsStr = String(tbl.totalAreaSqMtrs || "").replace(/[^\d.]/g, "");
@@ -590,7 +590,7 @@ function reconcileSidesWithPrintedArea(byDir: ByDir, table: any): void {
   }
 }
 
-interface RoadEdit {
+export interface RoadEdit {
   label: string;
   widthFeet: number;
 }

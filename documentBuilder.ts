@@ -438,6 +438,27 @@ function usablePageEmu(documentXml: string): { availW: number; availH: number } 
   };
 }
 
+// JSZip's `zip.file(path, data)` defaults to `createFolders: true`, which
+// silently inserts a zero-byte directory entry (e.g. "word/") for every parent
+// path segment that doesn't already have one explicitly in the archive. Real
+// Word/LibreOffice-authored .docx zips NEVER contain directory entries — only
+// flat file parts — and Word's OPC parser can reject a package that does,
+// surfacing as "problems with the contents" even though the XML inside is
+// perfectly well-formed. Every helper in this module re-saves an uploaded/
+// generated .docx via zip.file(...), so call this immediately before
+// generateAsync() to strip any directory entries JSZip introduced.
+function stripZipDirectoryEntries(zip: import("jszip")): void {
+  // NOTE: zip.remove(path) is NOT safe here — for a path ending in "/" it
+  // treats it as a folder and recursively deletes every file whose name
+  // starts with that prefix (e.g. remove("word/") would also delete
+  // "word/document.xml"). Delete straight from the internal files map instead,
+  // which only removes the exact zero-byte directory-entry keys.
+  const files = (zip as any).files as Record<string, { dir?: boolean }>;
+  for (const relPath of Object.keys(files)) {
+    if (relPath.endsWith("/") && files[relPath]?.dir) delete files[relPath];
+  }
+}
+
 export async function appendPlanPageToDocx(
   docxBuffer: Buffer,
   opts: AppendPlanOptions
@@ -532,6 +553,86 @@ export async function appendPlanPageToDocx(
   }
   xml = xml.slice(0, insertAt) + planXml + xml.slice(insertAt);
   zip.file("word/document.xml", xml);
+  stripZipDirectoryEntries(zip);
+
+  return zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+}
+
+export interface AppendEditablePlanOptions {
+  /** Structured plan data as returned by the plan-generation endpoint. */
+  plan?: any | null;
+  /** Same "details" shape used to render the image version (property/executants/claimants). */
+  details?: any | null;
+  /** Same free-text-prompt-derived edits object used by the image version, so the
+   *  editable export mirrors whatever the user already asked for. */
+  edits?: any | null;
+}
+
+// Editable counterpart to appendPlanPageToDocx: instead of rasterising the plan
+// to one flat picture, this emits native Word DrawingML shapes (text boxes for
+// every label, a freeform polygon for the plot outline, rectangles for road
+// bands/structures, primitives for the north arrow) so the resulting page can be
+// edited directly in Word — retype a dimension, drag a boundary vertex, delete a
+// line. This is an ADDITIONAL export path; appendPlanPageToDocx (the image
+// version) is left untouched and remains the default/fallback, since Word/
+// LibreOffice rendering of the shapes below has not been visually verified in
+// this environment (no LibreOffice/Word available here) — only XML well-
+// formedness and coordinate math have been checked.
+export async function appendEditablePlanPageToDocx(
+  docxBuffer: Buffer,
+  opts: AppendEditablePlanOptions
+): Promise<Buffer> {
+  const { buildEditablePlanDrawingXml } = await import("./planDocxRenderer");
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(docxBuffer);
+
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) throw new Error("Not a valid .docx (missing word/document.xml).");
+  let xml = await docFile.async("string");
+
+  const { availW, availH } = usablePageEmu(xml);
+
+  const drawingXml = buildEditablePlanDrawingXml({
+    plan: opts.plan,
+    details: opts.details,
+    edits: opts.edits,
+    availWEmu: availW,
+    availHEmu: availH,
+  });
+  if (!drawingXml) return docxBuffer; // nothing to add
+
+  // Ensure the namespaces our shapes rely on exist on <w:document>. (wps: is
+  // declared locally on each <wps:wsp> tag, so it doesn't need to be here.)
+  xml = xml.replace(/<w:document\b([^>]*)>/, (_m, attrs) => {
+    let a = attrs as string;
+    if (!/xmlns:r=/.test(a)) a += ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    if (!/xmlns:wp=/.test(a)) a += ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"';
+    return `<w:document${a}>`;
+  });
+
+  // Page-break, then ONE paragraph holding every anchored shape (their absolute
+  // page-relative positioning means paragraph placement itself doesn't matter,
+  // only that it lands on its own page after the break).
+  const planXml =
+    `<w:p><w:r><w:br w:type="page"/></w:r></w:p>` +
+    `<w:p>${drawingXml}</w:p>`;
+
+  const bodyClose = xml.lastIndexOf("</w:body>");
+  const lastSect = xml.lastIndexOf("<w:sectPr");
+  const lastParaClose = xml.lastIndexOf("</w:p>");
+  let insertAt: number;
+  if (lastSect !== -1 && lastSect < bodyClose && lastSect > lastParaClose) {
+    insertAt = lastSect;
+  } else {
+    insertAt = bodyClose === -1 ? xml.length : bodyClose;
+  }
+  xml = xml.slice(0, insertAt) + planXml + xml.slice(insertAt);
+  zip.file("word/document.xml", xml);
+  stripZipDirectoryEntries(zip);
 
   return zip.generateAsync({
     type: "nodebuffer",
@@ -667,57 +768,7 @@ export async function appendImagesPageToDocx(
   }
   xml = xml.slice(0, insertAt) + body + xml.slice(insertAt);
   zip.file("word/document.xml", xml);
-
-  return zip.generateAsync({
-    type: "nodebuffer",
-    compression: "DEFLATE",
-    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  });
-}
-
-/**
- * Append plain registration details to an existing .docx without rebuilding its
- * original pages. This is used after in-place filling an uploaded template: its
- * author may not have markers for every Step-1 field, but supplied facts must
- * still be available in the final deed for review and registration.
- */
-export async function appendRegistrationDetailsPageToDocx(
-  docxBuffer: Buffer,
-  title: string,
-  lines: string[]
-): Promise<Buffer> {
-  const nonEmptyLines = lines.map((line) => String(line || "").trim()).filter(Boolean);
-  if (nonEmptyLines.length === 0) return docxBuffer;
-
-  const escapeXml = (value: string) =>
-    stripInvalidXmlChars(value)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  const JSZip = (await import("jszip")).default;
-  const zip = await JSZip.loadAsync(docxBuffer);
-  const docFile = zip.file("word/document.xml");
-  if (!docFile) throw new Error("Not a valid .docx (missing word/document.xml).");
-  let xml = await docFile.async("string");
-
-  const body = [
-    '<w:p><w:r><w:br w:type="page"/></w:r></w:p>',
-    `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr><w:t>${escapeXml(title)}</w:t></w:r></w:p>`,
-    ...nonEmptyLines.map(
-      (line) => `<w:p><w:pPr><w:spacing w:after="100"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r></w:p>`
-    ),
-  ].join("");
-
-  const bodyClose = xml.lastIndexOf("</w:body>");
-  const lastSect = xml.lastIndexOf("<w:sectPr");
-  const lastParaClose = xml.lastIndexOf("</w:p>");
-  const insertAt = lastSect !== -1 && lastSect < bodyClose && lastSect > lastParaClose
-    ? lastSect
-    : bodyClose === -1
-    ? xml.length
-    : bodyClose;
-  xml = xml.slice(0, insertAt) + body + xml.slice(insertAt);
-  zip.file("word/document.xml", xml);
+  stripZipDirectoryEntries(zip);
 
   return zip.generateAsync({
     type: "nodebuffer",

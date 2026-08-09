@@ -1042,6 +1042,21 @@ export async function fillDocxTemplate(
   const result = fillDocumentXml(xml, resolve, opts.open ?? "<", opts.close ?? ">");
 
   zip.file("word/document.xml", result.xml);
+  // JSZip's zip.file(path, data) defaults to createFolders: true, which silently
+  // inserts a zero-byte "word/" directory entry into the output archive. Real
+  // Word/LibreOffice-authored .docx zips never contain directory entries — only
+  // flat file parts — and Word's OPC parser can reject a package that does,
+  // surfacing as "problems with the contents" even though the XML itself is
+  // perfectly well-formed. Strip any such entries before repackaging.
+  // NOTE: zip.remove(path) is NOT safe here — for a path ending in "/" it
+  // treats it as a folder and recursively deletes every file under that
+  // prefix (e.g. remove("word/") would also delete "word/document.xml").
+  // Delete straight from the internal files map, which only removes the
+  // exact zero-byte directory-entry keys.
+  const zipFiles = (zip as any).files as Record<string, { dir?: boolean }>;
+  for (const relPath of Object.keys(zipFiles)) {
+    if (relPath.endsWith("/") && zipFiles[relPath]?.dir) delete zipFiles[relPath];
+  }
   const outBuf = await zip.generateAsync({
     type: "nodebuffer",
     compression: "DEFLATE",

@@ -6,7 +6,7 @@ data from uploaded documents (Aadhaar cards, link/ownership deeds, supporting
 docs), merges the reviewed data into a Word template **in place** (preserving the
 template's own formatting), verifies the result, generates a to-scale
 **registration plan** from a hand-drawn sketch, and produces a print-ready,
-stamp-formatted `.docx` (and PDF where a converter is available) with the plan
+stamp-formatted `.docx` and PDF with the plan
 appended as the final page.
 
 > **Full-stack TypeScript app:** a React 19 + Vite 6 SPA served by a single Express
