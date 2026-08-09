@@ -6,7 +6,7 @@ import { execFile } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
-import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx } from "./documentBuilder";
+import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendImagesPageToDocx, appendRegistrationDetailsPageToDocx, buildVerificationReportDocx } from "./documentBuilder";
 import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs, upperRelPrefix } from "./templateFiller";
 import {
   renderPlanDataUrl,
@@ -1245,6 +1245,32 @@ app.post("/api/export-document", async (req, res) => {
   } catch (err: any) {
     console.error("Document export failed:", err);
     res.status(500).json({ error: "Failed to export document.", detail: String(err?.message || err) });
+  }
+});
+
+// VERIFY FLOW — export the discrepancy report as a Word (.docx) 5-column table.
+// Self-contained and used only by the verify flow; it takes the discrepancies the
+// client already has (from /api/verify) and renders them — no AI call, no shared
+// state with the deed-generation export path.
+app.post("/api/export-verification-report", async (req, res) => {
+  try {
+    const { discrepancies, documentName, registrationDate, statusMessage } = req.body || {};
+    if (!Array.isArray(discrepancies)) {
+      return res.status(400).json({ error: "discrepancies (array) is required." });
+    }
+    const buffer = await buildVerificationReportDocx(discrepancies, {
+      documentName,
+      registrationDate,
+      statusMessage,
+    });
+    return res.json({
+      format: "docx",
+      fileBase64: buffer.toString("base64"),
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+  } catch (err: any) {
+    console.error("Verification report export failed:", err);
+    return res.status(500).json({ error: "Failed to export verification report.", detail: String(err?.message || err) });
   }
 });
 
