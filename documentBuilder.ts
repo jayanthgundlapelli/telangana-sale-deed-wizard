@@ -23,6 +23,12 @@ import {
   AlignmentType,
   convertInchesToTwip,
   convertMillimetersToTwip,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  BorderStyle,
+  ShadingType,
 } from "docx";
 import { stripInvalidXmlChars } from "./templateFiller";
 import { promises as fsp } from "fs";
@@ -769,6 +775,255 @@ export async function appendImagesPageToDocx(
     compression: "DEFLATE",
     mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   });
+}
+
+// -----------------------------------------------------------------------------
+// VERIFY FLOW — build the discrepancy report as a Word (.docx) with a 5-column
+// table (Category · Issue · In Document · Should Be · Severity). Each header and
+// each cell is bilingual (English + Telugu) to mirror the on-screen table. This
+// is a self-contained builder used only by the verify flow's report download; it
+// does NOT touch the deed-generation builders above.
+// -----------------------------------------------------------------------------
+export interface ReportDiscrepancy {
+  category?: string;
+  categoryTe?: string;
+  description?: string;
+  descriptionTe?: string;
+  found?: string;
+  expected?: string;
+  severity?: string;
+}
+export interface VerificationReportMeta {
+  documentName?: string;
+  registrationDate?: string;
+  statusMessage?: string;
+}
+
+const REPORT_FONT = "Nirmala UI"; // ships with Windows; renders Latin + Telugu.
+const HEADER_FILL = "0A4D4A";
+const CRITICAL_FILL = "FDECEC";
+const WARNING_FILL = "FFF6E5";
+
+// The discrepancy text is AI-generated and may contain characters that are
+// ILLEGAL in XML 1.0 (control chars 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, and lone
+// surrogates). The docx library escapes &/<>/ but does NOT strip these, so they
+// end up in word/document.xml verbatim and Word refuses to open the file
+// ("Unspecified error ... Location: Part: /word/document.xml"). Strip them, and
+// collapse newlines/tabs to spaces since a single TextRun cannot represent them.
+function sanitizeReportText(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    .replace(/[\t\r\n]+/g, " ") // collapse whitespace a single TextRun cannot hold
+    // XML 1.0 illegal control chars: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F plus 0xFFFE/0xFFFF
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "") // lone high surrogate
+    .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "$1") // lone low surrogate
+    .trim();
+}
+
+function reportCell(
+  lines: { text: string; bold?: boolean; color?: string; size?: number }[],
+  opts: { width: number; fill?: string; align?: (typeof AlignmentType)[keyof typeof AlignmentType] } = { width: 20 }
+): TableCell {
+  return new TableCell({
+    width: { size: opts.width, type: WidthType.PERCENTAGE },
+    shading: opts.fill ? { type: ShadingType.CLEAR, color: "auto", fill: opts.fill } : undefined,
+    margins: { top: 60, bottom: 60, left: 90, right: 90 },
+    children: lines.map(
+      (ln) =>
+        new Paragraph({
+          alignment: opts.align ?? AlignmentType.LEFT,
+          spacing: { after: 20, line: 264 },
+          children: [
+            new TextRun({
+              text: sanitizeReportText(ln.text) || "—",
+              bold: ln.bold,
+              color: ln.color,
+              size: ln.size ?? 18, // half-points → 9pt
+              font: REPORT_FONT,
+            }),
+          ],
+        })
+    ),
+  });
+}
+
+export async function buildVerificationReportDocx(
+  discrepancies: ReportDiscrepancy[],
+  meta: VerificationReportMeta = {}
+): Promise<Buffer> {
+  const COLS = [26, 30, 18, 18, 8]; // Category, Issue, In Document, Should Be, Severity
+  const headerLabels = [
+    ["Category", "వర్గం"],
+    ["Issue", "సమస్య"],
+    ["In Document", "పత్రంలో ఉన్నది"],
+    ["Should Be", "ఉండవలసినది"],
+    ["Severity", "తీవ్రత"],
+  ];
+
+  const headerRow = new TableRow({
+    tableHeader: true,
+    children: headerLabels.map((lbl, i) =>
+      reportCell(
+        [
+          { text: lbl[0], bold: true, color: "FFFFFF", size: 19 },
+          { text: lbl[1], bold: true, color: "D7EDEA", size: 17 },
+        ],
+        { width: COLS[i], fill: HEADER_FILL }
+      )
+    ),
+  });
+
+  const bodyRows = (discrepancies || []).map((d) => {
+    const isCritical = String(d.severity || "").toUpperCase() === "CRITICAL";
+    const fill = isCritical ? CRITICAL_FILL : WARNING_FILL;
+    const sevColor = isCritical ? "B00020" : "8A5A00";
+    const sevTe = isCritical ? "తీవ్రమైనది" : "హెచ్చరిక";
+    return new TableRow({
+      children: [
+        reportCell(
+          [
+            { text: d.category || "", bold: true },
+            ...(d.categoryTe ? [{ text: d.categoryTe, color: "0A4D4A", size: 16 }] : []),
+          ],
+          { width: COLS[0], fill }
+        ),
+        reportCell(
+          [
+            { text: d.description || "" },
+            ...(d.descriptionTe ? [{ text: d.descriptionTe, color: "0A4D4A", size: 16 }] : []),
+          ],
+          { width: COLS[1], fill }
+        ),
+        reportCell([{ text: d.found || "", color: "B00020", bold: true }], { width: COLS[2], fill }),
+        reportCell([{ text: d.expected || "", color: "0A6B33", bold: true }], { width: COLS[3], fill }),
+        reportCell(
+          [
+            { text: (d.severity || "").toUpperCase(), bold: true, color: sevColor, size: 16 },
+            { text: sevTe, color: sevColor, size: 15 },
+          ],
+          { width: COLS[4], fill, align: AlignmentType.CENTER }
+        ),
+      ],
+    });
+  });
+
+  const table = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    borders: {
+      top: { style: BorderStyle.SINGLE, size: 4, color: "C9D6D4" },
+      bottom: { style: BorderStyle.SINGLE, size: 4, color: "C9D6D4" },
+      left: { style: BorderStyle.SINGLE, size: 4, color: "C9D6D4" },
+      right: { style: BorderStyle.SINGLE, size: 4, color: "C9D6D4" },
+      insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: "C9D6D4" },
+      insideVertical: { style: BorderStyle.SINGLE, size: 4, color: "C9D6D4" },
+    },
+    rows: [headerRow, ...bodyRows],
+  });
+
+  const titleBlock: Paragraph[] = [
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 40 },
+      children: [new TextRun({ text: "DEED VERIFICATION REPORT", bold: true, size: 30, font: REPORT_FONT })],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 200 },
+      children: [
+        new TextRun({ text: "దస్తావేజు పరిశీలన నివేదిక", bold: true, size: 22, color: "0A4D4A", font: REPORT_FONT }),
+      ],
+    }),
+  ];
+
+  const metaLines: Paragraph[] = [];
+  if (meta.documentName)
+    metaLines.push(
+      new Paragraph({
+        spacing: { after: 40 },
+        children: [
+          new TextRun({ text: "Document / పత్రం: ", bold: true, size: 18, font: REPORT_FONT }),
+          new TextRun({ text: sanitizeReportText(meta.documentName), size: 18, font: REPORT_FONT }),
+        ],
+      })
+    );
+  if (meta.registrationDate)
+    metaLines.push(
+      new Paragraph({
+        spacing: { after: 40 },
+        children: [
+          new TextRun({ text: "Registration Date / తేదీ: ", bold: true, size: 18, font: REPORT_FONT }),
+          new TextRun({ text: sanitizeReportText(meta.registrationDate), size: 18, font: REPORT_FONT }),
+        ],
+      })
+    );
+  metaLines.push(
+    new Paragraph({
+      spacing: { after: 200 },
+      children: [
+        new TextRun({ text: "Discrepancies found / గుర్తించిన తేడాలు: ", bold: true, size: 18, font: REPORT_FONT }),
+        new TextRun({ text: String((discrepancies || []).length), bold: true, size: 18, color: "B00020", font: REPORT_FONT }),
+      ],
+    })
+  );
+
+  const cleanBlock: Paragraph[] =
+    (discrepancies || []).length === 0
+      ? [
+          new Paragraph({
+            spacing: { before: 200 },
+            children: [
+              new TextRun({
+                text: "No discrepancies detected — the document matches the entered details and uploaded documents.",
+                bold: true,
+                color: "0A6B33",
+                size: 20,
+                font: REPORT_FONT,
+              }),
+            ],
+          }),
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: "ఎటువంటి తేడాలు కనుగొనబడలేదు — పత్రం నమోదు వివరాలతో మరియు అప్‌లోడ్ చేసిన పత్రాలతో సరిపోలింది.",
+                color: "0A6B33",
+                size: 18,
+                font: REPORT_FONT,
+              }),
+            ],
+          }),
+        ]
+      : [];
+
+  const doc = new Document({
+    creator: "Telangana Sale Deed Wizard",
+    title: "Deed Verification Report",
+    styles: { default: { document: { run: { font: REPORT_FONT, size: 18 } } } },
+    sections: [
+      {
+        properties: {
+          page: {
+            size: { width: convertMillimetersToTwip(210), height: convertMillimetersToTwip(297) },
+            margin: {
+              top: convertInchesToTwip(0.8),
+              right: convertInchesToTwip(0.6),
+              bottom: convertInchesToTwip(0.8),
+              left: convertInchesToTwip(0.6),
+            },
+          },
+        },
+        children: [
+          ...titleBlock,
+          ...metaLines,
+          ...((discrepancies || []).length > 0 ? [table] : []),
+          ...cleanBlock,
+        ],
+      },
+    ],
+  });
+
+  return Packer.toBuffer(doc);
 }
 
 // Deterministic placeholder merge — exact, no paraphrasing, no hallucination.

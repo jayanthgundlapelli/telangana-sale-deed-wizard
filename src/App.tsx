@@ -34,7 +34,9 @@ import {
   Database,
   Coins,
   Maximize2,
-  X
+  X,
+  FileUp,
+  ShieldCheck
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { PRESETS, MODEL_TEMPLATES, Preset, MockFile, ModelTemplate } from "./presets";
@@ -320,7 +322,16 @@ function paginateDeedText(text: string, measurer: HTMLElement): string[] {
 }
 
 export default function App() {
-  // 10-Step Wizard State (1 to 10)
+  // Which workflow the user is running. Two entirely separate flows that must NOT
+  // be mixed:
+  //   "generate" — the original 8-step Deed Document & Plan Generation flow.
+  //   "verify"   — a 3-step flow that checks an already-generated deed document
+  //                against the Step-1 registration details + uploaded Aadhaar/link
+  //                documents. Reuses Step 1's form and the generate flow's
+  //                verification logic verbatim; only the step COUNT and the middle
+  //                step (upload the finished document) differ.
+  const [flowMode, setFlowMode] = useState<"generate" | "verify">("generate");
+  // 8-Step (generate) / 3-Step (verify) Wizard State
   const [currentStep, setCurrentStep] = useState<number>(1);
   const [registrationDate, setRegistrationDate] = useState(new Date().toISOString().split('T')[0]);
 
@@ -686,6 +697,17 @@ export default function App() {
   const [aadhaarCards, setAadhaarCards] = useState<MockFile[]>([]);
   const [linkDocuments, setLinkDocuments] = useState<MockFile[]>([]);
 
+  // VERIFY FLOW — Step 2: the already-generated/updated deed document the user
+  // uploads to be checked. Only .docx/.doc are accepted; the parsed text is loaded
+  // into `filledDeedText` (the SAME variable the verification audit reads) so the
+  // verify flow's Step 3 reuses the generate flow's audit logic unchanged.
+  const [verifyDocName, setVerifyDocName] = useState<string>("");
+  const [verifyDocParsing, setVerifyDocParsing] = useState(false);
+  // VERIFY FLOW — Step 3: zoom for the Word-style report page, and per-button
+  // "downloading" state for the two export actions.
+  const [reportZoom, setReportZoom] = useState(1);
+  const [reportDownloading, setReportDownloading] = useState<"" | "report" | "corrected">("");
+
   // Step 4: AI Extraction State
   const [extractedDetails, setExtractedDetails] = useState<any>(null);
   const [extracting, setExtracting] = useState(false);
@@ -846,7 +868,8 @@ export default function App() {
     throw await parseApiFailure(response, label);
   };
 
-  const workflowSteps = [
+  // The 8-step Deed Document & Plan Generation flow.
+  const generateWorkflowSteps = [
     { number: 1, title: "Registration Form", telugu: "రిజిస్ట్రేషన్ ఫారమ్", desc: "Official details, values & uploads" },
     { number: 2, title: "Review Details", telugu: "వివరాల సమీక్ష", desc: "Preview all extracted data" },
     { number: 3, title: "Select Template", telugu: "మోడల్ సేల్ డీడ్", desc: "Choose Word deed template" },
@@ -856,6 +879,17 @@ export default function App() {
     { number: 7, title: "Stamp Preview", telugu: "రిజిస్ట్రేషన్ ప్రివ్యూ", desc: "A4 stamp-paper preview" },
     { number: 8, title: "Download & Print", telugu: "డౌన్‌లోడ్ & ప్రింట్", desc: "Export Word/PDF & print" }
   ];
+
+  // The 3-step Verify the Deed Document flow. Step 1 reuses the exact registration
+  // form; Step 3 reuses the exact verification audit from the generate flow.
+  const verifyWorkflowSteps = [
+    { number: 1, title: "Registration Form", telugu: "రిజిస్ట్రేషన్ ఫారమ్", desc: "Official details, values & uploads" },
+    { number: 2, title: "Upload Document", telugu: "డాక్యుమెంట్ అప్‌లోడ్", desc: "Upload the generated deed (.docx/.doc)" },
+    { number: 3, title: "Verify Details", telugu: "సరిపోలిక తనిఖీ", desc: "Cross-check the document for errors" }
+  ];
+
+  const workflowSteps = flowMode === "verify" ? verifyWorkflowSteps : generateWorkflowSteps;
+  const totalSteps = workflowSteps.length;
 
   const auditingStepsLogs = [
     "Reading drafted template and original uploads...",
@@ -1129,6 +1163,74 @@ export default function App() {
       alert("Failed to parse the uploaded file. Please verify the file format.");
     } finally {
       setFilling(false);
+    }
+  };
+
+  // Switch between the 8-step "generate" flow and the 3-step "verify" flow.
+  // Resets progress to Step 1 and clears the per-flow artifacts that would
+  // otherwise bleed across (the finished document text, the audit report, and the
+  // uploaded-document label) so the two flows stay fully isolated. Step-1 form
+  // data (parties, property, uploads) is intentionally kept — it is shared input
+  // for both flows.
+  const switchFlowMode = (mode: "generate" | "verify") => {
+    if (mode === flowMode) return;
+    setFlowMode(mode);
+    setCurrentStep(1);
+    setReport(null);
+    setFilledDeedText("");
+    setVerifyDocName("");
+    clearAiStatus();
+    setIsPresetsExpanded(false);
+  };
+
+  // VERIFY FLOW — Step 2: parse the uploaded finished deed document into
+  // `filledDeedText`. Accepts .docx (mammoth, client-side) and .doc (/api/parse-doc).
+  // Mirrors the custom-template upload's parsing exactly; no PDF/AI path.
+  const handleVerifyDocumentUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const lower = file.name.toLowerCase();
+    if (!lower.endsWith(".docx") && !lower.endsWith(".doc")) {
+      setError("Please upload the generated deed as a Microsoft Word .docx or .doc file.");
+      e.target.value = "";
+      return;
+    }
+    setVerifyDocParsing(true);
+    setError(null);
+    setReport(null);
+    try {
+      let text = "";
+      if (lower.endsWith(".docx")) {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        text = result?.value || "";
+      } else {
+        const base64 = await convertFileToBase64(file);
+        const response = await fetch("/api/parse-doc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ base64 }),
+        });
+        if (!response.ok) throw new Error("Failed to parse the .doc file via server.");
+        const data = await response.json();
+        text = data.text || "";
+      }
+      if (!text.trim()) {
+        setError("Could not read any text from that document. Please try a different .docx/.doc file.");
+        setVerifyDocName("");
+        setFilledDeedText("");
+        return;
+      }
+      setFilledDeedText(text);
+      setVerifyDocName(file.name);
+    } catch (err) {
+      console.error("Error reading verify document:", err);
+      setError("Failed to parse the uploaded document. Please ensure it is a valid Word .docx/.doc file.");
+      setVerifyDocName("");
+      setFilledDeedText("");
+    } finally {
+      setVerifyDocParsing(false);
+      e.target.value = "";
     }
   };
 
@@ -2135,13 +2237,14 @@ export default function App() {
     }
   };
 
-  // Load templates when entering Step 3.
+  // Load templates when entering Step 3 (generate flow only — verify's Step 3 is
+  // the audit and has no template picker).
   useEffect(() => {
-    if (currentStep === 3 && serverTemplates.length === 0) {
+    if (flowMode === "generate" && currentStep === 3 && serverTemplates.length === 0) {
       loadTemplates();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentStep]);
+  }, [currentStep, flowMode]);
 
   // If the chosen template changes, discard any previously generated draft so
   // Step 4 never shows a document built from a different template.
@@ -2260,6 +2363,7 @@ export default function App() {
     const prevStep = prevStepRef.current;
     prevStepRef.current = currentStep;
     if (
+      flowMode === "generate" &&
       prevStep === 1 &&
       currentStep !== 1 &&
       filledDeedText.trim() &&
@@ -2885,6 +2989,9 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
           enteredDetails: buildConsolidatedDetails(),
           unresolvedPlaceholders,
           templateName: selectedTemplateName(),
+          // VERIFY FLOW ONLY: request one row per atomic discrepancy. The generate
+          // flow omits this, so its verification behaviour is unchanged.
+          granularDiscrepancies: flowMode === "verify",
         })
       });
 
@@ -2906,6 +3013,87 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       reportFailure(err, "Deed verification", () => triggerDeedVerificationAudit());
     } finally {
       setAuditing(false);
+    }
+  };
+
+  // VERIFY FLOW — enrich each discrepancy with its Telugu category (mirrors the
+  // on-screen table) for the report/export. Shared by both downloads.
+  const buildReportDiscrepancies = () =>
+    (report?.allDiscrepancies || []).map((d: any) => ({
+      category: d.category || "",
+      categoryTe: getTeluguCategory(d.category),
+      description: d.description || "",
+      descriptionTe: d.descriptionTe || getTeluguDescription(d.description) || "",
+      found: d.found || "",
+      expected: d.expected || "",
+      severity: d.severity || "",
+    }));
+
+  // VERIFY FLOW — download the discrepancy report as a Word .docx (5-column table).
+  const downloadVerificationReport = async () => {
+    if (!report) return;
+    setReportDownloading("report");
+    clearAiStatus();
+    try {
+      const res = await fetch("/api/export-verification-report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          discrepancies: buildReportDiscrepancies(),
+          documentName: verifyDocName,
+          registrationDate,
+          statusMessage: report?.summary?.message || "",
+        }),
+      });
+      if (!res.ok) await failOn(res, "Report export");
+      const data = await res.json();
+      const base = (verifyDocName || "deed").replace(/\.(docx?|pdf)$/i, "").replace(/\s+/g, "_");
+      downloadBase64(data.fileBase64, data.mimeType, `Verification_Report_${base}.docx`);
+    } catch (err: any) {
+      reportFailure(err, "Report export", () => downloadVerificationReport());
+    } finally {
+      setReportDownloading("");
+    }
+  };
+
+  // VERIFY FLOW — download the uploaded deed with a "SUGGESTED CORRECTIONS" section
+  // appended at the bottom. Reuses the existing /api/export-document text path.
+  const downloadCorrectedDeed = async () => {
+    if (!report || !filledDeedText.trim()) return;
+    setReportDownloading("corrected");
+    clearAiStatus();
+    try {
+      const discs = report?.allDiscrepancies || [];
+      let corrections = "\n\n--------------------------------------------------\n";
+      corrections += "SUGGESTED CORRECTIONS / సూచించిన సవరణలు\n";
+      corrections += "--------------------------------------------------\n";
+      if (discs.length === 0) {
+        corrections += "No discrepancies detected. / ఎటువంటి తేడాలు కనుగొనబడలేదు.\n";
+      } else {
+        discs.forEach((d: any, i: number) => {
+          const rec = d.recommendation || `Update to: ${d.expected || ""}`;
+          const recTe = d.recommendationTe || getTeluguRecommendation(d.recommendation) || "";
+          corrections += `\n${i + 1}. [${(d.severity || "").toUpperCase()}] ${d.category || ""}\n`;
+          corrections += `   In document / పత్రంలో: ${d.found || "—"}\n`;
+          corrections += `   Should be / ఉండవలసినది: ${d.expected || "—"}\n`;
+          corrections += `   Action / చర్య: ${rec}\n`;
+          if (recTe) corrections += `   సూచన: ${recTe}\n`;
+        });
+      }
+      const finalText = filledDeedText + corrections;
+      const res = await fetch("/api/export-document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format: "docx", finalText }),
+      });
+      if (!res.ok) await failOn(res, "Corrected deed export");
+      const data = await res.json();
+      const base = (verifyDocName || "deed").replace(/\.(docx?|pdf)$/i, "").replace(/\s+/g, "_");
+      downloadBase64(data.fileBase64, data.mimeType, `Corrected_${base}.docx`);
+    } catch (err: any) {
+      reportFailure(err, "Corrected deed export", () => downloadCorrectedDeed());
+    } finally {
+      setReportDownloading("");
     }
   };
 
@@ -3298,7 +3486,7 @@ const getTeluguRecommendation = (rec: string) => {
                   Telangana Sale Deed Wizard & Registry
                 </h1>
                 <span className="bg-[#eef6f5] text-[#0a4d4a] text-[10px] font-bold px-2.5 py-0.5 rounded-md border border-[#c3dedb] uppercase">
-                  7-Step Workflow
+                  {flowMode === "verify" ? "Verify Deed · 3 Steps" : `${totalSteps}-Step Workflow`}
                 </span>
               </div>
               <p className="text-xs text-slate-500">
@@ -3356,7 +3544,7 @@ const getTeluguRecommendation = (rec: string) => {
               className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-xs font-bold py-2 px-3.5 rounded-lg flex items-center gap-1.5 shadow-sm transition-all"
             >
               <Sparkles className="w-3.5 h-3.5" />
-              Scenario Presets
+              Choose Workflow
             </button>
           </div>
         </div>
@@ -3373,40 +3561,72 @@ const getTeluguRecommendation = (rec: string) => {
           >
             <div className="w-full mx-auto px-4 py-4 sm:px-6 lg:px-8">
               <h3 className="text-xs font-bold text-[#0a4d4a] uppercase tracking-wider mb-2 flex items-center gap-1.5">
-                <BookOpen className="w-4 h-4" /> Loaded Practice Scenarios & Audit Testcases
+                <BookOpen className="w-4 h-4" /> Choose a Workflow
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                {PRESETS.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => {
-                      handleSelectPreset(p);
-                      setIsPresetsExpanded(false);
-                    }}
-                    className={`p-3 text-left rounded-lg bg-white border text-xs transition-all flex flex-col justify-between hover:shadow-sm ${
-                      activePresetId === p.id
-                        ? "border-[#0a4d4a] ring-2 ring-[#0a4d4a]/20 shadow-xs"
-                        : "border-slate-200 hover:border-slate-300"
-                    }`}
-                  >
-                    <div>
-                      <p className="font-bold text-slate-900 flex items-center justify-between mb-1">
-                        <span>{p.title}</span>
-                        {activePresetId === p.id && (
-                          <span className="text-[9px] bg-[#0a4d4a] text-white px-2 py-0.2 rounded-full font-bold">
-                            Active
-                          </span>
-                        )}
-                      </p>
-                      <p className="text-slate-500 leading-relaxed text-[11px] line-clamp-2">
-                        {p.description}
-                      </p>
-                    </div>
-                    <div className="mt-2 text-[10px] text-slate-400 font-mono text-right font-medium">
-                      Load Testcase →
-                    </div>
-                  </button>
-                ))}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {/* Flow 1: the full 8-step generation flow */}
+                <button
+                  onClick={() => switchFlowMode("generate")}
+                  className={`p-4 text-left rounded-lg bg-white border text-xs transition-all flex flex-col justify-between hover:shadow-sm ${
+                    flowMode === "generate"
+                      ? "border-[#0a4d4a] ring-2 ring-[#0a4d4a]/20 shadow-xs"
+                      : "border-slate-200 hover:border-slate-300"
+                  }`}
+                >
+                  <div>
+                    <p className="font-bold text-slate-900 flex items-center justify-between mb-1 gap-2">
+                      <span className="flex items-center gap-1.5">
+                        <FileCheck2 className="w-4 h-4 text-[#0a4d4a]" />
+                        Deed Document &amp; Plan Generation
+                      </span>
+                      {flowMode === "generate" && (
+                        <span className="text-[9px] bg-[#0a4d4a] text-white px-2 py-0.5 rounded-full font-bold shrink-0">
+                          Active
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-slate-500 leading-relaxed text-[11px]">
+                      The full 8-step workflow: enter registration details, review, pick a template,
+                      auto-fill the deed, re-verify, preview on stamp paper, generate the plan, and
+                      download/print.
+                    </p>
+                  </div>
+                  <div className="mt-2 text-[10px] text-slate-400 font-mono text-right font-medium">
+                    8 Steps →
+                  </div>
+                </button>
+
+                {/* Flow 2: the new 3-step verify flow */}
+                <button
+                  onClick={() => switchFlowMode("verify")}
+                  className={`p-4 text-left rounded-lg bg-white border text-xs transition-all flex flex-col justify-between hover:shadow-sm ${
+                    flowMode === "verify"
+                      ? "border-[#0a4d4a] ring-2 ring-[#0a4d4a]/20 shadow-xs"
+                      : "border-slate-200 hover:border-slate-300"
+                  }`}
+                >
+                  <div>
+                    <p className="font-bold text-slate-900 flex items-center justify-between mb-1 gap-2">
+                      <span className="flex items-center gap-1.5">
+                        <ShieldCheck className="w-4 h-4 text-[#0a4d4a]" />
+                        Verify the Deed Document
+                      </span>
+                      {flowMode === "verify" && (
+                        <span className="text-[9px] bg-[#0a4d4a] text-white px-2 py-0.5 rounded-full font-bold shrink-0">
+                          Active
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-slate-500 leading-relaxed text-[11px]">
+                      A focused 3-step check for an already-generated deed: enter the registration
+                      details, upload the finished document, then cross-check every detail against the
+                      entered data and uploaded Aadhaar/link documents.
+                    </p>
+                  </div>
+                  <div className="mt-2 text-[10px] text-slate-400 font-mono text-right font-medium">
+                    3 Steps →
+                  </div>
+                </button>
               </div>
             </div>
           </motion.div>
@@ -3524,27 +3744,47 @@ const getTeluguRecommendation = (rec: string) => {
               {/* STEP HEADER */}
               <div className="border-b border-slate-100 pb-4 mb-6">
                 <span className="text-[10px] font-bold uppercase tracking-widest text-[#0a4d4a] bg-[#eef6f5] px-2.5 py-1 rounded-md border border-[#c3dedb]">
-                  Step {currentStep} of {workflowSteps.length}: {workflowSteps[currentStep - 1].telugu}
+                  Step {currentStep} of {totalSteps}: {workflowSteps[currentStep - 1].telugu}
                 </span>
                 <h2 className="text-xl font-bold text-slate-900 mt-2 flex items-center gap-2">
-                  {currentStep === 1 && "Property Registration Details Form"}
-                  {currentStep === 2 && "Review Extracted & Entered Details"}
-                  {currentStep === 3 && "Select Word Deed Template"}
-                  {currentStep === 4 && "Auto-Fill Details into Selected Template"}
-                  {currentStep === 5 && "Re-Verify Draft & Cross-Check Uploads"}
-                  {currentStep === 6 && "Convert Hand Sketch to CAD-Style Plan"}
-                  {currentStep === 7 && "A4 Stamp Paper Print Preview"}
-                  {currentStep === 8 && "Download & Print Final Deed"}
+                  {flowMode === "verify" ? (
+                    <>
+                      {currentStep === 1 && "Property Registration Details Form"}
+                      {currentStep === 2 && "Upload the Generated Deed Document"}
+                      {currentStep === 3 && "Verify Deed & Cross-Check Details"}
+                    </>
+                  ) : (
+                    <>
+                      {currentStep === 1 && "Property Registration Details Form"}
+                      {currentStep === 2 && "Review Extracted & Entered Details"}
+                      {currentStep === 3 && "Select Word Deed Template"}
+                      {currentStep === 4 && "Auto-Fill Details into Selected Template"}
+                      {currentStep === 5 && "Re-Verify Draft & Cross-Check Uploads"}
+                      {currentStep === 6 && "Convert Hand Sketch to CAD-Style Plan"}
+                      {currentStep === 7 && "A4 Stamp Paper Print Preview"}
+                      {currentStep === 8 && "Download & Print Final Deed"}
+                    </>
+                  )}
                 </h2>
                 <p className="text-xs text-slate-500 mt-1">
-                  {currentStep === 1 && "Bilingual official details such as Pattadar Passbook, NALA Conversion, Layout approval details, bounds, seller/buyer names, and all supporting Aadhaar & Link document uploads."}
-                  {currentStep === 2 && "Review every detail extracted from the Aadhaar cards and Link documents alongside the values you entered. If anything needs a fix, go back to Step 1 to adjust before drafting."}
-                  {currentStep === 3 && "Select a pre-certified Word (.docx) deed template matching your registration type from the Telangana stamps template library."}
-                  {currentStep === 4 && "The system merges all reviewed details into the selected Word template and formats it to the official Telangana stamp-paper layout."}
-                  {currentStep === 5 && "Comprehensive AI audit: cross-checks the final deed against uploads and entered data, and confirms no residual content from other documents leaked in."}
-                  {currentStep === 6 && "Upload or draw the hand sketch of the plot and let AI convert it into a clean, CAD-style boundary plan with dimensions."}
-                  {currentStep === 7 && "Preview the finalized sale deed exactly as it will print — A4, Times New Roman 14, with the stamp/header space reserved on page one."}
-                  {currentStep === 8 && "Download the deed as an editable Microsoft Word (.docx) or PDF, or print it directly from this page."}
+                  {flowMode === "verify" ? (
+                    <>
+                      {currentStep === 1 && "Bilingual official details such as Pattadar Passbook, NALA Conversion, Layout approval details, bounds, seller/buyer names, and all supporting Aadhaar & Link document uploads."}
+                      {currentStep === 2 && "Upload the already-generated or updated deed document (.docx or .doc). Its text is read so it can be cross-checked against the details you entered in Step 1."}
+                      {currentStep === 3 && "Comprehensive AI audit: cross-checks every detail in the uploaded document against the entered data and the uploaded Aadhaar & link documents."}
+                    </>
+                  ) : (
+                    <>
+                      {currentStep === 1 && "Bilingual official details such as Pattadar Passbook, NALA Conversion, Layout approval details, bounds, seller/buyer names, and all supporting Aadhaar & Link document uploads."}
+                      {currentStep === 2 && "Review every detail extracted from the Aadhaar cards and Link documents alongside the values you entered. If anything needs a fix, go back to Step 1 to adjust before drafting."}
+                      {currentStep === 3 && "Select a pre-certified Word (.docx) deed template matching your registration type from the Telangana stamps template library."}
+                      {currentStep === 4 && "The system merges all reviewed details into the selected Word template and formats it to the official Telangana stamp-paper layout."}
+                      {currentStep === 5 && "Comprehensive AI audit: cross-checks the final deed against uploads and entered data, and confirms no residual content from other documents leaked in."}
+                      {currentStep === 6 && "Upload or draw the hand sketch of the plot and let AI convert it into a clean, CAD-style boundary plan with dimensions."}
+                      {currentStep === 7 && "Preview the finalized sale deed exactly as it will print — A4, Times New Roman 14, with the stamp/header space reserved on page one."}
+                      {currentStep === 8 && "Download the deed as an editable Microsoft Word (.docx) or PDF, or print it directly from this page."}
+                    </>
+                  )}
                 </p>
               </div>
 
@@ -5508,8 +5748,245 @@ const getTeluguRecommendation = (rec: string) => {
                     </div>
                   )}
 
+                  {/* VERIFY FLOW — STEP 2: upload the already-generated deed document */}
+                  {flowMode === "verify" && currentStep === 2 && (
+                    <div className="space-y-5">
+                      <div className="p-3.5 bg-[#eef6f5] border border-[#c3dedb] rounded-lg text-[11px] text-[#0a4d4a] flex items-start gap-2.5">
+                        <Info className="w-4 h-4 shrink-0 mt-0.5" />
+                        <p>
+                          Upload the deed document that was already generated or updated (Microsoft Word
+                          <span className="font-bold"> .docx</span> or <span className="font-bold">.doc</span>). Its text is read
+                          so the next step can cross-check every detail against the registration details you entered in Step 1
+                          and the uploaded Aadhaar &amp; link documents.
+                        </p>
+                      </div>
+
+                      <label
+                        className={`flex flex-col items-center justify-center gap-3 border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
+                          verifyDocName
+                            ? "border-emerald-300 bg-emerald-50/40"
+                            : "border-slate-300 bg-slate-50 hover:border-[#0a4d4a] hover:bg-[#eef6f5]"
+                        }`}
+                      >
+                        <input
+                          type="file"
+                          accept=".docx,.doc"
+                          className="hidden"
+                          onChange={handleVerifyDocumentUpload}
+                        />
+                        {verifyDocParsing ? (
+                          <>
+                            <div className="relative w-12 h-12 flex items-center justify-center">
+                              <div className="absolute inset-0 border-4 border-[#eef6f5] rounded-full"></div>
+                              <div className="absolute inset-0 border-4 border-[#0a4d4a] border-t-transparent rounded-full animate-spin"></div>
+                            </div>
+                            <p className="text-xs font-bold text-slate-600">Reading document…</p>
+                          </>
+                        ) : verifyDocName ? (
+                          <>
+                            <FileCheck2 className="w-12 h-12 text-emerald-600" />
+                            <div>
+                              <p className="text-sm font-bold text-slate-800">{verifyDocName}</p>
+                              <p className="text-[11px] text-slate-500 mt-0.5">
+                                Loaded successfully — click to replace with a different document.
+                              </p>
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            <FileUp className="w-12 h-12 text-[#0a4d4a]/40" />
+                            <div>
+                              <p className="text-sm font-bold text-slate-700">Click to upload the generated deed</p>
+                              <p className="text-[11px] text-slate-500 mt-0.5">Microsoft Word .docx or .doc</p>
+                            </div>
+                          </>
+                        )}
+                      </label>
+
+                      {verifyDocName && filledDeedText && (
+                        <div className="border border-slate-200 rounded-xl overflow-hidden">
+                          <div className="bg-slate-50 border-b border-slate-200 px-4 py-2 flex items-center gap-1.5">
+                            <FileText className="w-3.5 h-3.5 text-[#0a4d4a]" />
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-600">
+                              Uploaded Document Preview
+                            </span>
+                          </div>
+                          <pre className="p-4 text-[11px] text-slate-700 whitespace-pre-wrap max-h-[280px] overflow-y-auto font-sans leading-relaxed">
+                            {filledDeedText}
+                          </pre>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* VERIFY FLOW — STEP 3: cross-check audit (reuses the generate flow's audit logic) */}
+                  {flowMode === "verify" && currentStep === 3 && (
+                    <div className="space-y-5">
+                      {auditing ? (
+                        <div className="flex flex-col items-center justify-center text-center p-8">
+                          <div className="w-full space-y-4">
+                            <div className="relative w-16 h-16 mx-auto flex items-center justify-center">
+                              <div className="absolute inset-0 border-4 border-[#eef6f5] rounded-full"></div>
+                              <div className="absolute inset-0 border-4 border-[#0a4d4a] border-t-transparent rounded-full animate-spin"></div>
+                              <FileCheck2 className="w-6 h-6 text-[#0a4d4a] animate-pulse" />
+                            </div>
+                            <div>
+                              <h4 className="font-bold text-slate-800 text-sm">Running Comprehensive Deed Verification…</h4>
+                              <p className="text-xs text-slate-400 mt-1">Cross-checking the uploaded document against entered data and uploaded Aadhaar &amp; link documents.</p>
+                            </div>
+                            <div className="max-w-md mx-auto bg-slate-50 border border-slate-200 rounded-lg p-3 text-left font-mono text-[10px] text-slate-500 space-y-1">
+                              {auditingStepsLogs.map((log, idx) => {
+                                const isCompleted = idx < auditStepIndex;
+                                const isCurrent = idx === auditStepIndex;
+                                return (
+                                  <p key={idx} className={`${isCompleted ? "text-emerald-600 font-semibold" : isCurrent ? "text-[#0a4d4a] font-bold" : "text-slate-300"}`}>
+                                    {isCompleted ? "✓" : isCurrent ? "●" : "○"} {log}
+                                  </p>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      ) : report ? (() => {
+                        const discs = report.allDiscrepancies || [];
+                        const clamp = (z: number) => Math.min(1.6, Math.max(0.6, Math.round(z * 100) / 100));
+                        return (
+                        <div className="space-y-4">
+                          {/* Status banner + zoom / re-run toolbar */}
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className={`px-3 py-2 rounded-lg text-white text-[11px] font-bold flex items-center gap-2 ${report.summary.status === "APPROVED" ? "bg-emerald-800" : "bg-red-800"}`}>
+                              {report.summary.status === "APPROVED" ? "ALL CLEAR · అన్నీ సరిగ్గా ఉన్నాయి" : "DISCREPANCIES DETECTED · తేడాలు గుర్తించబడ్డాయి"}
+                              <span className="bg-white/15 px-2 py-0.5 rounded border border-white/20 font-mono">{discs.length} Issues</span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <button onClick={() => setReportZoom((z) => clamp(z - 0.1))} title="Zoom out" className="w-8 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold flex items-center justify-center">−</button>
+                              <span className="text-[11px] font-bold text-slate-600 w-12 text-center tabular-nums">{Math.round(reportZoom * 100)}%</span>
+                              <button onClick={() => setReportZoom((z) => clamp(z + 0.1))} title="Zoom in" className="w-8 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold flex items-center justify-center">+</button>
+                              <button onClick={() => setReportZoom(1)} title="Reset zoom" className="ml-1 px-2.5 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-600 text-[11px] font-bold">Fit</button>
+                              <button onClick={triggerDeedVerificationAudit} className="ml-1 px-3 h-8 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-[11px] font-bold flex items-center gap-1.5">
+                                <RefreshCw className="w-3.5 h-3.5" /> Re-run
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Word-style A4 page holding the 5-column discrepancy table */}
+                          <div className="bg-slate-200/60 border border-slate-300 rounded-xl p-4 sm:p-6 overflow-auto max-h-[70vh]">
+                            <div
+                              className="bg-white shadow-lg mx-auto origin-top"
+                              style={{ width: "794px", minHeight: "1123px", padding: "48px 40px", transform: `scale(${reportZoom})`, transformOrigin: "top center" }}
+                            >
+                              {/* Report header */}
+                              <div className="text-center border-b-2 border-double border-slate-400 pb-4 mb-5">
+                                <h2 className="text-xl font-black text-slate-800 tracking-wide uppercase">Deed Verification Report</h2>
+                                <p className="text-sm font-bold text-[#0a4d4a] mt-0.5">దస్తావేజు పరిశీలన నివేదిక</p>
+                              </div>
+                              <div className="text-[12px] text-slate-600 space-y-1 mb-5">
+                                {verifyDocName && <p><span className="font-bold">Document / పత్రం:</span> {verifyDocName}</p>}
+                                <p><span className="font-bold">Registration Date / తేదీ:</span> {registrationDate || "—"}</p>
+                                <p><span className="font-bold">Discrepancies found / గుర్తించిన తేడాలు:</span> <span className="font-bold text-red-700">{discs.length}</span></p>
+                              </div>
+
+                              {discs.length === 0 ? (
+                                <div className="border border-emerald-200 bg-emerald-50 rounded-lg p-4 text-[13px] text-emerald-800 font-semibold">
+                                  No discrepancies detected — the document matches the entered details and uploaded documents.
+                                  <span className="block text-[12px] text-emerald-700 mt-1 font-sans">ఎటువంటి తేడాలు కనుగొనబడలేదు — పత్రం నమోదు వివరాలతో సరిపోలింది.</span>
+                                </div>
+                              ) : (
+                                <table className="w-full border-collapse text-[12px] table-fixed">
+                                  <colgroup>
+                                    <col style={{ width: "20%" }} /><col style={{ width: "30%" }} /><col style={{ width: "19%" }} /><col style={{ width: "19%" }} /><col style={{ width: "12%" }} />
+                                  </colgroup>
+                                  <thead>
+                                    <tr className="bg-[#0a4d4a] text-white">
+                                      {[["Category", "వర్గం"], ["Issue", "సమస్య"], ["In Document", "పత్రంలో ఉన్నది"], ["Should Be", "ఉండవలసినది"], ["Severity", "తీవ్రత"]].map((h, i) => (
+                                        <th key={i} className="border border-[#0a4d4a] px-2 py-2 text-left align-top">
+                                          <div className="font-bold leading-tight">{h[0]}</div>
+                                          <div className="font-semibold text-[10px] text-[#bfe3df] font-sans">{h[1]}</div>
+                                        </th>
+                                      ))}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {discs.map((item: any, idx: number) => {
+                                      const isCritical = String(item.severity || "").toUpperCase() === "CRITICAL";
+                                      const teluguCat = getTeluguCategory(item.category);
+                                      const teluguDesc = item.descriptionTe || getTeluguDescription(item.description);
+                                      return (
+                                        <tr key={idx} className={isCritical ? "bg-red-50/60" : "bg-amber-50/50"}>
+                                          <td className="border border-slate-300 px-2 py-2 align-top">
+                                            <div className="font-bold text-slate-800">{item.category || "—"}</div>
+                                            {teluguCat && <div className="text-[11px] text-[#0a4d4a] font-sans">{teluguCat}</div>}
+                                          </td>
+                                          <td className="border border-slate-300 px-2 py-2 align-top">
+                                            <div className="text-slate-800">{item.description || "—"}</div>
+                                            {teluguDesc && <div className="text-[11px] text-[#0a4d4a] font-sans mt-0.5">{teluguDesc}</div>}
+                                          </td>
+                                          <td className="border border-slate-300 px-2 py-2 align-top font-bold text-red-700 break-words">{item.found || "—"}</td>
+                                          <td className="border border-slate-300 px-2 py-2 align-top font-bold text-emerald-700 break-words">{item.expected || "—"}</td>
+                                          <td className="border border-slate-300 px-2 py-2 align-top text-center">
+                                            <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${isCritical ? "bg-red-100 text-red-800" : "bg-amber-100 text-amber-800"}`}>
+                                              {(item.severity || "").toUpperCase()}
+                                            </span>
+                                            <div className="text-[10px] font-semibold mt-1 font-sans text-slate-600">{isCritical ? "తీవ్రమైనది" : "హెచ్చరిక"}</div>
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Downloads */}
+                          <div className="border-t border-slate-200 pt-4 flex flex-wrap justify-center gap-3">
+                            <button
+                              onClick={downloadVerificationReport}
+                              disabled={reportDownloading !== ""}
+                              className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 text-white text-xs font-bold py-3 px-6 rounded-lg flex items-center gap-1.5 shadow-sm"
+                            >
+                              <Download className="w-4 h-4" /> {reportDownloading === "report" ? "Preparing…" : "Download Report (Word)"}
+                            </button>
+                            <button
+                              onClick={downloadCorrectedDeed}
+                              disabled={reportDownloading !== ""}
+                              className="bg-white border border-[#0a4d4a] text-[#0a4d4a] hover:bg-[#eef6f5] disabled:opacity-50 text-xs font-bold py-3 px-6 rounded-lg flex items-center gap-1.5 shadow-sm"
+                            >
+                              <Download className="w-4 h-4" /> {reportDownloading === "corrected" ? "Preparing…" : "Download Corrected Deed (Word)"}
+                            </button>
+                          </div>
+                          <p className="text-[10px] text-slate-400 text-center max-w-lg mx-auto">
+                            The corrected deed is your uploaded document with a <span className="font-semibold">Suggested Corrections / సూచించిన సవరణలు</span> section appended at the bottom — review each change before use.
+                          </p>
+                        </div>
+                        );
+                      })() : (
+                        <div className="flex flex-col items-center justify-center text-center p-8 space-y-5">
+                          <ShieldCheck className="w-16 h-16 text-[#0a4d4a]/20 mx-auto" />
+                          <div>
+                            <h4 className="font-bold text-slate-800">Verify the Uploaded Deed Document</h4>
+                            <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">
+                              A deep AI audit cross-checks every detail in the uploaded document against the details you entered in
+                              Step 1 and the uploaded Aadhaar &amp; link documents.
+                            </p>
+                          </div>
+                          {!filledDeedText.trim() ? (
+                            <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900 max-w-md mx-auto flex items-start gap-2">
+                              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                              <span>No document loaded yet. Go back to Step 2 and upload the generated deed (.docx/.doc) first.</span>
+                            </div>
+                          ) : (
+                            <button onClick={triggerDeedVerificationAudit} className="bg-[#0a4d4a] hover:bg-[#073937] text-white text-xs font-bold py-3 px-6 rounded-lg flex items-center gap-1.5 mx-auto">
+                              <FileCheck2 className="w-4 h-4" /> Run Comprehensive Verification
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {/* STEP 2: File Upload states (Aadhaar & Link Documents) */}
-                  {currentStep === 2 && (() => {
+                  {flowMode === "generate" && currentStep === 2 && (() => {
                     const review = buildConsolidatedDetails();
                     const Field = ({ label, value }: { label: string; value?: string }) => (
                       <div className="flex flex-col">
@@ -5726,7 +6203,7 @@ const getTeluguRecommendation = (rec: string) => {
                   })()}
 
                   {/* STEP 3: Select predefined Word (.docx) template */}
-                  {currentStep === 3 && (
+                  {flowMode === "generate" && currentStep === 3 && (
                     <div className="space-y-5">
                       <div className="p-3.5 bg-[#eef6f5] border border-[#c3dedb] rounded-lg text-[11px] text-[#0a4d4a] flex items-start gap-2.5">
                         <Info className="w-4 h-4 shrink-0 mt-0.5" />
@@ -6831,7 +7308,39 @@ const getTeluguRecommendation = (rec: string) => {
                 <ChevronLeft className="w-4 h-4" /> Previous Step
               </button>
 
-              {currentStep < 8 ? (
+              {flowMode === "verify" ? (
+                currentStep < 3 ? (
+                  <button
+                    disabled={verifyDocParsing || (currentStep === 2 && !filledDeedText.trim())}
+                    onClick={() => {
+                      // 3-step verify flow: Registration → Upload → Verify
+                      if (currentStep === 1) {
+                        setCurrentStep(2); // proceed to Upload Document
+                      } else if (currentStep === 2) {
+                        if (filledDeedText.trim()) setCurrentStep(3); // proceed to Verify
+                      }
+                    }}
+                    className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs py-2 px-5 rounded-lg flex items-center gap-1.5 shadow-sm cursor-pointer"
+                  >
+                    {currentStep === 1 && "Proceed to Upload Document"}
+                    {currentStep === 2 && (verifyDocParsing ? "Reading…" : filledDeedText.trim() ? "Proceed to Verify" : "Upload a document first")}
+                    {" "}<ChevronRight className="w-4 h-4" />
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => {
+                      setCurrentStep(1);
+                      setReport(null);
+                      setFilledDeedText("");
+                      setVerifyDocName("");
+                      clearAiStatus();
+                    }}
+                    className="bg-[#14837e] hover:bg-[#106c68] text-white font-bold text-xs py-2 px-5 rounded-lg flex items-center gap-1.5 shadow-sm cursor-pointer"
+                  >
+                    Reset Verification <RefreshCw className="w-4 h-4 animate-spin-slow" />
+                  </button>
+                )
+              ) : currentStep < 8 ? (
                 <button
                   disabled={filling || auditing || (currentStep === 3 && !selectedTemplateId)}
                   onClick={() => {

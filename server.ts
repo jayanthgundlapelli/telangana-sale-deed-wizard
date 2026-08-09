@@ -6,7 +6,7 @@ import { execFile } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
-import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendEditablePlanPageToDocx, appendImagesPageToDocx } from "./documentBuilder";
+import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendEditablePlanPageToDocx, appendImagesPageToDocx, buildVerificationReportDocx } from "./documentBuilder";
 import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs, upperRelPrefix } from "./templateFiller";
 import {
   renderPlanDataUrl,
@@ -1189,6 +1189,32 @@ app.post("/api/export-document", async (req, res) => {
   }
 });
 
+// VERIFY FLOW — export the discrepancy report as a Word (.docx) 5-column table.
+// Self-contained and used only by the verify flow; it takes the discrepancies the
+// client already has (from /api/verify) and renders them — no AI call, no shared
+// state with the deed-generation export path.
+app.post("/api/export-verification-report", async (req, res) => {
+  try {
+    const { discrepancies, documentName, registrationDate, statusMessage } = req.body || {};
+    if (!Array.isArray(discrepancies)) {
+      return res.status(400).json({ error: "discrepancies (array) is required." });
+    }
+    const buffer = await buildVerificationReportDocx(discrepancies, {
+      documentName,
+      registrationDate,
+      statusMessage,
+    });
+    return res.json({
+      format: "docx",
+      fileBase64: buffer.toString("base64"),
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+  } catch (err: any) {
+    console.error("Verification report export failed:", err);
+    return res.status(500).json({ error: "Failed to export verification report.", detail: String(err?.message || err) });
+  }
+});
+
 // Endpoint to parse older Word .doc files
 app.post("/api/parse-doc", async (req, res) => {
   try {
@@ -1950,6 +1976,11 @@ app.post("/api/verify", async (req, res) => {
       enteredDetails,
       unresolvedPlaceholders,
       templateName,
+      // VERIFY FLOW ONLY: when true, the model must emit one row per atomic
+      // discrepancy instead of grouping related issues into a single item. The
+      // generate flow never sends this, so its verification behaviour is
+      // unchanged.
+      granularDiscrepancies,
     } = req.body;
 
     if (!draftText) {
@@ -2053,7 +2084,8 @@ app.post("/api/verify", async (req, res) => {
          - "Link document numbers mismatch"
          - "Residual content"
          - "Completeness"
-
+${granularDiscrepancies ? `
+      GRANULARITY (IMPORTANT): In "allDiscrepancies", emit ONE separate item for EACH individual field that differs — do NOT combine several fields into a single row, even when they share a category or belong to the same person/property. For example, if Plot No, Survey No and Extent (area) all differ, that is THREE separate items, not one. If two sellers each have a name-spelling issue, that is TWO items. Each item's "found" and "expected" must name the single specific field it is about (e.g. "Plot No", "Survey No", "Seller 2 name") and contain ONLY that field's value. Include every discrepancy no matter how minor.` : ""}
       Response MUST be in valid JSON. No trailing commas, no backticks outside the JSON.`,
     });
 
