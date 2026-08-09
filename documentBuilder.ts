@@ -432,6 +432,27 @@ function usablePageEmu(documentXml: string): { availW: number; availH: number } 
   };
 }
 
+// JSZip's `zip.file(path, data)` defaults to `createFolders: true`, which
+// silently inserts a zero-byte directory entry (e.g. "word/") for every parent
+// path segment that doesn't already have one explicitly in the archive. Real
+// Word/LibreOffice-authored .docx zips NEVER contain directory entries — only
+// flat file parts — and Word's OPC parser can reject a package that does,
+// surfacing as "problems with the contents" even though the XML inside is
+// perfectly well-formed. Every helper in this module re-saves an uploaded/
+// generated .docx via zip.file(...), so call this immediately before
+// generateAsync() to strip any directory entries JSZip introduced.
+function stripZipDirectoryEntries(zip: import("jszip")): void {
+  // NOTE: zip.remove(path) is NOT safe here — for a path ending in "/" it
+  // treats it as a folder and recursively deletes every file whose name
+  // starts with that prefix (e.g. remove("word/") would also delete
+  // "word/document.xml"). Delete straight from the internal files map instead,
+  // which only removes the exact zero-byte directory-entry keys.
+  const files = (zip as any).files as Record<string, { dir?: boolean }>;
+  for (const relPath of Object.keys(files)) {
+    if (relPath.endsWith("/") && files[relPath]?.dir) delete files[relPath];
+  }
+}
+
 export async function appendPlanPageToDocx(
   docxBuffer: Buffer,
   opts: AppendPlanOptions
@@ -526,6 +547,7 @@ export async function appendPlanPageToDocx(
   }
   xml = xml.slice(0, insertAt) + planXml + xml.slice(insertAt);
   zip.file("word/document.xml", xml);
+  stripZipDirectoryEntries(zip);
 
   return zip.generateAsync({
     type: "nodebuffer",
@@ -604,6 +626,7 @@ export async function appendEditablePlanPageToDocx(
   }
   xml = xml.slice(0, insertAt) + planXml + xml.slice(insertAt);
   zip.file("word/document.xml", xml);
+  stripZipDirectoryEntries(zip);
 
   return zip.generateAsync({
     type: "nodebuffer",
@@ -739,6 +762,7 @@ export async function appendImagesPageToDocx(
   }
   xml = xml.slice(0, insertAt) + body + xml.slice(insertAt);
   zip.file("word/document.xml", xml);
+  stripZipDirectoryEntries(zip);
 
   return zip.generateAsync({
     type: "nodebuffer",
