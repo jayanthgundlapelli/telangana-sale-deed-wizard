@@ -753,6 +753,24 @@ const HEADER_FILL = "0A4D4A";
 const CRITICAL_FILL = "FDECEC";
 const WARNING_FILL = "FFF6E5";
 
+// The discrepancy text is AI-generated and may contain characters that are
+// ILLEGAL in XML 1.0 (control chars 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, and lone
+// surrogates). The docx library escapes &/<>/ but does NOT strip these, so they
+// end up in word/document.xml verbatim and Word refuses to open the file
+// ("Unspecified error ... Location: Part: /word/document.xml"). Strip them, and
+// collapse newlines/tabs to spaces since a single TextRun cannot represent them.
+function sanitizeReportText(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    .replace(/[\t\r\n]+/g, " ") // collapse whitespace a single TextRun cannot hold
+    // XML 1.0 illegal control chars: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F plus 0xFFFE/0xFFFF
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "") // lone high surrogate
+    .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "$1") // lone low surrogate
+    .trim();
+}
+
 function reportCell(
   lines: { text: string; bold?: boolean; color?: string; size?: number }[],
   opts: { width: number; fill?: string; align?: (typeof AlignmentType)[keyof typeof AlignmentType] } = { width: 20 }
@@ -768,7 +786,7 @@ function reportCell(
           spacing: { after: 20, line: 264 },
           children: [
             new TextRun({
-              text: ln.text || "—",
+              text: sanitizeReportText(ln.text) || "—",
               bold: ln.bold,
               color: ln.color,
               size: ln.size ?? 18, // half-points → 9pt
@@ -875,7 +893,7 @@ export async function buildVerificationReportDocx(
         spacing: { after: 40 },
         children: [
           new TextRun({ text: "Document / పత్రం: ", bold: true, size: 18, font: REPORT_FONT }),
-          new TextRun({ text: meta.documentName, size: 18, font: REPORT_FONT }),
+          new TextRun({ text: sanitizeReportText(meta.documentName), size: 18, font: REPORT_FONT }),
         ],
       })
     );
@@ -885,7 +903,7 @@ export async function buildVerificationReportDocx(
         spacing: { after: 40 },
         children: [
           new TextRun({ text: "Registration Date / తేదీ: ", bold: true, size: 18, font: REPORT_FONT }),
-          new TextRun({ text: meta.registrationDate, size: 18, font: REPORT_FONT }),
+          new TextRun({ text: sanitizeReportText(meta.registrationDate), size: 18, font: REPORT_FONT }),
         ],
       })
     );
