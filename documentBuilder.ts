@@ -227,7 +227,7 @@ export async function buildDeedDocx(
     ],
   });
 
-  return Packer.toBuffer(doc);
+  return packDocxClean(doc);
 }
 
 // -----------------------------------------------------------------------------
@@ -380,7 +380,7 @@ export async function buildTeluguDeedDocx(
     ],
   });
 
-  return Packer.toBuffer(doc);
+  return packDocxClean(doc);
 }
 
 // -----------------------------------------------------------------------------
@@ -457,6 +457,27 @@ function stripZipDirectoryEntries(zip: import("jszip")): void {
   for (const relPath of Object.keys(files)) {
     if (relPath.endsWith("/") && files[relPath]?.dir) delete files[relPath];
   }
+}
+
+// The `docx` library's own `Packer.toBuffer()` builds its zip package the same
+// way (via JSZip with default createFolders: true), so buffers it produces
+// ALSO come out with stray zero-byte directory entries — the exact same
+// "problems with the contents" failure mode stripZipDirectoryEntries() above
+// exists to fix, just one layer further from our own code. Every document
+// built from scratch with `new Document(...)` (buildDeedDocx,
+// buildTeluguDeedDocx, buildVerificationReportDocx) must go through this
+// instead of calling Packer.toBuffer(doc) directly: re-load the packed buffer
+// with JSZip, strip the directory entries, and re-save.
+async function packDocxClean(doc: Document): Promise<Buffer> {
+  const raw = await Packer.toBuffer(doc);
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(raw);
+  stripZipDirectoryEntries(zip);
+  return zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
 }
 
 export async function appendPlanPageToDocx(
@@ -1023,7 +1044,7 @@ export async function buildVerificationReportDocx(
     ],
   });
 
-  return Packer.toBuffer(doc);
+  return packDocxClean(doc);
 }
 
 // Deterministic placeholder merge — exact, no paraphrasing, no hallucination.
