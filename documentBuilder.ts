@@ -583,6 +583,220 @@ export async function appendPlanPageToDocx(
   });
 }
 
+// -----------------------------------------------------------------------------
+// Insert the registration plan image INTO an uploaded template's OWN dedicated
+// "PLAN FOR REGISTRATION" page, instead of appending a brand-new page.
+//
+// Some uploaded templates (e.g. the Telangana stamp-paper deed format) already
+// ship a full plan page: a "PLAN FOR REGISTRATION" heading, the property/party
+// description with its own <angle bracket> markers (filled by the normal
+// in-place merge, untouched here), a reserved blank box for the sketch (often a
+// table cell holding a literal "<INSERT REGISTRATION SKETCH HERE>" marker), and
+// the template's own generic north-arrow picture. For these templates we must
+// NOT append a second plan page — we splice our generated, correctly-oriented
+// map into the EXISTING page, and remove the template's own north-arrow
+// picture so there is only ever one (correct) arrow on the page.
+//
+// Detection is heading-based: we look for a paragraph whose text (joined across
+// however many runs Word split it into) reads "PLAN FOR REGISTRATION". If that
+// heading is not present, this function returns null and the caller falls back
+// to appendPlanPageToDocx (append a whole new page) — the pre-existing default
+// behaviour for templates without their own plan page.
+// -----------------------------------------------------------------------------
+
+// Strip XML tags from a paragraph fragment and decode the handful of entities
+// that appear in these documents, for text-matching purposes only (never used
+// to produce output XML).
+function paraPlainText(paraXml: string): string {
+  return paraXml
+    .replace(/<[^>]+>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const PARA_RE = /<w:p\b[^>]*>[\s\S]*?<\/w:p>/g;
+
+// Find the first paragraph (as a {start,end,text} triple, indices relative to
+// `xml`) whose plain text matches `re`, optionally only among paragraphs at or
+// after `fromIndex`.
+function findParagraph(
+  xml: string,
+  re: RegExp,
+  fromIndex = 0
+): { start: number; end: number; text: string } | null {
+  const scan = new RegExp(PARA_RE);
+  let m: RegExpExecArray | null;
+  while ((m = scan.exec(xml))) {
+    if (m.index < fromIndex) continue;
+    const text = paraPlainText(m[0]);
+    if (re.test(text)) return { start: m.index, end: m.index + m[0].length, text };
+  }
+  return null;
+}
+
+export async function insertPlanIntoTemplatePlanPage(
+  docxBuffer: Buffer,
+  opts: AppendPlanOptions
+): Promise<Buffer | null> {
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(docxBuffer);
+
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) return null;
+  let xml = await docFile.async("string");
+
+  // 1) Detect the template's own dedicated plan page via its heading.
+  const heading = findParagraph(xml, /plan\s+for\s+registration/i);
+  if (!heading) return null; // no dedicated plan page -> caller falls back
+
+  // 2) Image bytes.
+  const raw = (opts.imageBase64 || "").replace(/^data:[^,]+,/, "");
+  const imgData = Buffer.from(raw, "base64");
+  if (imgData.length === 0) return docxBuffer;
+  const imgWpx = opts.imageWidthPx && opts.imageWidthPx > 0 ? opts.imageWidthPx : 800;
+  const imgHpx = opts.imageHeightPx && opts.imageHeightPx > 0 ? opts.imageHeightPx : 1131;
+
+  // 3) Ensure the drawing namespaces exist on <w:document> FIRST — this only
+  //    ever inserts characters inside the opening tag, which lives well before
+  //    `heading.start`, but doing it before we cut the segment means every
+  //    offset computed below stays valid without any manual re-basing.
+  xml = xml.replace(/<w:document\b([^>]*)>/, (_m, attrs) => {
+    let a = attrs as string;
+    if (!/xmlns:r=/.test(a)) a += ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+    if (!/xmlns:wp=/.test(a)) a += ' xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"';
+    return `<w:document${a}>`;
+  });
+
+  // 4) Re-locate the heading in the namespaced xml (its own text is untouched
+  //    by step 3, but offsets shifted by however many chars were inserted into
+  //    the <w:document> tag), then scope everything else to "the plan page":
+  //    from the heading paragraph to the end of the document body. Templates
+  //    like this one put the plan page last, so this segment IS the plan page
+  //    (its own trailing <w:sectPr>, if any, is preserved untouched — we only
+  //    rewrite paragraph-level content).
+  const headingNow = findParagraph(xml, /plan\s+for\s+registration/i);
+  if (!headingNow) return null;
+  const bodyEnd = xml.lastIndexOf("</w:body>");
+  const segEnd = bodyEnd === -1 ? xml.length : bodyEnd;
+  const prefix = xml.slice(0, headingNow.start);
+  let segment = xml.slice(headingNow.start, segEnd);
+  const suffix = xml.slice(segEnd);
+
+  // 5) Remove the template's OWN north-arrow (or any other) picture(s) on this
+  //    page — the generated map already draws its own, correctly-oriented
+  //    arrow, and two arrows on one page would conflict/confuse. A picture is
+  //    carried by a <w:drawing> (modern) or <w:pict> (legacy VML) element
+  //    inside its enclosing <w:r>; remove the whole run so no dangling <w:rPr>
+  //    is left behind.
+  segment = segment
+    .replace(/<w:r\b(?:[^>]*)>(?:(?!<\/w:r>)[\s\S])*?<w:drawing\b[\s\S]*?<\/w:drawing>(?:(?!<\/w:r>)[\s\S])*?<\/w:r>/g, "")
+    .replace(/<w:r\b(?:[^>]*)>(?:(?!<\/w:r>)[\s\S])*?<w:pict\b[\s\S]*?<\/w:pict>(?:(?!<\/w:r>)[\s\S])*?<\/w:r>/g, "");
+
+  // 6) Figure out how much room we have for the image. Prefer the reserved
+  //    sketch box's own table cell (its column width + row height) when one is
+  //    present, since that is the template author's intended sketch area;
+  //    otherwise fall back to the page's usable area.
+  const { availW: pageW, availH: pageH } = usablePageEmu(xml);
+  let availW = pageW;
+  let availH = pageH;
+
+  // The reserved sketch box is the last <w:tbl> before the sketch marker (or,
+  // if there's no marker, the last <w:tbl> on the page at all) — its
+  // <w:tblGrid> gives the column width(s) and its <w:trHeight> the row height.
+  const markerRe = /insert[^a-z]{0,3}registration[^a-z]{0,3}sketch[^a-z]{0,3}here|insert.{0,30}sketch.{0,30}here/i;
+  const markerPara = findParagraph(segment, markerRe);
+  const searchUpTo = markerPara ? markerPara.start : segment.length;
+  const tblSlice = segment.slice(0, searchUpTo);
+  const lastTblGrid = [...tblSlice.matchAll(/<w:tblGrid>([\s\S]*?)<\/w:tblGrid>/g)].pop();
+  const lastTrHeight = [...tblSlice.matchAll(/<w:trHeight\b[^>]*\bw:val="(\d+)"/g)].pop();
+  if (lastTblGrid) {
+    const colsW = [...lastTblGrid[1].matchAll(/w:w="(\d+)"/g)].reduce((sum, m) => sum + parseInt(m[1], 10), 0);
+    if (colsW > 0) availW = Math.min(pageW, colsW * EMU_PER_TWIP);
+  }
+  if (lastTrHeight) {
+    const rowH = parseInt(lastTrHeight[1], 10);
+    if (rowH > 0) availH = Math.min(pageH, rowH * EMU_PER_TWIP);
+  }
+
+  const natW = imgWpx * EMU_PER_PX;
+  const natH = imgHpx * EMU_PER_PX;
+  const scale = Math.min(availW / natW, availH / natH);
+  const cx = Math.max(1, Math.round(natW * scale));
+  const cy = Math.max(1, Math.round(natH * scale));
+
+  // 7) Add the media file + relationship + content-type, exactly as the
+  //    append-a-new-page path does.
+  const imgName = "registration-plan-inserted.jpg";
+  zip.file(`word/media/${imgName}`, imgData);
+
+  const ctFile = zip.file("[Content_Types].xml");
+  if (ctFile) {
+    let ct = await ctFile.async("string");
+    if (!/<Default\b[^>]*Extension="jpe?g"/i.test(ct)) {
+      ct = ct.replace(/<\/Types>/, '<Default Extension="jpg" ContentType="image/jpeg"/></Types>');
+      zip.file("[Content_Types].xml", ct);
+    }
+  }
+
+  const relsPath = "word/_rels/document.xml.rels";
+  const relsFile = zip.file(relsPath);
+  let rId = "rId900001";
+  if (relsFile) {
+    let rels = await relsFile.async("string");
+    const ids = [...rels.matchAll(/Id="rId(\d+)"/g)].map((m) => parseInt(m[1], 10));
+    rId = "rId" + ((ids.length ? Math.max(...ids) : 0) + 1);
+    rels = rels.replace(
+      /<\/Relationships>/,
+      `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/${imgName}"/></Relationships>`
+    );
+    zip.file(relsPath, rels);
+  }
+
+  // 8) Build the replacement/insertion XML: one centred, page/cell-fitted
+  //    drawing paragraph. No page break — this lands ON the existing page.
+  const drawingId = 424243;
+  const imgParaXml =
+    `<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>` +
+    `<wp:inline distT="0" distB="0" distL="0" distR="0">` +
+    `<wp:extent cx="${cx}" cy="${cy}"/>` +
+    `<wp:effectExtent l="0" t="0" r="0" b="0"/>` +
+    `<wp:docPr id="${drawingId}" name="RegistrationPlan"/>` +
+    `<wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>` +
+    `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+    `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+    `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+    `<pic:nvPicPr><pic:cNvPr id="${drawingId}" name="${imgName}"/><pic:cNvPicPr/></pic:nvPicPr>` +
+    `<pic:blipFill><a:blip r:embed="${rId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>` +
+    `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
+    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>` +
+    `</pic:pic></a:graphicData></a:graphic></wp:inline>` +
+    `</w:drawing></w:r></w:p>`;
+
+  // 9) Re-locate the sketch marker paragraph WITHIN the (north-arrow-stripped)
+  //    segment and either replace it (marker found) or insert right after the
+  //    heading paragraph (no marker — heading-based fallback per spec).
+  const markerParaNow = findParagraph(segment, markerRe);
+  if (markerParaNow) {
+    segment = segment.slice(0, markerParaNow.start) + imgParaXml + segment.slice(markerParaNow.end);
+  } else {
+    const headingEnd = segment.indexOf("</w:p>") + "</w:p>".length;
+    segment = segment.slice(0, headingEnd) + imgParaXml + segment.slice(headingEnd);
+  }
+
+  xml = prefix + segment + suffix;
+  zip.file("word/document.xml", xml);
+  stripZipDirectoryEntries(zip);
+
+  return zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+}
+
 export interface AppendEditablePlanOptions {
   /** Structured plan data as returned by the plan-generation endpoint. */
   plan?: any | null;

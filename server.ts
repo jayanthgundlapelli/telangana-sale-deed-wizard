@@ -6,7 +6,7 @@ import { execFile } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import WordExtractor from "word-extractor";
-import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, appendEditablePlanPageToDocx, appendImagesPageToDocx, buildVerificationReportDocx } from "./documentBuilder";
+import { buildDeedDocx, buildTeluguDeedDocx, mergePlaceholders, appendPlanPageToDocx, insertPlanIntoTemplatePlanPage, appendEditablePlanPageToDocx, appendImagesPageToDocx, buildVerificationReportDocx } from "./documentBuilder";
 import { fillDocxTemplate, buildAngleFieldResolver, toDDMMYYYY, expandMultiPartyParagraphs, upperRelPrefix } from "./templateFiller";
 import {
   renderPlanDataUrl,
@@ -1057,17 +1057,29 @@ app.post("/api/export-document", async (req, res) => {
 
     let docxBuffer: Buffer;
 
-    // Helper: splice the plan image in as the LAST page of an already-built docx.
+    // Helper: place the plan image into the document. If the uploaded template
+    // ships its own dedicated "PLAN FOR REGISTRATION" page (heading detected),
+    // insert the map directly into that page — replacing its reserved sketch
+    // placeholder and stripping the template's own generic north-arrow picture
+    // — instead of appending a brand-new page after it. Templates without such
+    // a page keep the original behaviour: the plan is appended as the LAST
+    // page of the docx.
     const withPlanPage = async (buf: Buffer): Promise<Buffer> => {
       if (!planImg) return buf;
       try {
+        const inserted = await insertPlanIntoTemplatePlanPage(buf, {
+          imageBase64: planImg,
+          imageWidthPx: planW,
+          imageHeightPx: planH,
+        });
+        if (inserted) return inserted;
         return await appendPlanPageToDocx(buf, {
           imageBase64: planImg,
           imageWidthPx: planW,
           imageHeightPx: planH,
         });
       } catch (e: any) {
-        console.warn("Failed to append plan page to docx:", e?.message || e);
+        console.warn("Failed to place plan page into docx:", e?.message || e);
         return buf;
       }
     };

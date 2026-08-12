@@ -112,6 +112,11 @@ export const PLAN_EXTRACTION_SCHEMA: any = {
                     type: T.STRING,
                     description: "Compass side of the plot this edge forms: NORTH, SOUTH, EAST, or WEST.",
                   },
+                  imageEdge: {
+                    type: T.STRING,
+                    description:
+                      "Which edge of the SKETCH IMAGE ITSELF this side is drawn along — TOP, BOTTOM, LEFT, or RIGHT — read LITERALLY from the picture layout, ignoring compass reasoning entirely (e.g. 'this line is drawn across the top of the page'). Report this independently of `direction` above; it is used only to mechanically cross-check that your compass call is consistent with the north arrow you found separately, so a reasoning slip on one does not silently corrupt the drawing.",
+                  },
                   lengthLabel: {
                     type: T.STRING,
                     description: "The dimension text written on that edge, verbatim, e.g. \"48'-3\\\"\" or \"66'\".",
@@ -257,6 +262,7 @@ CRITICAL RULES:
   Decide each side's compass direction USING this north, so NORTH is genuinely the northern edge even if it was drawn sideways or upside-down.
 - For EACH boundary side of the plot, add an entry to drawing.plot.sides with:
     • direction  = the TRUE COMPASS side it lies on (NORTH / SOUTH / EAST / WEST), decided using the north arrow above;
+    • imageEdge  = which edge of the IMAGE ITSELF (TOP / BOTTOM / LEFT / RIGHT) this side is drawn along — a plain literal observation of the picture's layout, made WITHOUT any compass reasoning (do this step first, before you even think about north, so it cannot be contaminated by your "direction" answer);
     • lengthLabel = the dimension written on that edge, verbatim, keeping feet/inch marks (e.g. 48'-3", 66', 19'-9");
     • lengthFeet  = that dimension in decimal feet (48'-3" -> 48.25, 66' -> 66, 19'-9" -> 19.75);
     • neighbour   = the abutter named outside that side (e.g. "HOUSE OF CHAKALI CHANDRAVVA"), else empty.
@@ -288,13 +294,27 @@ function esc(s: any): string {
 // rotating just the SYMBOL is what a prompt like "rotate north symbol into 90
 // degrees" is asking for (a stylistic/annotation change to the compass glyph,
 // not a request to redraw the plot at an angle).
-function drawNorthArrow(S: string[], cx: number, cy: number, rotationDeg: number): void {
-  S.push(`<circle cx="${cx}" cy="${cy}" r="18" fill="#ffffff" stroke="#000" stroke-width="1.2"/>`);
+//
+// `detected` reflects whether the AI actually found a north reference (arrow /
+// compass rose / explicit "N" label) on the UPLOADED sketch itself
+// (drawing.northDirection.found === 'yes'), as opposed to us silently
+// defaulting to north-up with no evidence from the sketch. When it was NOT
+// detected, the symbol is drawn muted/dashed with a "N?" label and a small
+// "NOT DETECTED — ASSUMED" caption so the plan doesn't overstate confidence
+// it doesn't have. This is purely a rendering cue; it never changes geometry.
+function drawNorthArrow(S: string[], cx: number, cy: number, rotationDeg: number, detected: boolean = true): void {
+  const ink = detected ? "#000" : "#8a8a8a";
+  const dash = detected ? "" : ' stroke-dasharray="3,2"';
+  S.push(`<circle cx="${cx}" cy="${cy}" r="18" fill="#ffffff" stroke="${ink}" stroke-width="1.2"${dash}/>`);
   const rot = rotationDeg ? ` transform="rotate(${rotationDeg} ${cx} ${cy})"` : "";
   S.push(`<g${rot}>`);
-  S.push(`<path d="M ${cx} ${cy + 12} L ${cx} ${cy - 12} M ${cx - 5} ${cy - 5} L ${cx} ${cy - 12} L ${cx + 5} ${cy - 5}" fill="none" stroke="#000" stroke-width="1.6"/>`);
-  S.push(`<text x="${cx}" y="${cy - 15}" text-anchor="middle" font-size="11" font-weight="bold">N</text>`);
+  S.push(`<path d="M ${cx} ${cy + 12} L ${cx} ${cy - 12} M ${cx - 5} ${cy - 5} L ${cx} ${cy - 12} L ${cx + 5} ${cy - 5}" fill="none" stroke="${ink}" stroke-width="1.6"${dash}/>`);
+  S.push(`<text x="${cx}" y="${cy - 15}" text-anchor="middle" font-size="11" font-weight="bold" fill="${ink}">${detected ? "N" : "N?"}</text>`);
   S.push(`</g>`);
+  if (!detected) {
+    S.push(`<text x="${cx}" y="${cy + 30}" text-anchor="middle" font-size="7.5" fill="${ink}">NORTH NOT DETECTED</text>`);
+    S.push(`<text x="${cx}" y="${cy + 39}" text-anchor="middle" font-size="7.5" fill="${ink}">IN SKETCH — ASSUMED</text>`);
+  }
 }
 
 // Greedy word-wrap: returns lines that fit within maxWidth px at the given font size.
@@ -406,6 +426,70 @@ export function normDir(s: any): "N" | "S" | "E" | "W" | "" {
   if (t.startsWith("EAST") || t === "E") return "E";
   if (t.startsWith("WEST") || t === "W") return "W";
   return "";
+}
+
+// Normalise a raw image-edge word ("TOP"/"BOTTOM"/"LEFT"/"RIGHT") to one of
+// the four literal picture edges ("" if unrecognised/missing).
+function normImageEdge(s: any): "TOP" | "BOTTOM" | "LEFT" | "RIGHT" | "" {
+  const t = String(s || "").trim().toUpperCase();
+  if (t.startsWith("TOP")) return "TOP";
+  if (t.startsWith("BOTTOM")) return "BOTTOM";
+  if (t.startsWith("LEFT")) return "LEFT";
+  if (t.startsWith("RIGHT")) return "RIGHT";
+  return "";
+}
+
+// Mechanically derive which COMPASS direction a given image edge corresponds
+// to, using ONLY the detected north-arrow angle (imageClockDeg) — no AI
+// reasoning involved. imageClockDeg is degrees clockwise from image-up that
+// north points (0=up, 90=right, 180=down, 270=left); rounding to the nearest
+// 90° gives which literal picture edge (TOP/RIGHT/BOTTOM/LEFT) is north, and
+// the other three edges follow going clockwise from there.
+function imageEdgeToCompass(edge: "TOP" | "BOTTOM" | "LEFT" | "RIGHT", northClockDeg: number): "N" | "S" | "E" | "W" {
+  const order: ("TOP" | "RIGHT" | "BOTTOM" | "LEFT")[] = ["TOP", "RIGHT", "BOTTOM", "LEFT"];
+  const compassOrder: ("N" | "E" | "S" | "W")[] = ["N", "E", "S", "W"];
+  const steps = Math.round(((northClockDeg % 360) + 360) % 360 / 90) % 4; // how many quarter-turns CW north is from TOP
+  const northEdgeIdx = steps; // e.g. steps=1 -> north arrow points to the RIGHT edge
+  const edgeIdx = order.indexOf(edge);
+  const offset = ((edgeIdx - northEdgeIdx) % 4 + 4) % 4; // how many quarter-turns CW this edge is from the north edge
+  return compassOrder[offset];
+}
+
+// Cross-check each side's AI-reasoned compass `direction` against a SECOND,
+// independent, purely mechanical derivation: the literal image edge it was
+// drawn on (imageEdge — a raw layout observation, not a compass judgement)
+// combined with the separately-detected north-arrow angle (imageClockDeg).
+// These two signals come from different questions (one is "what did the AI
+// reason the compass direction was", the other is "where in the picture is
+// this line, mechanically rotated by the detected arrow") — so they act as an
+// independent check on each other, the same way reconcileSidesWithPrintedArea
+// cross-checks lengths against the printed area instead of trusting a single
+// AI read. When they disagree and we HAVE a detected north reference to trust,
+// the mechanical derivation wins — it cannot suffer the "mental rotation"
+// reasoning slip that direction alone is prone to (e.g. calling the west edge
+// "north" because it was drawn along the top of an unusually-oriented sketch).
+// Returns how many sides were corrected (0 if none, or if there wasn't enough
+// signal to check at all).
+export function reconcileSideDirectionsWithNorthArrow(
+  rawSides: any[],
+  northClockDeg: number,
+  northFound: boolean
+): number {
+  if (!northFound || !Array.isArray(rawSides) || !rawSides.length) return 0;
+  let corrected = 0;
+  for (const s of rawSides) {
+    const edge = normImageEdge(s?.imageEdge);
+    if (!edge) continue; // AI didn't report a literal edge for this side — nothing to cross-check
+    const claimed = normDir(s?.direction);
+    const mechanical = imageEdgeToCompass(edge, northClockDeg);
+    if (claimed && claimed !== mechanical) {
+      s.direction = mechanical;
+      corrected++;
+    } else if (!claimed) {
+      s.direction = mechanical;
+    }
+  }
+  return corrected;
 }
 
 export interface SideInfo {
@@ -903,8 +987,24 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   // (paint-order="stroke" draws the white stroke first, then the black fill).
   const HALO = ' fill="#000" stroke="#ffffff" stroke-width="2.6" paint-order="stroke"';
 
+  // Whether the AI actually found a north reference (arrow/compass rose/label)
+  // ON THE UPLOADED SKETCH ITSELF, and at what angle. Computed here (before the
+  // side directions are gathered) because it feeds the mechanical direction
+  // cross-check below AND styles the north-arrow SYMBOL further down, so both
+  // uses share the exact same detection result.
+  const northClock = Number(drawing?.northDirection?.imageClockDeg) || 0;
+  const northFound = String(drawing?.northDirection?.found || "").toLowerCase() === "yes";
+
   // ---- Gather measurements -------------------------------------------------
   const rawSides: any[] = Array.isArray(drawing?.plot?.sides) ? drawing.plot.sides : [];
+  // The AI's per-side `direction` is a REASONED compass call, made by mentally
+  // rotating the sketch — the same class of error-prone step that misreads
+  // rotated digits (see reconcileSidesWithPrintedArea above). Cross-check it
+  // against a mechanical derivation from the literal image-edge each side sits
+  // on (imageEdge) plus the independently-detected arrow angle, and let the
+  // mechanical answer win on disagreement — this is the actual fix for what
+  // was previously just "trust whatever direction the AI said" with no check.
+  reconcileSideDirectionsWithNorthArrow(rawSides, northClock, northFound);
   const byDir: ByDir = {};
   for (const s of rawSides) {
     const dir = normDir(s?.direction);
@@ -988,6 +1088,9 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
 
   // Region bounds for clamping text inside the drawing box.
   const regL = RX + 4, regR = RX + RW - 4, regT = RY + 4, regB = RY + RH - 4;
+  // (northClock/northFound were computed earlier, above the side-gathering
+  // loop, so the direction cross-check and the north-arrow SYMBOL below both
+  // use the exact same detection result.)
 
   if (cornersFeet && cornersFeet.length >= 3) {
     // ===== TO-SCALE, NORTH-UP RECONSTRUCTED DRAWING ==========================
@@ -1237,10 +1340,14 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       }
     }
 
-    // North arrow — plot is drawn north-up by construction; the SYMBOL itself
-    // additionally rotates by edits.northRotationDeg when the prompt asked for it
-    // (e.g. "rotate north symbol into 90 degrees"), independent of the drawing.
-    drawNorthArrow(S, regR - 24, regT + 30, edits.northRotationDeg || 0);
+    // North arrow — plot is placed with whichever side the AI tagged NORTH on
+    // top (see reconstructRectilinear); this reconstruction does NOT itself
+    // verify that tag against the sketch's own detected arrow, so the SYMBOL's
+    // detected/not-detected styling below is the only honest signal of whether
+    // the sketch actually had a north reference to go on. The SYMBOL additionally
+    // rotates by edits.northRotationDeg when the prompt asked for it (e.g.
+    // "rotate north symbol into 90 degrees"), independent of the drawing.
+    drawNorthArrow(S, regR - 24, regT + 30, edits.northRotationDeg || 0, northFound);
   } else {
     // ===== FALLBACK: no usable side measurements =============================
     // Draw from the model's traced polygon (rotated so its north points UP) if it
@@ -1248,14 +1355,14 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     // useful when the sketch is too rough for measured reconstruction.
     const polyRaw: any[] = Array.isArray(drawing?.polygon) ? drawing.polygon.filter((p: any) => p && isFinite(p.x) && isFinite(p.y)) : [];
     const labels: any[] = Array.isArray(drawing?.labels) ? drawing.labels : [];
-    const northClock = Number(drawing?.northDirection?.imageClockDeg) || 0;
     // A traced polygon can only be trusted to sit north-up if we KNOW where north
     // is (a north arrow was actually found). Without that reference, drawing the
     // raw traced shape reproduces whatever rotation the sketch was drawn at — the
     // "plan is not north-up" bug. So we only use the traced polygon when a north
     // arrow was found (and rotate it upright by that arrow); otherwise we fall
     // through to the boundary rectangle, which is north-up by construction.
-    const northFound = String(drawing?.northDirection?.found || "").toLowerCase() === "yes";
+    // (northFound/northClock are computed once, above, and shared with the
+    // north-arrow SYMBOL's detected/not-detected styling.)
     // Rotate points so the sketch's north (northClock° cw from image-up) points up.
     const rot = (-northClock * Math.PI) / 180;
     const cxp = 500, cyp = 500;
@@ -1294,8 +1401,10 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       if (b.west) S.push(`<text x="${bx - 10}" y="${by + bh / 2}" font-size="12" transform="rotate(-90 ${bx - 10} ${by + bh / 2})" text-anchor="middle"${HALO}>${esc(b.west)}</text>`);
       if (b.east) S.push(`<text x="${bx + bw + 10}" y="${by + bh / 2}" font-size="12" transform="rotate(-90 ${bx + bw + 10} ${by + bh / 2})" text-anchor="middle"${HALO}>${esc(b.east)}</text>`);
     }
-    // North arrow (up, rotated per edits.northRotationDeg if requested).
-    drawNorthArrow(S, regR - 24, regT + 30, edits.northRotationDeg || 0);
+    // North arrow (up, rotated per edits.northRotationDeg if requested); styled
+    // detected/not-detected per whether the sketch itself actually had a north
+    // reference (northFound) — same flag used above for the sides path.
+    drawNorthArrow(S, regR - 24, regT + 30, edits.northRotationDeg || 0, northFound);
   }
 
   // ================= BOTTOM BLOCK (reference proforma layout) =================
