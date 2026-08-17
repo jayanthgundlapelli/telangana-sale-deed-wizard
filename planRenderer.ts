@@ -982,6 +982,19 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
   // the drawing consistently fill the full A4 sheet.
   const BOTTOM_BLOCK_H = 188;
   const RH = Math.max(460, H - M - 5 - RY - BOTTOM_BLOCK_H);
+  // RH above is the STRETCHED region height (fills leftover page space so the
+  // signature block sits low on the page instead of the plan looking short).
+  // The drawing's own CONTENT — plot + roads + dimension/neighbour labels —
+  // must NOT be centred within that full stretched height, or a small plot
+  // ends up floating in the middle of a large empty area whenever the
+  // description/party text above is short (exactly the "plan not positioned
+  // correctly" bug: the map drifts away from the text block it belongs under).
+  // DRAWH boxes the actual drawing into a compact, capped-height area anchored
+  // at the TOP of the region (right under the parties text, matching the
+  // reference proforma), using the pre-stretch known-good size; any leftover
+  // room between DRAWH and RH becomes blank page space above the signature
+  // block, which is exactly how the reference layout looks.
+  const DRAWH = Math.min(RH, 460);
 
   // A white halo under drawing text keeps marks legible over lines/hatching
   // (paint-order="stroke" draws the white stroke first, then the black fill).
@@ -1086,8 +1099,10 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     cornersFeet = rect ? rect.corners : null;
   }
 
-  // Region bounds for clamping text inside the drawing box.
-  const regL = RX + 4, regR = RX + RW - 4, regT = RY + 4, regB = RY + RH - 4;
+  // Region bounds for clamping text inside the drawing box. Uses DRAWH (the
+  // compact content height), not the full stretched RH, so labels/roads never
+  // spread out to chase empty page space.
+  const regL = RX + 4, regR = RX + RW - 4, regT = RY + 4, regB = RY + DRAWH - 4;
   // (northClock/northFound were computed earlier, above the side-gathering
   // loop, so the direction cross-check and the north-arrow SYMBOL below both
   // use the exact same detection result.)
@@ -1139,13 +1154,13 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
     // reconstructed shape (square stays square).
     const LABELPAD = 16; // px text breathing room at the region edge
     const innerW = Math.max(1, RW - 2 * LABELPAD);
-    const innerH = Math.max(1, RH - 2 * LABELPAD);
+    const innerH = Math.max(1, DRAWH - 2 * LABELPAD);
     const sc = Math.min((innerW * 0.56) / plotWFeet, (innerH * 0.56) / plotHFeet); // feet -> px
 
     const plotWpx = plotWFeet * sc;
     const plotHpx = plotHFeet * sc;
     const cx = RX + RW / 2;
-    const cy = RY + RH / 2;
+    const cy = RY + DRAWH / 2;
     // Map feet (x=East, y=North-up) to SVG px (y grows downward): centre the plot.
     const mpx = (fx: number) => cx + (fx - (pxMin + pxMax) / 2) * sc;
     const mpy = (fy: number) => cy - (fy - (pyMin + pyMax) / 2) * sc;
@@ -1377,9 +1392,9 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       const mnx = Math.min(...xs), mxx = Math.max(...xs), mny = Math.min(...ys), mxy = Math.max(...ys);
       const spanX = Math.max(1, mxx - mnx), spanY = Math.max(1, mxy - mny);
       const PAD = 40;
-      const fit = Math.min((RW - 2 * PAD) / spanX, (RH - 2 * PAD) / spanY);
+      const fit = Math.min((RW - 2 * PAD) / spanX, (DRAWH - 2 * PAD) / spanY);
       const ox = RX + PAD + ((RW - 2 * PAD) - spanX * fit) / 2;
-      const oy = RY + PAD + ((RH - 2 * PAD) - spanY * fit) / 2;
+      const oy = RY + PAD + ((DRAWH - 2 * PAD) - spanY * fit) / 2;
       const MX = (px: number) => ox + (px - mnx) * fit;
       const MY = (py: number) => oy + (py - mny) * fit;
       const ptsStr = poly.map((p) => `${MX(p.x).toFixed(1)},${MY(p.y).toFixed(1)}`).join(" ");
@@ -1393,7 +1408,7 @@ export function renderRegistrationPlanSvg(input: RenderInput): string {
       }
     } else {
       // Rectangle from form boundaries.
-      const bx = RX + 46, by = RY + 40, bw = RW - 92, bh = RH - 92;
+      const bx = RX + 46, by = RY + 40, bw = RW - 92, bh = DRAWH - 92;
       S.push(`<rect x="${bx}" y="${by}" width="${bw}" height="${bh}" fill="url(#propHatch)" stroke="#000" stroke-width="2.6"/>`);
       const b = formBounds;
       if (b.north) S.push(`<text x="${bx + bw / 2}" y="${by - 8}" text-anchor="middle" font-size="12"${HALO}>${esc(b.north)}</text>`);

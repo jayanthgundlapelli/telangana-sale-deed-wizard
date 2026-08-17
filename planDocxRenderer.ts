@@ -554,7 +554,13 @@ export function buildEditablePlanDrawingXml(input: EditablePlanInput): string {
   const RW = contentW - 12;
   const BOTTOM_BLOCK_H = 188;
   const RH = Math.max(460, H - M - 5 - RY - BOTTOM_BLOCK_H);
-  const regL = RX + 4, regR = RX + RW - 4, regT = RY + 4, regB = RY + RH - 4;
+  // DRAWH mirrors renderRegistrationPlanSvg's fix: RH is the STRETCHED region
+  // height (fills leftover page space so the signature block sits low on the
+  // page), but the drawing's own content must be boxed into a compact height
+  // anchored at the TOP of the region — else a small plot centres in the
+  // middle of a tall empty region whenever the text above it is short.
+  const DRAWH = Math.min(RH, 460);
+  const regL = RX + 4, regR = RX + RW - 4, regT = RY + 4, regB = RY + DRAWH - 4;
 
   // ---- Gather measurements (identical logic to renderRegistrationPlanSvg) ----
   const rawSides: any[] = Array.isArray(drawing?.plot?.sides) ? drawing.plot.sides : [];
@@ -652,13 +658,13 @@ export function buildEditablePlanDrawingXml(input: EditablePlanInput): string {
 
     const LABELPAD = 16;
     const innerW = Math.max(1, RW - 2 * LABELPAD);
-    const innerH = Math.max(1, RH - 2 * LABELPAD);
+    const innerH = Math.max(1, DRAWH - 2 * LABELPAD);
     const sc = Math.min((innerW * 0.56) / plotWFeet, (innerH * 0.56) / plotHFeet);
 
     const plotWpx = plotWFeet * sc;
     const plotHpx = plotHFeet * sc;
     const cx = RX + RW / 2;
-    const cy = RY + RH / 2;
+    const cy = RY + DRAWH / 2;
     const mpx = (fx: number) => cx + (fx - (pxMin + pxMax) / 2) * sc;
     const mpy = (fy: number) => cy - (fy - (pyMin + pyMax) / 2) * sc;
 
@@ -912,7 +918,7 @@ export function buildEditablePlanDrawingXml(input: EditablePlanInput): string {
     // trace is far less meaningful as individually-editable shapes than as one
     // image; users hitting this path get the image plan, which already covers
     // it faithfully.) ----
-    const bx = RX + 46, by = RY + 40, bw = RW - 92, bh = RH - 92;
+    const bx = RX + 46, by = RY + 40, bw = RW - 92, bh = DRAWH - 92;
     out.push(
       rectShape({ x: bx, y: by, w: bw, h: bh }, originXEmu, originYEmu, pxToEmu, {
         fill: "#ffffff",

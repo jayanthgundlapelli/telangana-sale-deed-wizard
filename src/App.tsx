@@ -2004,21 +2004,18 @@ export default function App() {
   // verification. Sourced from the Step-1 list rows (source of truth), falling back to
   // single-field state so nothing is silently dropped.
   const buildConsolidatedDetails = () => {
-    // Append district/state/pincode to a party's residential address ONLY when
-    // that token is not already present in it. The Aadhaar extractor is asked to
-    // return an address that already includes village/mandal/district/pincode, so
-    // blindly appending the separate district/state/pincode fields produced a
-    // duplicated tail (e.g. "…, Warangal, 506002, Warangal, Telangana, 506002").
-    const composeAddress = (base: string, extras: (string | undefined)[]): string => {
-      let acc = (base || "").trim().replace(/[\s,]+$/, "");
-      for (const t of extras) {
-        const v = (t || "").trim();
-        if (v && !acc.toLowerCase().includes(v.toLowerCase())) {
-          acc = acc ? `${acc}, ${v}` : v;
-        }
-      }
-      return acc;
-    };
+    // NOTE: this used to also re-append the party's separate district/state/pincode
+    // fields to the address here (composeAddress helper, ONLY when not already a
+    // substring of the address). That caused a bug: the Aadhaar extractor embeds
+    // district/pincode directly into the address text, so district/state/pincode
+    // are redundant mirrors of what's already in the address — but they are NOT
+    // exposed anywhere in the UI for the user to edit or clear. So when a user
+    // edited the visible Address field to delete a district (e.g. "Karimnagar"),
+    // the hidden district field still held the old value, the substring check now
+    // said "not present", and it silently re-appended the just-deleted district
+    // right back into the seller's/buyer's address in the exported document. The
+    // Address field the user actually edits is now used verbatim — nothing hidden
+    // is appended back in.
     const sellers = (executantsList.length
       ? executantsList
       : executantName
@@ -2033,7 +2030,7 @@ export default function App() {
       dob: e.dob,
       occupation: e.occupation || "",
       cellNo: e.cellNo || "",
-      address: composeAddress(cleanAddressWithoutRelation(e.address, e.relation), [e.district, e.state, e.pincode]),
+      address: cleanAddressWithoutRelation(e.address, e.relation),
     }));
 
     const buyers = (claimantsList.length
@@ -2050,7 +2047,7 @@ export default function App() {
       dob: c.dob,
       occupation: c.occupation || "",
       cellNo: c.cellNo || "",
-      address: composeAddress(cleanAddressWithoutRelation(c.address, c.relation), [c.district, c.state, c.pincode]),
+      address: cleanAddressWithoutRelation(c.address, c.relation),
     }));
 
     const firstProp = propertiesList[0] || ({} as any);
@@ -2763,13 +2760,20 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
     const sellerNamesText = executantsList.map(e => e.name).join(", ");
     const sellerAadhaarsText = executantsList.map(e => e.aadhaarNo).join(", ");
     const sellerAgesText = executantsList.map(e => `${e.age} Years`).join(", ");
-    const sellerAddressText = executantsList.map(e => `${e.address}, ${e.district}`).join("; ");
+    // NOTE: this used to also append the party's separate (hidden, non-editable)
+    // `district` field after the address — e.g. `${e.address}, ${e.district}`.
+    // The district is already embedded in the address text by the Aadhaar
+    // extractor, and the district field itself isn't shown anywhere for the user
+    // to edit/clear, so appending it back caused a deleted district (e.g.
+    // "Karimnagar") to reappear in the generated deed even after the user removed
+    // it from the visible Address field. The address is now used as typed.
+    const sellerAddressText = executantsList.map(e => e.address).join("; ");
 
     // Construct dynamic multi-buyer format
     const buyerNamesText = claimantsList.map(c => c.name).join(", ");
     const buyerAadhaarsText = claimantsList.map(c => c.aadhaarNo).join(", ");
     const buyerAgesText = claimantsList.map(c => `${c.age} Years`).join(", ");
-    const buyerAddressText = claimantsList.map(c => `${c.address}, ${c.district}`).join("; ");
+    const buyerAddressText = claimantsList.map(c => c.address).join("; ");
 
     const replacements: Record<string, string> = {
       "{{REGISTRATION_DATE}}": registrationDate,
@@ -5342,6 +5346,93 @@ const getTeluguRecommendation = (rec: string) => {
                                 )}
                               </tbody>
                             </table>
+                          </div>
+                        </div>
+
+                        {/* PLAN / SKETCH OF THE PROPERTY — upload it right here in Step 1 so it
+                            does not have to wait until Step 6. This reuses the exact same
+                            sketchImage/handleSketchUpload/handleGeneratePlan flow Step 6 uses
+                            (same AI hand-sketch → CAD-style conversion), so whatever is
+                            uploaded here is already sitting there, generated, when the user
+                            reaches Step 6 — and it is what gets appended as the plan page on
+                            export regardless of which step it was uploaded from. */}
+                        <div className="mb-6 mt-6">
+                          <div className="flex justify-between items-center bg-[#0a4d4a] text-white px-3 py-1.5 border border-[#0a4d4a] rounded-t-lg">
+                            <h3 className="text-[11px] font-black uppercase tracking-wider flex items-center gap-1.5">
+                              <UploadCloud className="w-3.5 h-3.5 text-emerald-200" /> PLAN / SKETCH OF THE PROPERTY (ప్లాన్ / స్కెచ్)
+                            </h3>
+                            {sketchImage && (
+                              <span className="text-[10px] text-emerald-100 bg-white/10 px-2 py-0.5 rounded font-bold border border-white/20">
+                                Uploaded: {sketchFileName || "sketch.png"}
+                              </span>
+                            )}
+                          </div>
+                          <div className="border border-slate-300 rounded-b-lg p-4 bg-white">
+                            {!sketchImage ? (
+                              <div className="border-2 border-dashed border-slate-300 rounded-xl p-6 text-center space-y-3 bg-slate-50/50 hover:bg-slate-50 transition-colors">
+                                <div className="w-10 h-10 bg-[#0a4d4a]/10 text-[#0a4d4a] rounded-full flex items-center justify-center mx-auto">
+                                  <UploadCloud className="w-5 h-5" />
+                                </div>
+                                <div>
+                                  <p className="text-xs font-bold text-slate-800">Upload the hand-drawn plot/house sketch here</p>
+                                  <p className="text-[11px] text-slate-400 mt-0.5">
+                                    Optional at this step — you can also upload it later in Step 6 "Generate Plan".
+                                    Uploading it here starts the AI CAD conversion immediately so it's ready sooner.
+                                  </p>
+                                </div>
+                                <label className="inline-flex items-center gap-2 bg-[#0a4d4a] hover:bg-[#073937] text-white font-bold text-xs py-2 px-4 rounded-lg cursor-pointer shadow-xs">
+                                  <UploadCloud className="w-4 h-4" /> Browse Image
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    onChange={handleSketchUpload}
+                                    className="hidden"
+                                  />
+                                </label>
+                              </div>
+                            ) : (
+                              <div className="flex flex-col sm:flex-row items-center gap-4">
+                                <div className="relative rounded-lg overflow-hidden border border-slate-200 bg-slate-900 shrink-0 flex items-center justify-center p-1.5 w-full sm:w-48 h-32">
+                                  <img
+                                    src={sketchImage}
+                                    alt="Hand drawn sketch"
+                                    className="max-h-full max-w-full object-contain rounded"
+                                  />
+                                </div>
+                                <div className="flex-1 space-y-1.5">
+                                  <p className="text-[11px] text-slate-600">
+                                    {planGenerating
+                                      ? "Converting to a computerized CAD-style plan…"
+                                      : generatedPlanImage
+                                      ? "Computerized plan ready — it will be appended as a page when you export the document. You can fine-tune it in Step 6."
+                                      : "Sketch uploaded. Head to Step 6 to review/adjust the generated plan before export."}
+                                  </p>
+                                  <div className="flex items-center gap-3">
+                                    <label className="text-[11px] font-bold text-[#0a4d4a] hover:underline cursor-pointer flex items-center gap-1">
+                                      <UploadCloud className="w-3.5 h-3.5" /> Replace Sketch Image
+                                      <input
+                                        type="file"
+                                        accept="image/*"
+                                        onChange={handleSketchUpload}
+                                        className="hidden"
+                                      />
+                                    </label>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setSketchImage(null);
+                                        setGeneratedPlanImage(null);
+                                        setPlanVerificationReport(null);
+                                        setExtractedPlan(null);
+                                      }}
+                                      className="text-[11px] font-bold text-red-600 hover:underline cursor-pointer"
+                                    >
+                                      Clear Image
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
 

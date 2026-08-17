@@ -2083,9 +2083,9 @@ app.post("/api/verify", async (req, res) => {
       ${dateContext}
 
       Verify the following and return the analysis strictly adhering to the JSON schema:
-      1. Extractions: Identify sellers, their exact names from Aadhaar, draft, and link documents, Aadhaar numbers, and DOBs. Calculate rounded age at the registration date using Aadhaar DOB.
+      1. Extractions: Identify sellers, their exact names from Aadhaar, draft, and link documents, Aadhaar numbers, and DOBs. Calculate their COMPLETED age (whole years since last birthday, NOT rounded) at the registration date using Aadhaar DOB.
       2. Comprehensive Verification Checks:
-         - Verification 1 (Names mismatch): Compare spelling in Draft to Aadhaar AND to the entered JSON. Must match EXACTLY. Verify Aadhaar numbers (12-digit format), and calculate age from Aadhaar DOB to check draft age.
+         - Verification 1 (Names mismatch): Compare spelling in Draft to Aadhaar AND to the entered JSON. Must match EXACTLY. Verify Aadhaar numbers (12-digit format), and calculate COMPLETED age (not rounded) from Aadhaar DOB to check draft age.
          - Verification 2 (Property details mismatch): Verify H.No, Plot No, Survey/Sub-division number, PTI No, Sq Yards, Plinth area, and boundaries (East, West, North, South) listed in Draft match the older Link Document / Pattadar Passbook AND the entered JSON exactly.
          - Verification 3 (Link document numbers mismatch): Verify that the registered sale deed/document reference number cited in the draft document exactly matches the actual document number printed on the Link Document PDF.
          - Verification 4 (Residual content): CRITICALLY inspect the draft for ANY content that does NOT belong to THIS transaction — e.g. a different person's name, a stray survey/plot number, an address, a village, an amount, or boilerplate that matches neither the uploaded documents nor the entered JSON. Any such leftover from another property, seller, or buyer, or any un-replaced template placeholder such as {{...}}, MUST be reported as a CRITICAL discrepancy in the "Residual content" category. The final deed must contain ONLY the details of the current supplied property, claimant, and executant — nothing mixed in from other documents.
@@ -2115,11 +2115,10 @@ ${granularDiscrepancies ? `
     Strict Rules for comparison:
     1. Aadhaar Card is the absolute source of truth for Seller Names, Dates of Birth, and Aadhaar numbers.
     2. Draft Name Spelling: The spelling and initials from the Aadhaar card must reflect EXACTLY in the draft document AND in the entered JSON. Flag even minor character differences, spacing, or punctuation mismatches.
-    3. Rounded Age Calculation:
+    3. COMPLETED Age Calculation (CRITICAL — do NOT round):
        - Identify the seller's Date of Birth (DOB) from the Aadhaar card.
-       - Calculate their exact age in years as of the provided Registration Date.
-       - Round the calculated age to the nearest integer.
-       - Compare this calculated rounded age with the age specified in the draft. Flag if they differ.
+       - Calculate their COMPLETED age in years as of the provided Registration Date — i.e. the number of full birthdays reached, using ONLY whole-year floor arithmetic (Registration Date year minus DOB year, minus 1 if this year's birthday has not yet occurred by the Registration Date). Do NOT round up/to-nearest: e.g. someone born 12-12-1979 is 46 (not 47) on 26-07-2026, because their 2026 birthday has not happened yet. Never add 1 for a partial year already lived.
+       - Compare this calculated completed age with the age specified in the draft. Flag if they differ.
     4. Language Fallback: Link documents are often in Telugu. If so, extract the seller's details (name, father's/husband's name, survey numbers, village, boundaries) from Telugu. Translate Telugu names to English and compare them with Aadhaar and Draft.
     5. Property & Boundaries: H.No, Plot No, Survey number, PTI No, Sq Yards, Plinth Area, and Boundaries must match the Link Document AND the entered JSON EXACTLY. Flag any discrepancy as CRITICAL in the 'Property details mismatch' category.
     6. Link Document Deed Number: Extract the actual deed number from the Link document header/page. Verify the draft refers to this exact acquired deed number. If not, flag as 'Link document numbers mismatch'.
@@ -2366,7 +2365,7 @@ app.post("/api/pre-audit", async (req, res) => {
       ${dateContext}
 
       Verify:
-      1. Names mismatch: seller/buyer names, spelling, and Aadhaar numbers in the entered JSON must exactly match the Aadhaar cards. Calculate age at the registration date from the Aadhaar DOB and compare to the entered age.
+      1. Names mismatch: seller/buyer names, spelling, and Aadhaar numbers in the entered JSON must exactly match the Aadhaar cards. Calculate their COMPLETED age (whole years since last birthday, NOT rounded to nearest) at the registration date from the Aadhaar DOB and compare to the entered age.
       2. Property details mismatch: H.No, Plot No, Survey/Sub-division number, PTI No, Sq Yards, Plinth area, and boundaries (East/West/North/South) in the entered JSON must exactly match the Link Document / Pattadar Passbook.
       3. Link document numbers mismatch: the link deed number entered in the JSON must exactly match the document number printed on the Link Document.
       4. Completeness: flag any field required for drafting that is blank or clearly a placeholder/example value.
@@ -2379,7 +2378,7 @@ app.post("/api/pre-audit", async (req, res) => {
     You are an expert Indian Document Verification AI specializing in land registrations under the Registration and Stamps Department of Telangana, India.
     Your task is to audit data a document writer has ENTERED (but not yet drafted into a deed) against official identity documents (Aadhaar cards) and older ownership documents (Link documents), so errors are caught BEFORE the deed template is auto-filled.
     Aadhaar Card is the absolute source of truth for names, DOB, and Aadhaar numbers. Link Document is the absolute source of truth for property/boundary/deed-number details.
-    Flag even minor spelling, spacing, or punctuation mismatches. Round ages to the nearest integer.
+    Flag even minor spelling, spacing, or punctuation mismatches. Ages must be COMPLETED age (whole years since the person's last birthday as of the registration date) — do NOT round to the nearest integer; a person is not "older" until their birthday actually occurs.
     Group all discrepancies strictly into: "Names mismatch", "Property details mismatch", "Link document numbers mismatch", "Completeness".
     Return your report strictly in the requested JSON schema.
     `;
