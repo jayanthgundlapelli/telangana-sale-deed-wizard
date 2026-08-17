@@ -1,152 +1,303 @@
-# Architecture Review — Telangana Sale Deed Wizard & Registry
+# Architecture — Telangana Sale Deed Wizard & Registry
 
-_Reviewed as of 2026-07. This document explains how the app is built, the
-issues found during an architecture pass, the fixes applied, and the
-recommended shape for hosting it cheaply now and in production later._
+_Last reviewed against the codebase on 2026-08-17._
+
+A single-deployable **full-stack TypeScript** application that guides a user
+through preparing a Telangana property **sale / gift / conveyance deed**,
+verifies it against source documents with Google Gemini, generates a to-scale
+**registration plan** from a hand-drawn sketch, and exports a stamp-formatted
+`.docx` / PDF (plan appended as the last page).
+
+Live demo: https://telangana-sale-deed-wizard.onrender.com  
+Health: `GET /api/health`
 
 ---
 
-## 1. What the app is
+## 1. System overview
 
-A single-deployable **full-stack TypeScript app**:
+```
+┌──────────────────────────── Browser ────────────────────────────┐
+│  React 19 SPA (src/App.tsx ~7.9k LOC)                            │
+│  • Dual mode: Generate (8 steps) | Verify (3 steps)              │
+│  • localStorage: telangana_deeds_registry (draft registry)       │
+│  • Client rasterises plan SVG → PNG before export                │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ HTTPS  /api/*
+                                ▼
+┌───────────────────────── Express (server.ts) ───────────────────┐
+│  Serves SPA (Vite HMR in dev · dist/ in prod)                    │
+│  Gemini calls stay server-side (GEMINI_API_KEY never in browser) │
+│  LibreOffice (soffice) for optional DOCX → PDF                   │
+└───────┬───────────────────┬───────────────────┬─────────────────┘
+        │                   │                   │
+        ▼                   ▼                   ▼
+  Google Gemini API   ./templates/*.docx   Ephemeral /tmp
+  (vision + text)     (self-seeding lib)   (PDF conversion)
+```
 
-- **Frontend** — React 19 + Vite 6 SPA (`src/App.tsx`, Tailwind CSS). A 7-step
-  wizard: Registration Form → Review → Select Template → Auto-Fill → Re-Verify →
-  Stamp Preview → Download & Print.
-- **Backend** — a single **Express** server (`server.ts`) that:
-  1. Serves the built SPA (`dist/`) in production, or proxies Vite dev middleware
-     in development.
-  2. Exposes `/api/*` endpoints that call the **Google Gemini API** server-side
-     for document extraction and verification.
-  3. Generates Word `.docx` deeds (`documentBuilder.ts`) and manages the deed
-     template library (`templateManager.ts`), optionally converting to PDF via
-     LibreOffice in the production container.
-
-There is **no database**. State is the request payload plus a small on-disk
-template library that self-seeds on boot. The browser keeps a local registry in
+**No database.** Request payloads carry all working state. The only durable
+server artifact is the on-disk template library (baked into the container /
+self-seeded on boot). The browser keeps a lightweight deed draft registry in
 `localStorage`.
 
+---
+
+## 2. Runtime & deployment topology
+
+| Layer | Choice | Notes |
+|-------|--------|-------|
+| Runtime | Node.js **20–22** | Pinned via `engines` + Dockerfile `node:20-alpine` |
+| Process model | **One long-lived Express process** | Serves SPA + API; not serverless |
+| Dev | `tsx server.ts` + Vite middleware | HMR; lazy `import("vite")` only in non-prod |
+| Prod build | Vite SPA → `dist/` + esbuild → `dist/server.cjs` | `--packages=external` |
+| Container | Multi-stage Dockerfile | Runtime includes LibreOffice + Liberation fonts |
+| Hosts | Render (Docker free) · Cloud Run | `render.yaml`, `cloudbuild.yaml` |
+
+Scale characteristics: **stateless** request handlers → horizontal scale and
+scale-to-zero are fine. Ephemeral filesystem is acceptable because templates
+self-seed and exports stream to the client.
+
+---
+
+## 3. Product flows
+
+### 3.1 Generate flow (8 steps)
+
+| # | Step | Responsibility |
+|---|------|----------------|
+| 1 | **Registration Form** | Bilingual official details; Aadhaar + link-document uploads → `/api/extract-aadhaar`, `/api/extract-link-document` |
+| 2 | **Review Details** | Read-only consolidation of entered/extracted facts |
+| 3 | **Select Template** | Library templates (`/api/templates`) or bring-your-own `.docx` / `.doc` / `.txt` / PDF |
+| 4 | **Auto-Fill Draft** | Merge into template via `/api/generate-document` (in-place fill or placeholder merge); optional `/api/fill-template`, `/api/translate-deed`, `/api/clean-draft` |
+| 5 | **Re-Verify Deed** | `/api/verify` — documents ↔ form ↔ draft; bilingual discrepancies |
+| 6 | **Generate Plan** | Hand sketch → `/api/generate-plan` → structured JSON → deterministic SVG |
+| 7 | **Stamp Preview** | A4 / Times New Roman 14pt / page-1 stamp offset preview |
+| 8 | **Download & Print** | `/api/export-document` (`.docx` or PDF); plan PNG + optional Aadhaar image page |
+
+### 3.2 Verify flow (3 steps)
+
+Reuses Step-1 form + the same audit engine:
+
+1. Registration Form  
+2. Upload finished deed (`.docx` / `.doc`)  
+3. Cross-check via `/api/verify` (+ `/api/export-verification-report`)
+
+Mode is toggled in the SPA (`flowMode`: `"generate"` | `"verify"`).
+
+---
+
+## 4. Module map
+
 ```
-Browser (React SPA)
-   │  HTTPS
-   ▼
-Express server  ──────────────►  Google Gemini API   (server-side, key hidden)
-   ├── serves dist/ (static SPA)
-   ├── /api/extract, /api/extract-aadhaar, /api/extract-link-document
-   ├── /api/generate-document, /api/fill-template   (docx merge)
-   ├── /api/export-document        (docx or PDF via LibreOffice)
-   ├── /api/verify                 (comprehensive AI audit)
-   └── /api/health                 (liveness probe)
-        │
-        ▼
-   ./templates/*.docx   (self-seeding deed template library)
+┌─ Frontend ─────────────────────────────────────────────────────┐
+│  src/main.tsx              entry                                 │
+│  src/App.tsx               wizard UI, state, all client orchestration │
+│  src/DocxLivePreview.tsx   docx-preview live Word rendering      │
+│  src/AiStatusBanner.tsx    AI failure / degraded-mode UX         │
+│  src/aiError.ts            client-side error presentation        │
+│  src/presets.ts            sample / demo form presets            │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ Backend core ─────────────────────────────────────────────────┐
+│  server.ts (~2.9k)         Express app, Gemini orchestration,    │
+│                            model failover, all /api routes       │
+│  aiErrors.ts               Classify AI failures; timeouts;       │
+│                            never silently succeed on AI failure  │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ Document pipeline ────────────────────────────────────────────┐
+│  templateManager.ts        Template library + self-seed          │
+│  templateFiller.ts         In-place .docx XML fill (jszip);      │
+│                            split-run / <w:br/> aware; multi-party│
+│  documentBuilder.ts        Deterministic A4 stamp-spec .docx;    │
+│                            plan append; verification report DOCX │
+│  planRenderer.ts           Vision schema + reconstruct geometry; │
+│                            SVG A4 registration plan              │
+│  planDocxRenderer.ts       Optional editable DrawingML plan page │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-### API surface
+### Design principle: AI extracts, code decides
+
+| Concern | Who owns it |
+|---------|-------------|
+| OCR / field extraction from Aadhaar, link docs, sketches | Gemini (vision) |
+| Deed verification / discrepancy language (EN + TE) | Gemini (text) |
+| Plot geometry, north-up layout, to-scale roads | **`planRenderer.ts`** (deterministic) |
+| Stamp-paper margins, fonts, page breaks | **`documentBuilder.ts`** |
+| Preserving uploaded template formatting | **`templateFiller.ts`** (edit `<w:t>` only) |
+| Failure classification & user messaging | **`aiErrors.ts`** |
+
+This split keeps legal formatting and surveying rules testable and stable even
+when the model changes.
+
+---
+
+## 5. API surface
 
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/api/health` | GET | Liveness probe (used by Docker/Render/Cloud Run) |
-| `/api/templates` | GET | List deed templates in the library |
-| `/api/extract` | POST | Extract structured data from an uploaded deed |
-| `/api/extract-aadhaar` | POST | Extract Aadhaar card fields |
-| `/api/extract-link-document` | POST | Extract link-document fields |
-| `/api/generate-document` | POST | Merge reviewed data into the chosen template |
+| `/api/health` | GET | Liveness (Docker / Render / Cloud Run) |
+| `/api/templates` | GET | List deed templates |
+| `/api/extract` | POST | Structured extraction from uploaded deed |
+| `/api/extract-aadhaar` | POST | Aadhaar field extraction |
+| `/api/extract-link-document` | POST | Link / ownership document extraction |
+| `/api/parse-doc` | POST | Legacy `.doc` / `.docx` → text |
+| `/api/extract-template-text` | POST | Pull plain text from a template file |
+| `/api/generate-document` | POST | Merge reviewed data into chosen template |
 | `/api/fill-template` | POST | AI-assisted template fill |
-| `/api/export-document` | POST | Return `.docx` or PDF via LibreOffice |
-| `/api/verify` | POST | Cross-check documents ↔ entered data ↔ final deed |
-| `/api/parse-doc` | POST | Parse an uploaded legacy `.doc`/`.docx` |
+| `/api/clean-draft` | POST | Clean / normalise draft text |
+| `/api/translate-deed` | POST | On-demand Telugu translation of draft |
+| `/api/pre-audit` | POST | Early cross-check before full draft |
+| `/api/verify` | POST | Full documents ↔ data ↔ deed audit |
+| `/api/export-verification-report` | POST | Verification report as `.docx` |
+| `/api/generate-plan` | POST | Sketch → structured plan + boundary audit + SVG |
+| `/api/export-document` | POST | Final `.docx` or PDF (+ plan / images pages) |
+
+Body size limit: **50 MB** (base64 uploads for scans and filled templates).
 
 ---
 
-## 2. Architecture strengths (keep these)
+## 6. Key pipelines
 
-- **Single process, single artifact.** One Express server serves both the SPA and
-  the API. Trivial to containerize, no CORS, no split origins. Perfect for a
-  single small container on any host.
-- **Server-side Gemini key.** The API key never reaches the browser — the correct
-  pattern. All model calls happen in `server.ts`.
-- **Graceful degradation.** If `GEMINI_API_KEY` is missing, the app drops to a
-  deterministic "heuristic simulation" mode instead of crashing. If LibreOffice
-  is absent, PDF export falls back to `.docx` with a clear message. This makes it
-  deployable even on the leanest free tier.
-- **Deterministic document core.** `.docx` generation and placeholder merging are
-  pure, testable functions independent of the AI layer. Formatting (A4, Times New
-  Roman 14pt, 5.8" first-page stamp offset) is enforced in code, not left to the
-  template.
-- **Stateless request handling.** No sticky sessions or server memory between
-  requests → scales horizontally and tolerates scale-to-zero cold starts.
-
----
-
-## 3. Issues found & fixes applied
-
-| # | Severity | Finding | Fix applied |
-|---|----------|---------|-------------|
-| 1 | **Critical (security)** | A **live `GEMINI_API_KEY`** was committed in `.env.local`, **and** a second copy sat in `EXTRACTION_SUCCESS.md`. With no `.gitignore`, pushing to GitHub for deployment would leak both. | Added a comprehensive `.gitignore` (ignores all `.env*`), redacted the key in the archived doc, and added `.env.example` as the safe template. **The key in `.env.local` should still be rotated** — see the warning in `DEPLOYMENT.md`. |
-| 2 | **High (portability/correctness)** | `server.ts` imported Vite at the **top level**, so the production bundle eagerly `require("vite")` even though Vite is only used for dev HMR. This forced production to install Vite's whole tree, and would crash on boot if anyone trimmed it to devDependencies. | Converted to a **lazy `await import("vite")`** inside the `NODE_ENV !== "production"` branch, and removed `vite` from `dependencies` (kept in `devDependencies`). Verified the built `server.cjs` no longer eagerly requires vite and boots clean under `NODE_ENV=production`. |
-| 3 | **High (deploy correctness)** | `vercel.json` modeled the app as a **Vercel serverless function**. This app is a long-running server that seeds files to disk on boot — Vercel's read-only serverless FS and function model don't fit; it would fail or behave unpredictably. | **Removed `vercel.json`.** Recommended hosts are container/long-process platforms (Cloud Run, Render). |
-| 4 | **Medium (deploy correctness)** | The `Dockerfile` never copied `templates/`, so user-supplied `.docx` templates would vanish in the image (only runtime self-seeded placeholders would exist). | Rewrote the `Dockerfile` to `COPY templates/`, use `npm ci --omit=dev`, and add a PORT-aware healthcheck. |
-| 5 | **Medium (cost)** | The Gemini model (`gemini-3.5-flash`, the priciest flash tier) was hardcoded at 5 call sites. | Extracted to a single **`GEMINI_MODEL` env var** (default `gemini-3.5-flash`). Production can switch to `gemini-2.5-flash` or `-flash-lite` to cut cost with zero code changes. |
-| 6 | **Low (config drift)** | `render.yaml` used the deprecated `env: node` key. | Updated to `runtime: node`, pinned `npm ci`, added the `GEMINI_MODEL` var and clarifying comments. |
-| 7 | **Low (hygiene)** | ~27 stale AI session-note markdowns + a 202 KB `App.tsx.backup` + obsolete root test scripts cluttered the repo root; browser tab title still read "My Google AI Studio App". | Archived notes to `docs/archive/` (excluded from build context), deleted the backup and dead tests, set the real `<title>`. |
-| 8 | **Low (build context)** | `.dockerignore` missed `Samples/`, `.agents/`, screenshots, test files. | Tightened `.dockerignore` and added a matching `.gcloudignore`. |
-
-All fixes verified: `tsc --noEmit` passes, `npm run build` succeeds, and the
-production server boots and answers `/api/health` and `/api/templates`.
-
----
-
-## 4. Known limitations & things to watch
-
-- **Ephemeral filesystem.** The template library and any generated PDF temp dirs
-  live on the container's local disk. On Render Free and Cloud Run this disk is
-  **ephemeral** — fine here because templates self-seed and generated files are
-  streamed straight to the client, nothing needs to persist. If you later let
-  users *upload and keep* custom templates, move them to object storage
-  (Cloud Storage / S3) or bake them into the image at build time.
-- **No PDF engine in most free tiers.** Server-side PDF needs LibreOffice
-  (`soffice`), a large binary. It is **not** installed on Render Free or the base
-  Node image. The app already degrades to `.docx` + browser "Print → Save as PDF".
-  To get true server PDF, use a Docker image with LibreOffice (adds ~400 MB +
-  more RAM) — feasible on Cloud Run/Railway, tight on 512 MB free tiers. See
-  `DEPLOYMENT.md` §6.
-- **`App.tsx` is ~3,800 lines.** It works and is out of scope to refactor now, but
-  it's the main future-maintainability risk. When you next touch it, split by
-  wizard step into `src/steps/*` and lift shared state into a context/store.
-- **Client bundle is ~950 KB** (259 KB gzipped) — acceptable, but code-splitting
-  the wizard steps and lazy-loading `motion`/`lucide-react` would cut first paint.
-- **In-flight request loss on scale-to-zero.** With `min-instances=0`, a request
-  arriving during shutdown could fail; the client already retries/degrades, so
-  this is acceptable for this workload.
-
----
-
-## 5. Recommended target architecture
-
-**For development / demo (free): Render Free Web Service** or **Cloud Run
-(scale-to-zero).** Both run the container as-is. Render is the fewest clicks;
-Cloud Run keeps you in the Google ecosystem and has a generous always-free tier.
-
-**For production (cost-effective, Google-first): Google Cloud Run + Secret
-Manager + Artifact Registry**, region `asia-south1` (Mumbai). Rationale:
-- Scales to zero → you pay nothing when idle, cents/month at low traffic.
-- Native `--set-secrets` integration keeps `GEMINI_API_KEY` out of the image/env.
-- Same container image as dev — no architecture change between environments.
-- Stays entirely within Google (Gemini API + Cloud Run) for one bill, one IAM.
-
-Step-by-step for both is in **`DEPLOYMENT.md`**. Config already in the repo:
-`Dockerfile`, `render.yaml`, `cloudbuild.yaml`, `.dockerignore`, `.gcloudignore`,
-`.env.example`.
+### 6.1 Template fill
 
 ```
-                 ┌─────────────────────── Google Cloud project ───────────────────────┐
-   User ──HTTPS──►  Cloud Run service (this container, scales 0→N)                     │
-                 │        │  reads GEMINI_API_KEY at runtime                           │
-                 │        ▼                                                            │
-                 │   Secret Manager (gemini-api-key)                                   │
-                 │   Artifact Registry (container image)  ◄── Cloud Build (cloudbuild.yaml)
-                 └──────────────────────────┬──────────────────────────────────────────┘
-                                            ▼
-                                   Google Gemini API
+Custom .docx upload ──► fillDocxTemplate (templateFiller)
+                          • angle-bracket / {{PLACEHOLDER}} resolve
+                          • multi-party paragraph expansion
+                          • unresolved markers left intact for re-verify
+Library template ─────► mammoth text → mergePlaceholders → buildDeedDocx
+                          • wording from template, formatting from code
 ```
+
+Export prefers the **already-filled** `filledDocxBase64` bytes so download
+matches the stamp preview (tables, fonts, page breaks preserved). Fallback
+paths rebuild from `finalText` or re-fill the original template bytes.
+
+### 6.2 Registration plan
+
+```
+Hand sketch (image)
+        │
+        ├─► Gemini vision: PLAN_EXTRACTION_SCHEMA  (measurements, not a trace)
+        └─► Gemini vision: boundary audit vs form   (concurrent, time-boxed)
+                │
+                ▼
+        planRenderer: reconstruct polygon (north-up, to-scale roads)
+                │
+                ▼
+        SVG data URL ──► client canvas rasterise PNG
+                │
+                ▼
+        export: appendPlanPageToDocx  (+ optional editable DrawingML,
+                 optional Aadhaar images page)
+```
+
+If vision fails, the endpoint **degrades with a flag** and still renders a plan
+from registration-form measurements where possible — never hangs (per-call
+timeouts via `PLAN_AI_TIMEOUT_MS`, default 45s).
+
+### 6.3 Gemini resilience
+
+- Primary model: `GEMINI_MODEL` (default `gemini-3.1-flash-lite`)
+- Fallback chain: `GEMINI_FALLBACK_MODELS` (default `gemini-3.6-flash,gemini-3.5-flash-lite`)
+- Retries on overload (503 / high demand); strips `thinkingConfig` on 400 for
+  models that reject it
+- Shared classification: `QUOTA_EXHAUSTED` | `NOT_CONFIGURED` | `TIMEOUT` |
+  `UNAUTHORIZED` | `BAD_RESPONSE` | `UPSTREAM_ERROR`
+- Missing key → heuristic / degraded mode (app stays usable, no fabricated
+  “verified” results)
+
+---
+
+## 7. Data & state
+
+| Store | What | Lifetime |
+|-------|------|----------|
+| React state in `App.tsx` | Full wizard session | Tab session |
+| `localStorage["telangana_deeds_registry"]` | Draft registry metadata | Persistent in browser |
+| Request JSON | Extraction / verify / export payloads | Per request |
+| `./templates/` | Seeded or user-baked `.docx` library | Container disk (ephemeral on free hosts) |
+| OS temp | LibreOffice PDF conversion | Deleted after stream |
+
+There is **no server-side session store** and **no multi-tenant auth** in this
+version — suitable for demo / trusted local use; production hardening would add
+auth, rate limits, and object storage for retained templates.
+
+---
+
+## 8. Formatting contract (deed export)
+
+Enforced in `documentBuilder.ts` regardless of source template formatting when
+rebuilding from text:
+
+| Spec | Value |
+|------|-------|
+| Page | A4 |
+| Body font | Times New Roman, 14 pt |
+| Page 1 body start | **5.8″** from top (stamp logo / header reserve) |
+| Pages 2..n top | 1″ |
+| L / R / Bottom | 0.75″ / 0.75″ / 1″ |
+
+In-place fill (`templateFiller`) intentionally **preserves** the uploaded
+template’s own formatting by editing run text only.
+
+---
+
+## 9. Frontend architecture notes
+
+- Almost all UI and orchestration live in **`src/App.tsx` (~7,900 lines)** —
+  the primary maintainability risk.
+- Supporting UI: `DocxLivePreview` (`docx-preview`), `AiStatusBanner`, Tailwind 4.
+- Motion (`motion`) and Lucide icons used for step transitions / chrome.
+- No router: single-page wizard with step index + flow mode.
+
+**Recommended next refactor** (not yet done): split `src/steps/*`, lift shared
+state into a context or store, and code-split step chunks.
+
+---
+
+## 10. Security & ops
+
+| Topic | Status |
+|-------|--------|
+| Gemini key | Server-only env (`GEMINI_API_KEY`); never shipped to client |
+| Secrets in git | `.gitignore` excludes `.env*`; rotate any historically leaked keys |
+| Auth / tenancy | None — treat as single-user or behind a trusted edge |
+| Uploads | Large base64 bodies; no malware scanning |
+| PDF | Requires LibreOffice in image; otherwise fall back to `.docx` + browser print |
+
+See **`DEPLOYMENT.md`** for Render / Cloud Run steps and secret wiring.
+
+---
+
+## 11. Known limitations
+
+1. **Monolithic `App.tsx`** — hard to test and review in isolation.
+2. **Ephemeral disk** — uploaded custom templates are not persisted across
+   container restarts unless baked into the image or moved to object storage.
+3. **Print vs export** — browser Print may not include the plan page the same
+   way Word/PDF export does.
+4. **Editable DrawingML plan** — optional export path; rendering fidelity across
+   Word/LibreOffice not fully verified visually.
+5. **No auth / audit trail** — unsuitable for multi-user production without an
+   edge auth layer and logging of who exported what.
+
+---
+
+## 12. Recommended target architecture (unchanged direction)
+
+**Demo:** Render Free Docker service (current).  
+**Production:** Cloud Run (`asia-south1`) + Secret Manager + Artifact Registry,
+same container image. Scale-to-zero; Gemini key injected at runtime.
+
+```
+User ──HTTPS──► Cloud Run (this container)
+                    │  GEMINI_API_KEY from Secret Manager
+                    ▼
+               Google Gemini API
+```
+
+Config already in-repo: `Dockerfile`, `render.yaml`, `cloudbuild.yaml`,
+`.dockerignore`, `.gcloudignore`, `.env.example`.

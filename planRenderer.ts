@@ -249,6 +249,31 @@ export const BOUNDARY_AUDIT_SCHEMA: any = {
   required: ["extractedFromSketch", "discrepancies", "isMatch"],
 };
 
+// ---- Auto-detection: hand-drawn sketch vs. already-finished computer-generated
+// plan. Run as a small, fast, dedicated vision call BEFORE deciding whether to
+// read+redraw (hand-drawn) or embed verbatim (computer-generated) — the user
+// never has to say which one it is themselves.
+export const PLAN_SOURCE_CLASSIFICATION_SCHEMA: any = {
+  type: T.OBJECT,
+  properties: {
+    sourceKind: {
+      type: T.STRING,
+      description:
+        "'computer-generated' if the uploaded image is an already-finished, professionally drafted site plan/blueprint: ruler-straight/vector lines, a title block, typed or plotter/printer-produced dimension labels and text, a precise to-scale look — e.g. produced by CAD/drafting software, or a printed/scanned surveyor's plan. 'hand-drawn' if it is a rough pencil/pen/marker sketch: freehand uneven lines, handwritten labels/notes, informal layout, drawn by a layperson and not to scale.",
+    },
+    reason: {
+      type: T.STRING,
+      description: "One short sentence describing the visual cues (line quality, text style) that led to this decision.",
+    },
+  },
+  required: ["sourceKind"],
+};
+
+export const PLAN_SOURCE_CLASSIFICATION_PROMPT = `Look at the uploaded property-plan image and decide which ONE of these two categories it belongs to:
+- "hand-drawn": a rough pencil/pen/marker sketch — freehand, uneven lines, handwritten labels/notes, drawn by a layperson, not to scale.
+- "computer-generated": an already-finished, professionally drafted plan — ruler-straight/vector lines, a title block, typed or plotter/printer-produced dimension labels and text, a precise to-scale look, produced by CAD/drafting software or a printed/scanned surveyor's plan.
+Base the decision on line quality (freehand vs. ruler-straight/vector) and text style (handwritten vs. typed/printed font). Return ONLY the JSON matching the schema.`;
+
 export const PLAN_EXTRACTION_PROMPT = `You are a meticulous land surveyor and town-planning draftsman digitising a hand-drawn Telangana property registration sketch.
 
 Read the sketch and extract its content as STRUCTURED MEASUREMENTS — do NOT try to trace the exact drawn shape (hand sketches are not to scale). We will REDRAW the plot to scale from your measurements.

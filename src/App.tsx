@@ -664,7 +664,7 @@ export default function App() {
       claimantsList.some(c => c.name !== "" || c.aadhaarNo !== "" || c.address !== "") ||
       jurDistrict !== "" ||
       jurVillage !== "" ||
-      linkDocNo !== "" ||
+      linkDocumentsList.some(d => d.linkDocNo !== "") ||
       propPlotNo !== "" ||
       propSurveyNo !== "";
 
@@ -688,7 +688,7 @@ export default function App() {
     claimantsList,
     jurDistrict,
     jurVillage,
-    linkDocNo,
+    linkDocumentsList,
     propPlotNo,
     propSurveyNo
   ]);
@@ -802,6 +802,29 @@ export default function App() {
   // race-guard comment. Prevents an in-flight, now-stale request's response
   // from clobbering a NEWER request's result when the two overlap.
   const planRequestSeqRef = useRef(0);
+  // Whether the uploaded plan/sketch image is a genuine HAND-DRAWN sketch (AI
+  // reads it and redraws a clean CAD-style plan from what it can extract) or
+  // an already-finished COMPUTER-GENERATED/professionally-drafted plan (title
+  // block, precise dimension arrows, typed labels) that must be embedded into
+  // the "PLAN FOR REGISTRATION" page EXACTLY as uploaded — same dimensions,
+  // shape, road lines, everything — with no AI reinterpretation/redraw at all.
+  // NOT a user-facing toggle: this is set automatically from the server's
+  // /api/generate-plan response (`data.sourceKind`), which runs a dedicated
+  // Gemini vision classification call on every upload. The user never has to
+  // say which kind it is themselves.
+  const [planSourceKind, setPlanSourceKind] = useState<"hand-drawn" | "computer-generated">("hand-drawn");
+  // True once the current sketchImage has actually been classified by the
+  // server (vs. still on the initial "hand-drawn" default before any response
+  // has come back) — lets the UI show "Detecting…" instead of a premature
+  // "Hand-Drawn Sketch" badge while the first classification call is in flight.
+  const [planSourceKindDetected, setPlanSourceKindDetected] = useState(false);
+  // The most recent /api/generate-plan call still in flight (or its already-
+  // resolved result). exportDocument() awaits this so a sketch uploaded just
+  // before export — or a plan that was still generating — never silently
+  // exports WITHOUT its plan page (see exportDocument's comment for why this
+  // was previously possible: generatedPlanImage stayed null until the async
+  // call finished, and export read that state synchronously).
+  const planGenPromiseRef = useRef<Promise<string | null> | null>(null);
 
   // General App states
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
@@ -2077,7 +2100,7 @@ export default function App() {
         state: "Telangana",
         hNo: firstProp.houseBearingHNo || firstProp.demoBearingHNo || firstProp.partBearingHNo || firstProp.flatBearingHNo || firstProp.nearHNo || propNearHNo || propertyHNo || "",
         plotNo: firstProp.plotNo || propPlotNo || propertyPlotNo || "",
-        ptiNo: firstProp.ptiNo || firstProp.vltPtiNo || propVltPtiNo || firstLink.pattadarPassbookNo || linkPattadarPassbook || propertyPTINo || "",
+        ptiNo: firstProp.ptiNo || firstProp.vltPtiNo || propVltPtiNo || firstLink.pattadarPassbookNo || propertyPTINo || "",
         vltPtiNo: firstProp.vltPtiNo || firstProp.ptiNo || propVltPtiNo || propertyPTINo || "",
         extentSqYards: firstProp.extentSqYards || propExtentSqYards || propertyExtent || "",
         plinthArea: firstProp.housePlinthArea || firstProp.flatPlinthArea || propertyPlinth || "",
@@ -2116,19 +2139,28 @@ export default function App() {
           south: firstBound.south || boundarySouth || "",
         },
       },
+      // NOTE: deliberately sourced ONLY from firstLink (linkDocumentsList[0]) —
+      // the live, currently-bound Link Document data. This used to also fall
+      // back to a set of legacy flat linkXxx states (`firstLink.xxx ||
+      // linkXxx`), but those are set ONLY by restoreDraftSnapshot() (i.e. only
+      // ever populated by resuming an old saved draft) and are never cleared
+      // when starting a new draft or uploading a fresh link document. That
+      // let stale numbers from a previously-resumed draft silently leak into
+      // an unrelated new deed whenever the current link document's own field
+      // happened to be blank. See also localFillDeedHeuristics() below.
       linkDeed: {
-        deedNumber: firstLink.linkDocNo || linkDocNo || "",
+        deedNumber: firstLink.linkDocNo || "",
         docType: firstLink.linkDocType || "",
         type: firstLink.linkDocType || "",
-        executionDate: firstLink.linkDocDate || linkDocDate || "",
-        village: firstLink.subRegistrar || linkSubRegistrar || "",
-        subRegistrar: firstLink.subRegistrar || linkSubRegistrar || "",
-        subRegistrarCode: firstLink.subRegistrarCode || linkSubRegistrarCode || "",
-        pattadarPassbookNo: firstLink.pattadarPassbookNo || linkPattadarPassbook || "",
-        passbookKhataNo: firstLink.passbookKhataNo || linkPassbookKhataNo || "",
-        layoutFileNo: firstLink.layoutFileNo || linkLayoutFileNo || "",
-        nalaOrderNo: firstLink.nalaOrderNo || linkNalaOrderNo || "",
-        houseTaxReceipt: firstLink.houseTaxReceipt || linkHouseTaxReceipt || "",
+        executionDate: firstLink.linkDocDate || "",
+        village: firstLink.subRegistrar || "",
+        subRegistrar: firstLink.subRegistrar || "",
+        subRegistrarCode: firstLink.subRegistrarCode || "",
+        pattadarPassbookNo: firstLink.pattadarPassbookNo || "",
+        passbookKhataNo: firstLink.passbookKhataNo || "",
+        layoutFileNo: firstLink.layoutFileNo || "",
+        nalaOrderNo: firstLink.nalaOrderNo || "",
+        houseTaxReceipt: firstLink.houseTaxReceipt || "",
       },
       properties,
       jurisdictions,
@@ -2545,13 +2577,51 @@ export default function App() {
     setExporting(format);
     clearAiStatus();
     try {
+      // BUG FIX: exporting used to read `generatedPlanImage` synchronously here.
+      // A sketch/plan image is uploaded via handleSketchUpload, which fires
+      // handleGeneratePlan() but does NOT await it — so generatedPlanImage stays
+      // null for as long as that request is in flight. If the user uploaded a
+      // sketch and clicked "Download" quickly afterwards (or generation was slow/
+      // still running for any reason), export would silently ship the document
+      // with NO plan image at all — the exact bug reported: the "PLAN FOR
+      // REGISTRATION" page came out as text only, its sketch area completely
+      // blank, because planImagePngBase64 was never sent. Awaiting whatever
+      // generation is in flight (tracked in planGenPromiseRef by every call to
+      // handleGeneratePlan) — and, if a sketch was uploaded but no generation
+      // was ever kicked off at all, triggering one now — makes export always
+      // wait for a real plan image before it decides there isn't one.
+      let planImageToUse = generatedPlanImage;
+      if (!planImageToUse && planGenPromiseRef.current) {
+        try {
+          planImageToUse = await planGenPromiseRef.current;
+        } catch {
+          /* handled inside doGeneratePlan; fall through with whatever we have */
+        }
+      }
+      if (!planImageToUse && sketchImage) {
+        // A sketch/plan image is sitting there but generation never ran (e.g. an
+        // earlier attempt errored before ever setting planGenPromiseRef, or the
+        // user navigated away and back). One last attempt rather than exporting
+        // silently without it.
+        try {
+          planImageToUse = await handleGeneratePlan(planCustomPrompt, sketchImage);
+        } catch {
+          /* best-effort */
+        }
+      }
+
       // If a registration plan was generated, rasterise it so the server appends it
       // as the LAST page of the exported document. Best-effort: on any failure we
       // still export the deed itself.
       let planFields: Record<string, unknown> = {};
-      if (generatedPlanImage) {
+      if (planImageToUse) {
         try {
-          const jpg = await rasterizePlan(generatedPlanImage, 2, "image/jpeg");
+          // Computer-generated/pre-existing plan images are already a finished
+          // raster photo/scan at full resolution — rasterising at 2x would only
+          // needlessly upscale and bloat the file. Hand-drawn plans are always an
+          // SVG data URL rendered at CSS pixel size, so 2x keeps them crisp.
+          const rasterScale = planSourceKind === "computer-generated" ? 1 : 2;
+          const jpg = await rasterizePlan(planImageToUse, rasterScale, "image/jpeg");
           planFields = {
             planImagePngBase64: jpg.base64, // JPEG bytes; server embeds as-is
             planImageWidthPx: jpg.width,
@@ -2613,11 +2683,24 @@ export default function App() {
       }
       // A plan was generated but could not be rasterised → it silently would not
       // append. Tell the user instead of leaving them to wonder.
-      if (generatedPlanImage && !(planFields as any).planImagePngBase64) {
+      if (planImageToUse && !(planFields as any).planImagePngBase64) {
         setDegraded({
           code: "UNKNOWN",
           message:
             "The document downloaded, but the registration plan could not be added as a page. Please re-open Step 6, regenerate the plan, then export again.",
+          retryable: true,
+          status: 200,
+        });
+      }
+      // A sketch/plan image was uploaded but NO plan image could be produced at
+      // all (generation never ran, failed, and the last-attempt retry above also
+      // failed) — surface this loudly instead of silently shipping a document
+      // whose "PLAN FOR REGISTRATION" page has no image on it.
+      if (!planImageToUse && sketchImage) {
+        setDegraded({
+          code: "UNKNOWN",
+          message:
+            "The document downloaded, but the plan image could not be generated in time, so the registration plan page was left blank. Please re-open Step 6, confirm the plan preview shows an image, then export again.",
           retryable: true,
           status: 200,
         });
@@ -2642,6 +2725,12 @@ export default function App() {
   const exportEditablePlanDocument = async () => {
     if (!generatedPlanImage) {
       setError("Generate the plan first (Step 6) before exporting an editable version.");
+      return;
+    }
+    if (planSourceKind === "computer-generated") {
+      setError(
+        "This plan was automatically detected as a computer-generated/pre-existing image, so there is no structured drawing data to re-derive native Word shapes from. Use the flat-image plan page (the plain \"Download Word\" button) instead — it embeds this image exactly as uploaded."
+      );
       return;
     }
     setExportingEditablePlan(true);
@@ -2775,6 +2864,13 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
     const buyerAgesText = claimantsList.map(c => `${c.age} Years`).join(", ");
     const buyerAddressText = claimantsList.map(c => c.address).join("; ");
 
+    // Sourced from the live linkDocumentsList[0] — NOT the legacy flat
+    // linkPattadarPassbook/linkDocNo states, which are only ever populated by
+    // resuming an old saved draft (restoreDraftSnapshot) and are never cleared,
+    // so they could silently leak a previous draft's numbers into an unrelated
+    // new deed. See buildConsolidatedDetails() for the same fix.
+    const firstLinkDoc = linkDocumentsList[0] || ({} as any);
+
     const replacements: Record<string, string> = {
       "{{REGISTRATION_DATE}}": registrationDate,
       "{{SELLER_NAME}}": sellerNamesText || executantName,
@@ -2795,14 +2891,14 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       "{{PROPERTY_DISTRICT}}": jurDistrict,
       "{{PROPERTY_HNO}}": propNearHNo,
       "{{PROPERTY_PLOT}}": propPlotNo,
-      "{{PROPERTY_PTI}}": linkPattadarPassbook,
+      "{{PROPERTY_PTI}}": firstLinkDoc.pattadarPassbookNo || "",
       "{{PROPERTY_EXTENT}}": propExtentSqYards,
       "{{PROPERTY_PLINTH}}": propertyPlinth,
       "{{BOUNDARY_EAST}}": boundaryEast,
       "{{BOUNDARY_WEST}}": boundaryWest,
       "{{BOUNDARY_NORTH}}": boundaryNorth,
       "{{BOUNDARY_SOUTH}}": boundarySouth,
-      "{{LINK_DEED_NO}}": linkDocNo,
+      "{{LINK_DEED_NO}}": firstLinkDoc.linkDocNo || "",
       "{{LINK_DEED_DATE}}": "14th August 1998"
     };
 
@@ -2845,12 +2941,16 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       }
     });
 
-  // Function to call /api/generate-plan with the sketch base64 image and property details
-  const handleGeneratePlan = async (overridePrompt?: string, overrideImage?: string) => {
+  // Function to call /api/generate-plan with the sketch base64 image and property details.
+  // Returns the plan image (data URL) that ended up applied, or null if none did
+  // (upload missing / request superseded / failure) — callers that need to know
+  // whether a plan is actually ready (e.g. exportDocument) can await this instead
+  // of racing against the async state update.
+  const doGeneratePlan = async (overridePrompt?: string, overrideImage?: string): Promise<string | null> => {
     const base64Raw = overrideImage || sketchImage;
     if (!base64Raw) {
-      setError("Please upload a hand-drawn sketch image first.");
-      return;
+      setError("Please upload a hand-drawn sketch or plan image first.");
+      return null;
     }
 
     // Guards against a stale response overwriting a newer one. If the user
@@ -2914,9 +3014,28 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       // in flight — drop this now-stale response instead of letting it overwrite
       // the newer call's (possibly already-applied) result. See the race-guard
       // comment above where myRequestId was assigned.
-      if (myRequestId !== planRequestSeqRef.current) return;
-      if (data.generatedImageBase64) {
-        setGeneratedPlanImage(data.generatedImageBase64);
+      if (myRequestId !== planRequestSeqRef.current) return null;
+
+      // The server auto-detects hand-drawn vs. computer-generated (a dedicated
+      // Gemini vision classification call — no user-facing toggle) and reports
+      // which one it decided via data.sourceKind. Reflect that in the UI.
+      const detectedKind: "hand-drawn" | "computer-generated" =
+        data.sourceKind === "computer-generated" ? "computer-generated" : "hand-drawn";
+      setPlanSourceKind(detectedKind);
+      setPlanSourceKindDetected(true);
+
+      let appliedImage: string | null = data.generatedImageBase64 ?? null;
+      if (detectedKind === "computer-generated") {
+        // For the verbatim-embed path, use OUR OWN original full-resolution
+        // upload (base64Raw) rather than the server's echoed image — the
+        // server only ever saw the network-downscaled copy (base64ToUse,
+        // shrunk for the vision call), and re-using that here would needlessly
+        // lose fidelity on an already-finished plan whose exact dimensions and
+        // road lines the user is relying on.
+        appliedImage = base64Raw;
+      }
+      if (appliedImage) {
+        setGeneratedPlanImage(appliedImage);
       }
       if (data.masterPromptUsed) {
         setPlanMasterPrompt(data.masterPromptUsed);
@@ -2924,9 +3043,10 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       if (data.verificationReport) {
         setPlanVerificationReport(data.verificationReport);
       }
-      // May legitimately be null (no AI key / sketch read failed) — the editable
-      // export still works in that case, falling back to form-boundary data only,
-      // same as the image renderer does.
+      // May legitimately be null (no AI key / sketch read failed, or the plan
+      // was embedded verbatim so there's no structured extraction) — the
+      // editable export still works in that case, falling back to form-
+      // boundary data only, same as the image renderer does.
       setExtractedPlan(data.extractedPlan ?? null);
       // The plan image is always rendered from the user's own form data, so a
       // failed AI leg degrades rather than blocks. But it must be VISIBLE: this
@@ -2936,8 +3056,9 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       if (data.imageError) {
         console.warn("Plan generation notice:", data.imageError);
       }
+      return appliedImage;
     } catch (err: any) {
-      if (myRequestId !== planRequestSeqRef.current) return; // stale — a newer call already took over
+      if (myRequestId !== planRequestSeqRef.current) return null; // stale — a newer call already took over
       console.error("Error generating plan:", err);
       if (err?.name === "AbortError") {
         setPlanError(
@@ -2949,13 +3070,25 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
         const f = toApiFailure(err, "Plan generation");
         setPlanError(f.hint ? `${f.message} ${f.hint}` : f.message);
       }
+      return null;
     } finally {
       clearTimeout(timeoutId);
       if (myRequestId === planRequestSeqRef.current) setPlanGenerating(false);
     }
   };
 
-  // Helper to handle hand-drawn sketch file upload
+  // Wrapper kept for all the existing fire-and-forget call sites (buttons that
+  // don't need the result, only the side effects/state updates above). Also
+  // tracks the in-flight promise in planGenPromiseRef so exportDocument() can
+  // await "whatever plan generation is currently happening" without every
+  // caller having to thread the promise through.
+  const handleGeneratePlan = (overridePrompt?: string, overrideImage?: string) => {
+    const p = doGeneratePlan(overridePrompt, overrideImage);
+    planGenPromiseRef.current = p;
+    return p;
+  };
+
+  // Helper to handle hand-drawn/plan sketch file upload
   const handleSketchUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2968,6 +3101,10 @@ Boundaries: East: {{BOUNDARY_EAST}}, West: {{BOUNDARY_WEST}}, North: {{BOUNDARY_
       setGeneratedPlanImage(null);
       setPlanVerificationReport(null);
       setExtractedPlan(null);
+      // A new image needs to be (re-)classified server-side before we know
+      // which pipeline applies to it — don't keep showing the previous
+      // upload's detected kind while this one is still in flight.
+      setPlanSourceKindDetected(false);
       // Auto-trigger plan generation upon upload
       handleGeneratePlan(planCustomPrompt, result);
     };
@@ -3452,6 +3589,22 @@ const getTeluguRecommendation = (rec: string) => {
     setSketchImage(null);
     setSketchFileName("");
     setGeneratedPlanImage(null);
+    setPlanSourceKind("hand-drawn");
+    setPlanSourceKindDetected(false);
+    // Legacy flat Link Document fields (superseded by linkDocumentsList, which
+    // is reset via snap.linkDocumentsList above). These are only ever written
+    // by restoreDraftSnapshot() and were never cleared anywhere else, so a
+    // stale value from a previously-resumed draft could otherwise linger in
+    // component state indefinitely. Clearing them here too, defensively.
+    setLinkDocNo("");
+    setLinkDocDate("");
+    setLinkSubRegistrar("");
+    setLinkSubRegistrarCode("");
+    setLinkPattadarPassbook("");
+    setLinkPassbookKhataNo("");
+    setLinkNalaOrderNo("");
+    setLinkLayoutFileNo("");
+    setLinkHouseTaxReceipt("");
     setActivePresetId(null);
     setError(null);
     setFailure(null);
@@ -5368,16 +5521,44 @@ const getTeluguRecommendation = (rec: string) => {
                             )}
                           </div>
                           <div className="border border-slate-300 rounded-b-lg p-4 bg-white">
+                            {/* Auto-detected HAND-DRAWN vs COMPUTER-GENERATED badge (read-only —
+                                no user toggle). A dedicated Gemini vision call classifies every
+                                upload: a rough pencil sketch is read by AI and redrawn as a clean
+                                CAD-style plan; an already-finished, professionally-drafted plan
+                                (title block, precise dimension arrows, typed labels) is instead
+                                embedded EXACTLY as uploaded — same dimensions, shape, road lines —
+                                with no AI reinterpretation. See doGeneratePlan()'s handling of
+                                data.sourceKind from /api/generate-plan. */}
+                            {sketchImage && (
+                              <div className="flex items-center gap-2 mb-3">
+                                {planGenerating && !planSourceKindDetected ? (
+                                  <span className="text-[10px] font-extrabold uppercase tracking-wide py-1 px-2.5 rounded-md bg-slate-100 text-slate-500 flex items-center gap-1.5">
+                                    <RefreshCw className="w-3 h-3 animate-spin" /> Detecting sketch type…
+                                  </span>
+                                ) : (
+                                  <span className="text-[10px] font-extrabold uppercase tracking-wide py-1 px-2.5 rounded-md bg-[#eef6f5] text-[#0a4d4a] border border-[#c3dedb]">
+                                    Detected: {planSourceKind === "computer-generated" ? "Computer-Generated Plan" : "Hand-Drawn Sketch"}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                            {sketchImage && planSourceKindDetected && (
+                              <p className="text-[10px] text-slate-400 mb-3 -mt-1">
+                                {planSourceKind === "hand-drawn"
+                                  ? "Looks like a rough pencil/pen sketch — AI read it and redrew a clean CAD-style plan."
+                                  : "Looks like an already-finished, typed/printed plan (e.g. from a surveyor) — used exactly as uploaded, unchanged."}
+                              </p>
+                            )}
                             {!sketchImage ? (
                               <div className="border-2 border-dashed border-slate-300 rounded-xl p-6 text-center space-y-3 bg-slate-50/50 hover:bg-slate-50 transition-colors">
                                 <div className="w-10 h-10 bg-[#0a4d4a]/10 text-[#0a4d4a] rounded-full flex items-center justify-center mx-auto">
                                   <UploadCloud className="w-5 h-5" />
                                 </div>
                                 <div>
-                                  <p className="text-xs font-bold text-slate-800">Upload the hand-drawn plot/house sketch here</p>
+                                  <p className="text-xs font-bold text-slate-800">Upload the plot/house sketch or plan here</p>
                                   <p className="text-[11px] text-slate-400 mt-0.5">
                                     Optional at this step — you can also upload it later in Step 6 "Generate Plan".
-                                    Uploading it here starts the AI CAD conversion immediately so it's ready sooner.
+                                    Uploading it here starts the conversion immediately so it's ready sooner.
                                   </p>
                                 </div>
                                 <label className="inline-flex items-center gap-2 bg-[#0a4d4a] hover:bg-[#073937] text-white font-bold text-xs py-2 px-4 rounded-lg cursor-pointer shadow-xs">
@@ -5395,21 +5576,25 @@ const getTeluguRecommendation = (rec: string) => {
                                 <div className="relative rounded-lg overflow-hidden border border-slate-200 bg-slate-900 shrink-0 flex items-center justify-center p-1.5 w-full sm:w-48 h-32">
                                   <img
                                     src={sketchImage}
-                                    alt="Hand drawn sketch"
+                                    alt="Uploaded plot sketch/plan"
                                     className="max-h-full max-w-full object-contain rounded"
                                   />
                                 </div>
                                 <div className="flex-1 space-y-1.5">
                                   <p className="text-[11px] text-slate-600">
                                     {planGenerating
-                                      ? "Converting to a computerized CAD-style plan…"
+                                      ? planSourceKind === "computer-generated"
+                                        ? "Preparing the plan for embedding…"
+                                        : "Converting to a computerized CAD-style plan…"
                                       : generatedPlanImage
-                                      ? "Computerized plan ready — it will be appended as a page when you export the document. You can fine-tune it in Step 6."
-                                      : "Sketch uploaded. Head to Step 6 to review/adjust the generated plan before export."}
+                                      ? planSourceKind === "computer-generated"
+                                        ? "Plan ready — this exact image will be embedded as-is when you export the document."
+                                        : "Computerized plan ready — it will be appended as a page when you export the document. You can fine-tune it in Step 6."
+                                      : "Sketch/plan uploaded. Head to Step 6 to review/adjust before export."}
                                   </p>
                                   <div className="flex items-center gap-3">
                                     <label className="text-[11px] font-bold text-[#0a4d4a] hover:underline cursor-pointer flex items-center gap-1">
-                                      <UploadCloud className="w-3.5 h-3.5" /> Replace Sketch Image
+                                      <UploadCloud className="w-3.5 h-3.5" /> Replace Image
                                       <input
                                         type="file"
                                         accept="image/*"
@@ -7042,7 +7227,10 @@ const getTeluguRecommendation = (rec: string) => {
                               </span>
                             </h4>
                             <p className="text-xs text-slate-600 mt-1 max-w-xl">
-                              Upload a hand-drawn sketch of the plot or house. Gemini AI converts it into a neat, computerized architectural blueprint drawing and cross-checks all boundaries against your Step 1 Registration Form.
+                              Upload a hand-drawn sketch OR an already-finished (computer-generated) plan of the plot or house — Gemini AI
+                              automatically detects which one it is. A hand-drawn sketch is read by AI and redrawn as a neat, computerized
+                              architectural blueprint, with boundaries cross-checked against your Step 1 Registration Form. A computer-generated
+                              plan is embedded exactly as uploaded instead — same dimensions, shape and road lines, with no AI redraw.
                             </p>
                           </div>
                         </div>
@@ -7102,7 +7290,7 @@ const getTeluguRecommendation = (rec: string) => {
                         <div className="bg-white p-5 border border-slate-200 rounded-xl space-y-4 shadow-2xs">
                           <div className="flex items-center justify-between">
                             <h5 className="font-bold text-xs text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-                              <UploadCloud className="w-4 h-4 text-[#0a4d4a]" /> Hand-Drawn Plot Sketch
+                              <UploadCloud className="w-4 h-4 text-[#0a4d4a]" /> Plot Sketch / Plan
                             </h5>
                             {sketchImage && (
                               <span className="text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded font-bold border border-emerald-200">
@@ -7111,14 +7299,38 @@ const getTeluguRecommendation = (rec: string) => {
                             )}
                           </div>
 
+                          {/* Auto-detected HAND-DRAWN vs COMPUTER-GENERATED badge (read-only —
+                              see the matching badge + comment in the Step 1 upload section for
+                              the full rationale). Kept in sync since both read the same state. */}
+                          {sketchImage && (
+                            <div className="flex items-center gap-2">
+                              {planGenerating && !planSourceKindDetected ? (
+                                <span className="text-[10px] font-extrabold uppercase tracking-wide py-1 px-2.5 rounded-md bg-slate-100 text-slate-500 flex items-center gap-1.5">
+                                  <RefreshCw className="w-3 h-3 animate-spin" /> Detecting sketch type…
+                                </span>
+                              ) : (
+                                <span className="text-[10px] font-extrabold uppercase tracking-wide py-1 px-2.5 rounded-md bg-[#eef6f5] text-[#0a4d4a] border border-[#c3dedb]">
+                                  Detected: {planSourceKind === "computer-generated" ? "Computer-Generated Plan" : "Hand-Drawn Sketch"}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          {sketchImage && planSourceKindDetected && (
+                            <p className="text-[10px] text-slate-400 -mt-2">
+                              {planSourceKind === "hand-drawn"
+                                ? "Looks like a rough pencil/pen sketch — AI read it and redrew a clean CAD-style plan."
+                                : "Looks like an already-finished, typed/printed plan (e.g. from a surveyor) — used exactly as uploaded, unchanged."}
+                            </p>
+                          )}
+
                           {!sketchImage ? (
                             <div className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center space-y-4 bg-slate-50/50 hover:bg-slate-50 transition-colors">
                               <div className="w-12 h-12 bg-[#0a4d4a]/10 text-[#0a4d4a] rounded-full flex items-center justify-center mx-auto">
                                 <UploadCloud className="w-6 h-6" />
                               </div>
                               <div>
-                                <p className="text-xs font-bold text-slate-800">Upload Hand-Drawn Plot Sketch</p>
-                                <p className="text-[11px] text-slate-400 mt-0.5">Select a photo or scan of a hand-drawn house or land layout</p>
+                                <p className="text-xs font-bold text-slate-800">Upload Plot Sketch or Plan</p>
+                                <p className="text-[11px] text-slate-400 mt-0.5">Select a photo or scan of a hand-drawn OR already-finished plan/layout</p>
                               </div>
                               <label className="inline-flex items-center gap-2 bg-[#0a4d4a] hover:bg-[#073937] text-white font-bold text-xs py-2.5 px-5 rounded-lg cursor-pointer shadow-xs">
                                 <UploadCloud className="w-4 h-4" /> Browse Image
@@ -7135,13 +7347,13 @@ const getTeluguRecommendation = (rec: string) => {
                               <div className="relative rounded-lg overflow-hidden border border-slate-200 bg-slate-900 max-h-80 flex items-center justify-center p-2">
                                 <img
                                   src={sketchImage}
-                                  alt="Hand drawn sketch"
+                                  alt="Uploaded plot sketch/plan"
                                   className="max-h-72 object-contain rounded"
                                 />
                               </div>
                               <div className="flex items-center justify-between gap-2">
                                 <label className="text-[11px] font-bold text-[#0a4d4a] hover:underline cursor-pointer flex items-center gap-1">
-                                  <UploadCloud className="w-3.5 h-3.5" /> Replace Sketch Image
+                                  <UploadCloud className="w-3.5 h-3.5" /> Replace Image
                                   <input
                                     type="file"
                                     accept="image/*"
@@ -7165,11 +7377,12 @@ const getTeluguRecommendation = (rec: string) => {
                           )}
                         </div>
 
-                        {/* RIGHT PANEL: Computerized AI CAD Image Preview */}
+                        {/* RIGHT PANEL: Plan Preview (AI CAD redraw OR verbatim embed) */}
                         <div className="bg-white p-5 border border-slate-200 rounded-xl space-y-4 shadow-2xs">
                           <div className="flex items-center justify-between">
                             <h5 className="font-bold text-xs text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-                              <Sparkles className="w-4 h-4 text-[#0a4d4a]" /> Computerized AI Plot Plan
+                              <Sparkles className="w-4 h-4 text-[#0a4d4a]" />
+                              {planSourceKind === "computer-generated" ? "Plan To Be Embedded (As-Is)" : "Computerized AI Plot Plan"}
                             </h5>
                             {generatedPlanImage && (
                               <div className="flex items-center gap-1.5">
@@ -7177,7 +7390,7 @@ const getTeluguRecommendation = (rec: string) => {
                                   onClick={() => setPlanExpanded(true)}
                                   className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer"
                                 >
-                                  <Maximize2 className="w-3 h-3" /> Expand &amp; Edit
+                                  <Maximize2 className="w-3 h-3" /> {planSourceKind === "computer-generated" ? "Expand" : "Expand & Edit"}
                                 </button>
                                 <button
                                   onClick={downloadPlanImage}
@@ -7185,19 +7398,21 @@ const getTeluguRecommendation = (rec: string) => {
                                 >
                                   <Download className="w-3 h-3" /> Download JPG
                                 </button>
-                                <button
-                                  onClick={exportEditablePlanDocument}
-                                  disabled={exportingEditablePlan}
-                                  title="Downloads a SEPARATE .docx where every plan element (text, dimensions, boundary lines, north arrow) is a native, editable Word shape instead of one flat picture. Not yet verified visually in Word/LibreOffice — please check it opens correctly on your machine."
-                                  className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
-                                >
-                                  {exportingEditablePlan ? (
-                                    <RefreshCw className="w-3 h-3 animate-spin" />
-                                  ) : (
-                                    <FileText className="w-3 h-3" />
-                                  )}
-                                  Editable Plan (Word)
-                                </button>
+                                {planSourceKind !== "computer-generated" && (
+                                  <button
+                                    onClick={exportEditablePlanDocument}
+                                    disabled={exportingEditablePlan}
+                                    title="Downloads a SEPARATE .docx where every plan element (text, dimensions, boundary lines, north arrow) is a native, editable Word shape instead of one flat picture. Not yet verified visually in Word/LibreOffice — please check it opens correctly on your machine."
+                                    className="text-[10px] font-extrabold text-[#0a4d4a] bg-[#eef6f5] hover:bg-[#c3dedb] px-2.5 py-1 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+                                  >
+                                    {exportingEditablePlan ? (
+                                      <RefreshCw className="w-3 h-3 animate-spin" />
+                                    ) : (
+                                      <FileText className="w-3 h-3" />
+                                    )}
+                                    Editable Plan (Word)
+                                  </button>
+                                )}
                               </div>
                             )}
                           </div>
@@ -7205,20 +7420,26 @@ const getTeluguRecommendation = (rec: string) => {
                           {planGenerating ? (
                             <div className="h-80 border border-slate-200 rounded-xl bg-slate-50 flex flex-col items-center justify-center p-6 text-center space-y-3">
                               <RefreshCw className="w-8 h-8 text-[#0a4d4a] animate-spin" />
-                              <p className="text-xs font-bold text-slate-800">Converting Hand Sketch into AI Computerized Plan...</p>
-                              <p className="text-[11px] text-slate-500 max-w-xs">Reading handwritten measurements, boundaries, and rendering vector CAD lines.</p>
+                              <p className="text-xs font-bold text-slate-800">
+                                {planSourceKind === "computer-generated" ? "Preparing the plan for embedding..." : "Converting Hand Sketch into AI Computerized Plan..."}
+                              </p>
+                              <p className="text-[11px] text-slate-500 max-w-xs">
+                                {planSourceKind === "computer-generated"
+                                  ? "No AI redraw — the uploaded image will be used exactly as-is."
+                                  : "Reading handwritten measurements, boundaries, and rendering vector CAD lines."}
+                              </p>
                             </div>
                           ) : generatedPlanImage ? (
                             <div className="space-y-3">
                               <button
                                 type="button"
                                 onClick={() => setPlanExpanded(true)}
-                                title="Click to expand & edit"
+                                title={planSourceKind === "computer-generated" ? "Click to expand" : "Click to expand & edit"}
                                 className="group relative rounded-lg overflow-hidden border border-slate-200 bg-white max-h-80 w-full flex items-center justify-center p-2 shadow-inner cursor-zoom-in"
                               >
                                 <img
                                   src={generatedPlanImage}
-                                  alt="Computerized AI Plot Plan"
+                                  alt={planSourceKind === "computer-generated" ? "Uploaded plan (to be embedded as-is)" : "Computerized AI Plot Plan"}
                                   className="max-h-72 object-contain rounded"
                                 />
                                 <span className="absolute top-2 right-2 bg-[#0a4d4a] text-white rounded-md px-2 py-1 text-[10px] font-bold flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -7226,7 +7447,9 @@ const getTeluguRecommendation = (rec: string) => {
                                 </span>
                               </button>
                               <p className="text-[10px] text-emerald-800 font-semibold bg-emerald-50 p-2 rounded border border-emerald-200 text-center">
-                                Clean vector CAD layout generated successfully. Click the preview to expand and refine it with a prompt.
+                                {planSourceKind === "computer-generated"
+                                  ? "This exact image — same dimensions, shape and road lines — will be embedded into the PLAN FOR REGISTRATION page on export."
+                                  : "Clean vector CAD layout generated successfully. Click the preview to expand and refine it with a prompt."}
                               </p>
                             </div>
                           ) : planError ? (
@@ -7351,7 +7574,8 @@ const getTeluguRecommendation = (rec: string) => {
                             {/* Modal header */}
                             <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200 bg-[#eef6f5]">
                               <h4 className="font-extrabold text-sm text-slate-900 flex items-center gap-2">
-                                <Maximize2 className="w-4 h-4 text-[#0a4d4a]" /> Registration Plan — Expand &amp; Edit
+                                <Maximize2 className="w-4 h-4 text-[#0a4d4a]" />
+                                {planSourceKind === "computer-generated" ? "Registration Plan — Preview (As Uploaded)" : "Registration Plan — Expand & Edit"}
                               </h4>
                               <div className="flex items-center gap-2">
                                 <button
@@ -7360,19 +7584,21 @@ const getTeluguRecommendation = (rec: string) => {
                                 >
                                   <Download className="w-3.5 h-3.5" /> Download JPG
                                 </button>
-                                <button
-                                  onClick={exportEditablePlanDocument}
-                                  disabled={exportingEditablePlan}
-                                  title="Downloads a SEPARATE .docx where every plan element (text, dimensions, boundary lines, north arrow) is a native, editable Word shape instead of one flat picture. Not yet verified visually in Word/LibreOffice — please check it opens correctly on your machine."
-                                  className="text-[11px] font-extrabold text-[#0a4d4a] bg-white hover:bg-[#c3dedb] px-3 py-1.5 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
-                                >
-                                  {exportingEditablePlan ? (
-                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                  ) : (
-                                    <FileText className="w-3.5 h-3.5" />
-                                  )}
-                                  Editable Plan (Word)
-                                </button>
+                                {planSourceKind !== "computer-generated" && (
+                                  <button
+                                    onClick={exportEditablePlanDocument}
+                                    disabled={exportingEditablePlan}
+                                    title="Downloads a SEPARATE .docx where every plan element (text, dimensions, boundary lines, north arrow) is a native, editable Word shape instead of one flat picture. Not yet verified visually in Word/LibreOffice — please check it opens correctly on your machine."
+                                    className="text-[11px] font-extrabold text-[#0a4d4a] bg-white hover:bg-[#c3dedb] px-3 py-1.5 rounded border border-[#c3dedb] flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+                                  >
+                                    {exportingEditablePlan ? (
+                                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    ) : (
+                                      <FileText className="w-3.5 h-3.5" />
+                                    )}
+                                    Editable Plan (Word)
+                                  </button>
+                                )}
                                 <button
                                   onClick={() => setPlanExpanded(false)}
                                   className="text-slate-500 hover:text-slate-900 p-1.5 rounded hover:bg-white cursor-pointer"
@@ -7399,34 +7625,43 @@ const getTeluguRecommendation = (rec: string) => {
                               )}
                             </div>
 
-                            {/* Prompt-refine bar */}
-                            <div className="px-5 py-4 border-t border-slate-200 bg-white space-y-2">
-                              <label className="text-[11px] font-bold text-slate-800 flex items-center gap-1.5">
-                                <Edit2 className="w-3.5 h-3.5 text-[#0a4d4a]" /> Modify the plan with a prompt
-                              </label>
-                              <div className="flex items-center gap-2">
-                                <input
-                                  type="text"
-                                  value={planCustomPrompt}
-                                  onChange={(e) => setPlanCustomPrompt(e.target.value)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter" && sketchImage && !planGenerating) handleGeneratePlan();
-                                  }}
-                                  placeholder="e.g. Move the 18' road to the south edge, widen the RCC block, add a compound wall on the east…"
-                                  className="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0a4d4a]"
-                                />
-                                <button
-                                  onClick={() => handleGeneratePlan()}
-                                  disabled={planGenerating || !sketchImage}
-                                  className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 text-white font-bold text-xs py-2 px-4 rounded-lg flex items-center gap-1.5 shrink-0 cursor-pointer shadow-3xs"
-                                >
-                                  <Sparkles className="w-3.5 h-3.5" /> {planGenerating ? "Applying…" : "Apply & Re-generate"}
-                                </button>
+                            {/* Prompt-refine bar (AI redraw only — not applicable to verbatim-embedded computer-generated plans) */}
+                            {planSourceKind === "computer-generated" ? (
+                              <div className="px-5 py-4 border-t border-slate-200 bg-white">
+                                <p className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3 text-center">
+                                  This plan was automatically detected as computer-generated / pre-existing, so it is embedded exactly as uploaded — there is no
+                                  AI redraw to refine with a prompt. To change the plan itself, replace the uploaded image instead.
+                                </p>
                               </div>
-                              <p className="text-[10px] text-slate-400">
-                                Your instruction is combined with the original hand-drawn sketch, so the plan is re-derived — not drawn from scratch.
-                              </p>
-                            </div>
+                            ) : (
+                              <div className="px-5 py-4 border-t border-slate-200 bg-white space-y-2">
+                                <label className="text-[11px] font-bold text-slate-800 flex items-center gap-1.5">
+                                  <Edit2 className="w-3.5 h-3.5 text-[#0a4d4a]" /> Modify the plan with a prompt
+                                </label>
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    type="text"
+                                    value={planCustomPrompt}
+                                    onChange={(e) => setPlanCustomPrompt(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" && sketchImage && !planGenerating) handleGeneratePlan();
+                                    }}
+                                    placeholder="e.g. Move the 18' road to the south edge, widen the RCC block, add a compound wall on the east…"
+                                    className="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#0a4d4a]"
+                                  />
+                                  <button
+                                    onClick={() => handleGeneratePlan()}
+                                    disabled={planGenerating || !sketchImage}
+                                    className="bg-[#0a4d4a] hover:bg-[#073937] disabled:opacity-50 text-white font-bold text-xs py-2 px-4 rounded-lg flex items-center gap-1.5 shrink-0 cursor-pointer shadow-3xs"
+                                  >
+                                    <Sparkles className="w-3.5 h-3.5" /> {planGenerating ? "Applying…" : "Apply & Re-generate"}
+                                  </button>
+                                </div>
+                                <p className="text-[10px] text-slate-400">
+                                  Your instruction is combined with the original hand-drawn sketch, so the plan is re-derived — not drawn from scratch.
+                                </p>
+                              </div>
+                            )}
                           </div>
                         </div>
                       )}

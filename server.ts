@@ -14,6 +14,8 @@ import {
   PLAN_EXTRACTION_SCHEMA,
   PLAN_EXTRACTION_PROMPT,
   BOUNDARY_AUDIT_SCHEMA,
+  PLAN_SOURCE_CLASSIFICATION_SCHEMA,
+  PLAN_SOURCE_CLASSIFICATION_PROMPT,
 } from "./planRenderer";
 import {
   listTemplates,
@@ -2615,6 +2617,80 @@ app.post("/api/generate-plan", async (req, res) => {
     // data, so this endpoint degrades-with-a-flag rather than failing closed.
     let planFailure: ReturnType<typeof classifyAiError> | null = null;
 
+    // ---- STEP 0: auto-detect hand-drawn sketch vs. already-finished
+    // computer-generated plan. This used to be a manual toggle the user had to
+    // set themselves; now a small, fast, dedicated vision call decides it, so
+    // the right pipeline (AI read+redraw vs. verbatim embed) always runs
+    // automatically. If classification fails or there's no AI key, default to
+    // "hand-drawn" — the safe choice, since it still produces a full plan (the
+    // existing pipeline degrades gracefully with no AI), it just does not take
+    // the verbatim-embed shortcut.
+    let detectedSourceKind: "hand-drawn" | "computer-generated" = "hand-drawn";
+    let sourceKindReason: string | null = null;
+    // Large phone photos can push this vision call past a tight timeout under
+    // real-world latency (observed: a 1.6MB reference photo took >15s), which
+    // would wrongly fall back to "hand-drawn" for a plan that actually is
+    // computer-generated. Give it real headroom; overridable via env.
+    const PLAN_CLASSIFY_TIMEOUT_MS = Number(process.env.PLAN_CLASSIFY_TIMEOUT_MS) || 25000;
+    if (ai) {
+      try {
+        const classifyRes = await withTimeout(
+          ai.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: [imagePart, { text: PLAN_SOURCE_CLASSIFICATION_PROMPT }],
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: PLAN_SOURCE_CLASSIFICATION_SCHEMA,
+              temperature: 0,
+              maxOutputTokens: 512,
+              thinkingConfig: { thinkingBudget: 0 },
+            },
+          }),
+          PLAN_CLASSIFY_TIMEOUT_MS,
+          "Plan source classification"
+        );
+        const parsedKind = parseModelJson((classifyRes as any)?.text || "");
+        if (parsedKind?.sourceKind === "computer-generated") {
+          detectedSourceKind = "computer-generated";
+        }
+        sourceKindReason = parsedKind?.reason || null;
+      } catch (e: any) {
+        console.warn(
+          "Plan source classification failed; defaulting to hand-drawn (read+redraw) pipeline:",
+          e?.message || e
+        );
+      }
+    }
+
+    if (detectedSourceKind === "computer-generated") {
+      // Already a finished, professionally-drafted plan (title block, precise
+      // dimension arrows, typed labels, to-scale road lines). Running it through
+      // the AI vision extraction + deterministic-redraw pipeline would
+      // re-interpret it and could subtly change the exact dimensions/shape/
+      // road-line placement the user is relying on — so embed it verbatim
+      // instead: same dimensions, same shape, same road lines, byte-for-byte
+      // the image that was uploaded.
+      return res.json({
+        generatedImageBase64: sketchBase64,
+        sourceKind: "computer-generated",
+        sourceKindReason,
+        imageError: null,
+        verificationReport: {
+          extractedFromSketch: { east: "", west: "", north: "", south: "", dimensions: "", roadDetails: "" },
+          discrepancies: [],
+          isMatch: false,
+          notVerified: true,
+          notVerifiedReason:
+            "This image was automatically detected as an already-finished (computer-generated) plan, so it was embedded exactly as uploaded and was not read or cross-checked by AI. Verify the boundaries manually before registration.",
+        },
+        extractedPlan: null,
+        ...OK_META,
+        masterPromptUsed:
+          "Computer-generated / pre-existing plan detected automatically: no AI extraction or redraw was run. " +
+          "The uploaded image is embedded exactly as uploaded — same dimensions, shape, and road lines.",
+      });
+    }
+
     // ---- STEP 1: read the hand-drawn sketch into STRUCTURED JSON (vision) ----
     // The sketch image IS sent to the model here. (Previously the sketch was
     // never passed to the image generator, so the output bore no relation to it.)
@@ -2777,6 +2853,7 @@ JSON Output Schema strictly format as:
 
     return res.json({
       generatedImageBase64,
+      sourceKind: "hand-drawn",
       imageError,
       verificationReport,
       // What the sketch reader pulled out — handy for debugging/preview.
@@ -2801,6 +2878,7 @@ JSON Output Schema strictly format as:
       const editsFb = customPrompt && String(customPrompt).trim() ? parsePlanPrompt(String(customPrompt)) : null;
       return res.json({
         generatedImageBase64: renderPlanDataUrl({ plan: null, details: rd, edits: editsFb }),
+        sourceKind: "hand-drawn",
         // Was `imageError: null` with the reason argument dropped — so a total
         // failure here rendered as a plan with NO warning at all, the exact
         // silent-success this whole change set exists to remove.
