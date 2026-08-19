@@ -382,6 +382,17 @@ function scanLabelStart(
   return { start: i, hitCap: steps >= cap, atDelim: false, atValueEnd: false };
 }
 
+// Markers that are NOT Step-1 form fields at all — they are reserved spots
+// filled in by a LATER pipeline stage with something other than typed text
+// (currently: the registration-plan IMAGE, spliced in by
+// insertPlanIntoTemplatePlanPage/appendPlanPageToDocx in documentBuilder.ts
+// once the user runs Step 6 "Generate Plan"). If Step 6 never ran (or the
+// export step didn't have an image yet), the marker is correctly still empty
+// at THIS point in the pipeline — but that is not a data-entry gap the user
+// can fix by "going back to Step 1", so it must not be reported alongside the
+// genuine unfilled fields in `unresolved`.
+const STRUCTURAL_MARKER_RE = /insert[^a-z]{0,3}registration[^a-z]{0,3}sketch[^a-z]{0,3}here|insert.{0,30}sketch.{0,30}here/i;
+
 /**
  * Fill placeholders inside a raw document.xml string.
  *
@@ -485,8 +496,17 @@ export function fillDocumentXml(
       // show any raw <bracket> placeholder — so we splice it OUT (empty value)
       // rather than leaving it visible — but we STILL report the label in
       // `unresolved` so the Verify step surfaces it as a discrepancy (and the
-      // caller can flag the important ones).
-      unresolved.add(open + innerSpace.replace(/\s+/g, " ").trim() + close);
+      // caller can flag the important ones) — UNLESS it is a STRUCTURAL marker
+      // like "<INSERT REGISTRATION SKETCH HERE>". That one is never a Step-1
+      // form field at all: it is a reserved spot the plan-image insertion step
+      // (insertPlanIntoTemplatePlanPage, run later at export time) fills in with
+      // the generated registration-plan picture, not text data. Reporting it as
+      // an "unfilled placeholder" told the user to "go back to Step 1 to supply
+      // the missing value" for a field that has no corresponding form field —
+      // a false alarm on every angle-bracket template that ships this marker.
+      if (!STRUCTURAL_MARKER_RE.test(innerSpace)) {
+        unresolved.add(open + innerSpace.replace(/\s+/g, " ").trim() + close);
+      }
       // Also swallow the whitespace/line-break the removed marker leaves behind,
       // so the deed has no blank line or double space where a value was missing
       // (the "unnecessary gaps" the user flagged). In priority order:

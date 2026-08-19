@@ -761,6 +761,22 @@ export default function App() {
   const [unresolvedPlaceholders, setUnresolvedPlaceholders] = useState<string[]>([]);
   const [mergeMode, setMergeMode] = useState<string>("");
   const [exporting, setExporting] = useState<"" | "docx" | "pdf">("");
+  // generatedDocxBase64 above is the OUTPUT of /api/generate-document (Step 4),
+  // which runs before Step 6 "Generate Plan" even exists — so it never carries
+  // the registration-plan image, and the Stamp Preview (Step 7) that renders it
+  // via <DocxLivePreview> could never show the plan page even after the user
+  // generated one. Only the Download button spliced the plan image in (via
+  // /api/export-document), and only for the file that got downloaded — never
+  // for what stays on screen. previewDocxBase64 is generatedDocxBase64 WITH the
+  // plan (and any Aadhaar pages) spliced in server-side, kept separate so the
+  // plain (no-plan) bytes are still available for re-splicing after an edit;
+  // it is what Step 4/7 actually render whenever a plan is available.
+  const [previewDocxBase64, setPreviewDocxBase64] = useState<string>("");
+  const [previewComposing, setPreviewComposing] = useState(false);
+  // Sequence guard for composePreviewWithPlan(): if generatedDocxBase64/the plan
+  // change again while a compose call is still in flight, the stale response
+  // must not clobber a newer one (same pattern as planRequestSeqRef below).
+  const previewComposeSeqRef = useRef(0);
 
   // Step 7: Audit Report & Verification State
   const [report, setReport] = useState<any | null>(null);
@@ -2224,6 +2240,7 @@ export default function App() {
       // won't fire — clear it here explicitly).
       setFilledDeedText("");
       setGeneratedDocxBase64("");
+      setPreviewDocxBase64("");
       setUnresolvedPlaceholders([]);
       setMergeMode("");
       setSelectedTemplateId(CUSTOM_TEMPLATE_ID); // auto-select the uploaded template
@@ -2280,6 +2297,7 @@ export default function App() {
   useEffect(() => {
     setFilledDeedText("");
     setGeneratedDocxBase64("");
+    setPreviewDocxBase64("");
     setUnresolvedPlaceholders([]);
     setMergeMode("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2361,6 +2379,11 @@ export default function App() {
       const data = await res.json();
       setFilledDeedText(data.mergedText || "");
       setGeneratedDocxBase64(data.docxBase64 || "");
+      // Freshly (re)generated base document — any previously-composed preview
+      // (with a plan/Aadhaar pages spliced in) was built from the OLD bytes and
+      // is now stale; clear it so the compose effect below rebuilds it from the
+      // new bytes + whatever plan image already exists.
+      setPreviewDocxBase64("");
       setUnresolvedPlaceholders(data.unresolvedPlaceholders || []);
       setMergeMode(data.mergeMode || "");
       // A CUSTOM upload asks for an AI merge; a library template is deterministic
@@ -2470,6 +2493,90 @@ export default function App() {
       img.onerror = () => reject(new Error("Failed to load plan SVG for rasterisation"));
       img.src = svgDataUrl;
     });
+
+  // Compose the ON-SCREEN preview (Step 4 + Step 7) so it shows the plan page
+  // too, not just the plain filled deed. Without this, generatedDocxBase64 is
+  // frozen at whatever /api/generate-document returned BEFORE Step 6 "Generate
+  // Plan" ever ran, and the preview could never show the plan no matter how
+  // long after generating it the user looked — only the Download button (which
+  // calls /api/export-document itself) ever saw the plan image, and only for
+  // the file that got downloaded. This mirrors exportDocument()'s own
+  // plan-resolution + rasterisation + /api/export-document call, but stores the
+  // result in previewDocxBase64 instead of downloading it, so on-screen and
+  // downloaded bytes are built the same way and stay in sync.
+  const composePreviewWithPlan = async () => {
+    const myId = ++previewComposeSeqRef.current;
+    // Nothing to compose onto — the plain fill result will be shown as-is.
+    if (!generatedDocxBase64) {
+      setPreviewDocxBase64("");
+      return;
+    }
+    // Resolve whatever plan image is available, awaiting an in-flight
+    // generation the same way exportDocument() does — without this, a plan
+    // that finished generating a moment ago (or is still generating right now)
+    // would not show up in the preview until some unrelated re-render.
+    let planImageToUse = generatedPlanImage;
+    if (!planImageToUse && planGenPromiseRef.current) {
+      try {
+        planImageToUse = await planGenPromiseRef.current;
+      } catch {
+        /* handled inside doGeneratePlan; fall through with whatever we have */
+      }
+    }
+    if (myId !== previewComposeSeqRef.current) return; // superseded while awaiting
+
+    if (!planImageToUse) {
+      // No plan yet — show the plain filled deed (no stale composed bytes).
+      setPreviewDocxBase64("");
+      return;
+    }
+
+    setPreviewComposing(true);
+    try {
+      const rasterScale = planSourceKind === "computer-generated" ? 1 : 2;
+      const jpg = await rasterizePlan(planImageToUse, rasterScale, "image/jpeg");
+      if (myId !== previewComposeSeqRef.current) return; // superseded
+
+      const aadhaarImages = aadhaarCards
+        .filter((c) => c.base64 && !c.isMock)
+        .map((c) => ({ base64: c.base64 as string, mimeType: c.mimeType || "image/jpeg", name: c.name || "aadhaar" }));
+
+      const res = await fetch("/api/export-document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          format: "docx",
+          filledDocxBase64: generatedDocxBase64,
+          planImagePngBase64: jpg.base64,
+          planImageWidthPx: jpg.width,
+          planImageHeightPx: jpg.height,
+          aadhaarImages,
+        }),
+      });
+      if (myId !== previewComposeSeqRef.current) return; // superseded
+      if (!res.ok) return; // best-effort: preview just falls back to the plain fill
+      const data = await res.json();
+      const b64 = data?.fileBase64 || data?.docxBase64;
+      if (b64 && myId === previewComposeSeqRef.current) {
+        setPreviewDocxBase64(b64);
+      }
+    } catch (e) {
+      console.warn("Could not compose preview with plan; showing plain filled deed instead:", e);
+    } finally {
+      if (myId === previewComposeSeqRef.current) setPreviewComposing(false);
+    }
+  };
+
+  // Re-compose the preview whenever its inputs change: a fresh base document,
+  // a newly (re)generated plan, or its source-kind classification flipping
+  // (which changes the rasterisation scale). Aadhaar uploads are intentionally
+  // NOT a dependency here — they're comparatively rare to change post-plan and
+  // would otherwise re-run this on every keystroke-adjacent state update; the
+  // Download button's own compose always includes the latest set regardless.
+  useEffect(() => {
+    void composePreviewWithPlan();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generatedDocxBase64, generatedPlanImage, planSourceKind]);
 
   // Download the generated plan as a real JPG. The plan is held as an SVG data URL,
   // so we rasterise it to JPEG first — previously the button just renamed the SVG
@@ -3586,6 +3693,7 @@ const getTeluguRecommendation = (rec: string) => {
     setLinkDocuments([]);
     setCustomTemplateDocxBase64("");
     setGeneratedDocxBase64("");
+    setPreviewDocxBase64("");
     setSketchImage(null);
     setSketchFileName("");
     setGeneratedPlanImage(null);
@@ -6853,6 +6961,13 @@ const getTeluguRecommendation = (rec: string) => {
                             </div>
                           )}
 
+                          {previewComposing && (
+                            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-600 flex items-center gap-2">
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                              Adding the registration plan to this preview…
+                            </div>
+                          )}
+
                           {/* Full document content. When a filled .docx is available (and not
                               editing), show the REAL Word document via the SAME shared preview
                               component used by Step 7 (Stamp Preview) — real tables, centered/bold
@@ -6861,7 +6976,7 @@ const getTeluguRecommendation = (rec: string) => {
                               editable text. */}
                           {(!previewEditing && !!generatedDocxBase64 && !docxPreviewError) ? (
                             <DocxLivePreview
-                              docxBase64={generatedDocxBase64}
+                              docxBase64={previewDocxBase64 || generatedDocxBase64}
                               maxHeightClass="max-h-[560px]"
                               onError={() => setDocxPreviewError(true)}
                             />
@@ -7046,6 +7161,13 @@ const getTeluguRecommendation = (rec: string) => {
                         )}
                       </div>
 
+                      {previewComposing && (
+                        <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-600 flex items-center gap-2">
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                          Adding the registration plan to this preview…
+                        </div>
+                      )}
+
                       {/* Toolbar: page nav + edit toggle */}
                       <div className="flex items-center justify-between gap-3 flex-wrap">
                         <div className="flex items-center gap-2">
@@ -7119,7 +7241,7 @@ const getTeluguRecommendation = (rec: string) => {
                         // so both previews are identical. Falls back to the text view on
                         // any render error.
                         <DocxLivePreview
-                          docxBase64={generatedDocxBase64}
+                          docxBase64={previewDocxBase64 || generatedDocxBase64}
                           onError={() => setDocxPreviewError(true)}
                         />
                       ) : (
@@ -7798,6 +7920,7 @@ const getTeluguRecommendation = (rec: string) => {
                     setReport(null);
                     setExtractedDetails(null);
                     setGeneratedDocxBase64("");
+                    setPreviewDocxBase64("");
                     setUnresolvedPlaceholders([]);
                     setFilledDeedText("");
                     setMergeMode("");
